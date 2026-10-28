@@ -1,13 +1,22 @@
-from threading import Lock
+# from threading import Lock
 import math
 from pathlib import Path
 from shutil import which
+# from token import LBRACE
+import os
 
 from Solver import Solver
-from amplpy import AMPL, Kind, OutputHandler, ErrorHandler, ampl
+from amplpy import AMPL, OutputHandler, ErrorHandler, Environment
 from Model import Model
 import time
 from TimeMe import TimeMe
+import multiprocessing
+import TimeoutFunc
+
+# Where else should it be?
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+
 
 class InnerOutputHandler(OutputHandler):
     def isInvalidOption(msg):
@@ -15,22 +24,49 @@ class InnerOutputHandler(OutputHandler):
             if error in msg:
                 return True
         return False
-    def __init__(self, appendError, storeOutput = False,):
-      self._storeOutput = storeOutput
+    def __init__(self, appendError, printOutput = False, storeOutput=False):
+      self._printOutput = printOutput
       self._appendError = appendError
+      self.file = None
+      self._storeOutput = storeOutput
       if storeOutput:
         self._msgs = list()
         self._kinds = list()
+    def clear_output(self):
+        self._msgs = []
+        self._kinds = []
+    def get_output(self) -> str:
+       return "".join(self._msgs)
+    def append_error_to_list(self, msg: str):
+       self._msgs.append(msg)
+       self._kinds.append("ERROR")
+    def __del__(self):
+       self.close_log()
+    def is_recording_output(self) -> bool:
+        return self._storeOutput
+    
+    def set_log_file(self, filename: str):
+       try:
+        self.file = open(filename , 'w')
+       except IOError:
+            print("Error: Could not open file.")
+    def close_log(self):
+       if self.file:
+           self.file.close()
+           self.file = None
     def output(self, kind, msg):
         # Check if the message contains errors coming from the solver, 
         # that are passed as normal messages from AMPL but could help
         # with better error detection
       if InnerOutputHandler.isInvalidOption(msg):
-          self._appendError(msg)
+         self._appendError(msg)
+      if self.file:
+         self.file.write(msg)
       if self._storeOutput:
         self._kinds.append(kind)
         self._msgs.append(msg)
-        print(msg, flush=True)
+      if self._printOutput:
+         print(msg, flush=True)
       pass
     def getMessages(self):
       return self._msgs
@@ -48,8 +84,11 @@ class InnerErrorHandler(ErrorHandler):
 
 class AMPLRunner(object):
 
-    def __init__(self, solver=None, optionsExtra=None, writeSolverName = False,
-                 keepAMPLOutput = False):
+    def __init__(self, ampl=None, solver=None, optionsExtra=None, writeSolverName = False,
+                 printOutput=False,
+                 storeOutput = False, timeout=None):
+        self._ampl_dir_name = os.path.dirname(ampl)
+        self._ampl_file_name = os.path.basename(ampl)
         self.isBenchmark = False
         if solver:
             self.setSolver(solver)
@@ -57,27 +96,39 @@ class AMPLRunner(object):
             self._solver = None
         self._writeSolverName = writeSolverName
         self._amplInitialized = False
-        self._keepAMPLOutput = keepAMPLOutput
+        self._storeOutput = storeOutput
+        self._printOutput = printOutput
+        self._timeout = timeout
         self._optionsExtra = optionsExtra
         self._logFile = None
-
+        self._version = None
+        
     def _initAMPL(self, model):
         if self._amplInitialized:
           self._ampl.reset()
           self._ampl.eval("reset options;")
           self._setSolverInAMPL(model)
+          self._outputHandler.clear_output()
           return
         if self.isBenchmark: # Issues with non-server licenses
             time.sleep(.5)   # so wait until the license is released
-        self._ampl = AMPL()
-        doLogs = self._logFile is not None
-        self._outputHandler = InnerOutputHandler(self.appendError, self._keepAMPLOutput)
+
+        self._ampl = AMPL(Environment(
+                          binary_directory=self._ampl_dir_name,
+                          binary_name=self._ampl_file_name))
+        self._outputHandler = InnerOutputHandler(self.appendError, printOutput=self._printOutput,
+                                                 storeOutput=self._storeOutput)
+        if self._logFile is not None:
+            self._outputHandler.set_log_file(self._logFile)
         self._ampl.setOutputHandler(self._outputHandler)
         self._ampl.setErrorHandler(InnerErrorHandler(self.appendError))
-        self._ampl.setOption("solver_msg", 1 if doLogs else 0)
+        solver_msg = self._logFile is not None or self._printOutput or self._storeOutput
+        self._ampl.setOption("solver_msg", solver_msg)
         if self._solver:
           self._setSolverInAMPL(model)
         self._amplInitialized = True
+        if self._printOutput:
+           self._ampl.eval("option version;")
    
     def _terminateAMPL(self):
       self._ampl.close()
@@ -85,27 +136,15 @@ class AMPLRunner(object):
 
     def appendError(self, exception):
       self._lastError = exception
+      if self._outputHandler.is_recording_output():
+         self._outputHandler.append_error_to_list(str(exception))
 
     def readModel(self, model: Model):
         mp = Path(model.getFilePath())
         if not mp.exists():
             raise Exception("Model {} not found".format(model.getFilePath()))
         if model.isScript():
-          class MyInterpretIsOver(Runnable):
-            executed = False
-            def run(self):
-              self.executed = True
-              mutex.release()
-          callback = MyInterpretIsOver()
-          mutex = Lock()
-          mutex.acquire()
-          timeOut = self._solver.getTimeout()
-          self._ampl.evalAsync("include '{}';".format(str(mp.absolute().resolve())), callback)
-          mutex.acquire(timeout=timeOut)
-          if not callback.executed:
-            self._ampl.interrupt()
-            self._ampl.interrupt()
-            return None
+          self._ampl.eval("include '{}';".format(str(mp.absolute().resolve())))
         else:
           self._ampl.read(str(mp.absolute().resolve()))
           files = model.getAdditionalFiles()
@@ -118,8 +157,8 @@ class AMPLRunner(object):
                       self._ampl.read(str(f.absolute().resolve()))
         return mp
 
-    def writeNL(self, model, outdir=None):
-        """ Write an NL file corresponding to the specified model. 
+    def writeModel(self, model, outdir=None, writeMPS: bool=False):
+        """ Export a model as NL (default) or MPS.
             By default it writes in the model directory, unless outdir is specified"""
         print(f"Opening {model.getName()}.", end=" ", flush=True)
         self.doInit(model)
@@ -132,8 +171,14 @@ class AMPLRunner(object):
 
         self._ampl.cd(dir)
         nlname = model.getName()
-        print(f"Writing NL file {nlname}.nl.", end=" ", flush=True)
-        self._ampl.eval("write 'g{}';".format(nlname))
+        if writeMPS:
+           typename="MPS"
+           prefix="m"
+        else:
+            typename="NL"
+            prefix="g"
+        print(f"Writing {typename} file {nlname}.nl.", end=" ", flush=True)
+        self._ampl.eval(f"write '{prefix}{nlname}';")
         print("Done.", flush=True)
         self._terminateAMPL()
 
@@ -146,14 +191,36 @@ class AMPLRunner(object):
 
     def _setSolverInAMPL(self, model):
         sp = self._solver.getExecutable()
+        
         self._ampl.setOption("solver", sp)
+        if not self._solver.get_version():
+           self._solver.set_version(self._getSolverVersion(sp))
         (name, value) = self._solver.getAMPLOptions(model)
         if self._logFile is not None:
             logOption = self._solver.setLogFile(self._logFile)
             if logOption:
                 value += f" {logOption}"
         self._ampl.setOption(name, value)
+        for (fname, fvalue) in self._solver.getFixedAMPLOptions():
+            self._ampl.setOption(fname, fvalue)
         
+    def _getSolverVersion(self, solver) -> tuple:
+        """Returns driver version (e.g. 20240316), version string"""
+        command = f"shell \"{solver} -v\";"
+        v=self._ampl.get_output(command)
+        driver_version = None
+        import re
+        for l in v.splitlines():
+            driver_match = re.search(r'driver\((\d+)\)', l)
+            if driver_match:
+                driver_version = driver_match.group(1)
+                all_string=l
+                break
+        if not driver_version:
+           driver_version=v
+           all_string=v
+        return (driver_version, all_string)
+
 
     def tryGetObjective(self):
       try: 
@@ -195,14 +262,22 @@ class AMPLRunner(object):
         if model.isScript() or model.doCd():
             self._ampl.cd(mp)
         return self.readModel(model)
-
+    
+    def get_output(self) -> str:
+     return self._outputHandler.get_output()
+    
     def runAndEvaluate(self, model: Model, logFile : str):
+      try:
         self._run(model, logFile)
         self._evaluateRun(model)
         # Todo: check bug in the API (or in amplpy) by which old objectives are 
         # reported after reset. Terminating AMPL each time takes care of the problem
         # but it's hardly efficient
         # self._terminateAMPL()
+      except Exception as exc:
+        self._amplInitialized = False                 # To reinitialize next run
+        raise
+
 
     def _run(self, model: Model,  logFile : str = None):
       self._logFile = logFile
@@ -210,6 +285,9 @@ class AMPLRunner(object):
       self.setupOptions(model)
       if self.isBenchmark:
          print("\n\t\t{0: <20}: Reading... ".format(self._solver.getName()), flush=True, end="")
+      if model.isScript():
+         print("Executing script..", flush=True, end="")
+         
       amplStats = { "AMPLreadTime" : "-",
                    "AMPLgenerationTime" : "-",
                    "AMPLsolveTime" : "-"
@@ -219,25 +297,10 @@ class AMPLRunner(object):
       t.tick()
       mp = self.doReadModel(model)
       amplStats["AMPLreadTime"]= t.toc()
-      if model.isScript() and mp == None: # if a script ran out of time (had to kill AMPL)
-         self._terminateAMPL()
-         self.stats["solutionTime"] = self._solver.getTimeout()
-         self.stats["objective"] = None
-         if self._lastError:
-           self.stats["outmsg"] = self._lastError
-           self.stats["errormsg"] = self._lastError
-         else:
-           self.stats["outmsg"] = "Script ran out of time"
-           self.stats["errormsg"] = "Script ran out of time"
-         self.stats["timelimit"] = True
-         if logFile is not None:
-             logs = self._outputHandler.getMessages(self)
-             with open(logFile, 'w') as f:
-                f.write(logs)
-         return
+      
       t.tick()
       try:
-          if self.isBenchmark:
+          if self.isBenchmark and not model.isScript():
                 print("Generating... ", flush=True, end="")
           ncontvars = self._ampl.getValue("_nvars - _snbvars - _snivars")
           nintvars = self._ampl.getValue("_snbvars  + _snivars")
@@ -248,34 +311,57 @@ class AMPLRunner(object):
           nintvars = 0
           nconstr =  0
           nnz  = 0
-      
       amplStats["AMPLgenerationTime"] = t.toc()
+      
       self.stats["modelStats"] = {"nvars" : int(ncontvars),
                                    "nintvars" : int(nintvars),
                                    "nconstr" : int(nconstr),
                                    "nnz" : int(nnz)}
+      solve_result = None
       if not model.isScript():
           if self.isBenchmark:
-            print("Solving... ", end="")
+            print("Solving... ", end="", flush=True)
           t.tick()
-          self._ampl.solve()
+          if self._timeout is None:
+              self._ampl.solve()
+          else:
+              TimeoutFunc.run_with_timeout_cleanup_multiprocessing_watcher(
+                  lambda: self._ampl.solve(),
+                  TimeoutFunc.cleanup_non_immediate_descendants,
+                  self._timeout, 5)
           solve_result = self._ampl.get_value("solve_result")
           if solve_result != "solved":
-              print("WARNING: not solved (solve_result: {})".format(solve_result))
+              print("\n  WARNING:\n    - not solved (solve_result: {})". \
+                  format(solve_result), "\n", " "*62, end="")
           amplStats["AMPLsolveTime"]= t.toc()
+      # Close log before any further amplapi operations
+      self._outputHandler.close_log()
+      
+      # Gather results
+      self.stats["exit_code"] = self._ampl.get_value('solve_exitcode')
       self.stats["AMPLstats"] = amplStats
-      interval = self._ampl.getValue("_solve_elapsed_time")
-      self.stats["solutionTime"] = interval
-      v = self.tryGetObjective()
-      self.stats["objective"] = v
+      if not solve_result:
+         solve_result = self._ampl.getValue("solve_result")
+      self.stats["solutionTime"] = self._ampl.getValue("_solve_elapsed_time")
+      if self._solver: # Get times suffix if supported
+        if self._solver.support_times():
+           try:
+              solver_time =self._ampl.get_value("Initial.time_solver")
+              setup_time=self._ampl.get_value("Initial.time_setup")
+              self.stats["times"]= {
+                 "setup" : setup_time,
+                 "solver": solver_time,
+                  }
+           except:
+              pass
+      self.stats["objective"] = self.tryGetObjective()
       if self._lastError:
         self.stats["outmsg"] = str(self._lastError)
-        self.stats["timelimit"] = self._ampl.getValue("solve_result")
+        self.stats["timelimit"] = solve_result
         self.stats["errormsg"] = self._lastError
       else:
         self.stats["outmsg"] = self._ampl.getValue("solve_message")
-        self.stats["timelimit"] = self._ampl.getValue("solve_result")
-      # self._terminateAMPL()          ## This breaks end2end tests
+        self.stats["timelimit"] = solve_result
       return
 
     def setupOptions(self, model: Model):
@@ -283,17 +369,24 @@ class AMPLRunner(object):
             return
         (slvname, slvval) = self._solver.getAMPLOptions(model)         # slvname = 'gurobi_options' e.g.
         if model.hasOptions():
-            optmap = model.getOptions()
+            optmap = {}                                 # Case option -> solver's AMPL option
+            for name, val in model.getOptions().items():
+                optmap[self._solver.mapCaseOptionName(name)] = val
             for name, val in optmap.items():
-                if name.endswith("SOLVER_options"):               # Any-solver option
-                    if not slvname in optmap:                     # When no 'gurobi_options'
-                        name = slvname
-                    else:
-                        continue                                  # Skip as solver-specific given
+                if name.endswith("_options"):               # A solver option
+                    if name.endswith("SOLVER_options"):         # Any-solver option
+                        if not slvname in optmap:               # When no 'gurobi_options'
+                            name = slvname
+                        else:
+                            continue                            # Skip as solver-specific given
+                    val_before = self._ampl.getOption(name)
+                    if val_before is not None:       # E.g., if the tests are run with mp_options='cvt:prod=0',
+                        val += ' '                   # we append the new value.
+                        val += val_before            # Can be useful for MP2NL.
                 if slvname==name:
                     slvval = slvval + ' ' + val                   # Prepend 'default' options like nthreads
                 else:
-                    self._ampl.setOption(name, val)
+                    self._ampl.setOption(name, val)      # After the solve we reset options in _ampl.
         if self._optionsExtra:
             slvval = slvval + ' ' + self._optionsExtra
         if (len(slvval)>0):
@@ -306,25 +399,89 @@ class AMPLRunner(object):
             self._assertAndRecord(expsol, self.stats["objective"],
                                   "objective")
         if model.hasExpectedValues():
-            for name, ev in model.getExpectedValues().items():
+            for name, ev in model.getExpectedValues(
+                    self._solver.getCategory()).items():
                 self.stats["eval_done"] = True
                 try:
-                    val = self._ampl.getValue(name)
+                    if name.startswith("option "):
+                        val = self._ampl.option[name[7:]]
+                    else:
+                        val = self._ampl.getValue(name)
                     self._assertAndRecord(ev, val,
                         "value of entity '{}'".format(name))
                 except:
-                    self.stats["eval_fail_msg"] = "error retrieving '{}'".format(name)
+                    self.stats.setdefault("eval_fail_msg", []).append( \
+                        "error retrieving '{}'".format(name))
+        if model.hasExpectedOutput():
+            output = str(self.stats.get("outmsg", ""))
+            if self._outputHandler.is_recording_output():
+                output += self.get_output()
+            for oitem in model.getExpectedOutput():
+                self.stats["eval_done"] = True
+                if str(oitem) not in output:
+                    self.stats.setdefault("eval_fail_msg", []).append( \
+                    "string  '" + str(oitem) + \
+                    "'  is not found in the output")
 
     def _assertAndRecord(self, expval, val, msg):
+        if isinstance(expval, dict):
+            self._assertAndRecordObjectValue(expval, val, msg)
+        else:
+            self._assertAndRecordNonObjectValue(expval, val, msg)
+
+    def _assertAndRecordNonObjectValue(self, expval, val, msg):
+        if isinstance(expval, str):
+            if expval == "_anyvalue":
+                return
+        if isinstance(expval, list):       ## any of the listed values
+            for ev in expval:
+                if isinstance(ev, (int, float)) and isinstance(val, (int, float)):
+                    if math.isclose(ev, val, rel_tol=1e-5, abs_tol=1e-5):
+                        return
+                elif ev == val:
+                    return
+            self.stats.setdefault("eval_fail_msg", []).append(msg + \
+                ": value " + str(val) + \
+                ", expected one of " + str(expval))
+            return
         b1 = isinstance(expval, (int, float))
         b2 = isinstance(val, (int, float))
         uneq = not \
             math.isclose(expval, val, rel_tol=1e-5, abs_tol=1e-5) \
             if b1 and b2 else expval != val
         if uneq:
-            self.stats["eval_fail_msg"] = msg + \
+            self.stats.setdefault("eval_fail_msg", []).append(msg + \
                 ": value " + str(val) + \
-                ", expected " + str(expval)
+                ", expected " + str(expval))
+
+    def _assertAndRecordObjectValue(self, expval, val, msg):
+        errmsg = ''
+        for kw, refv in expval.items():
+            if "max"==str(kw):
+                if val>refv:
+                    errmsg = str(val) + " exceeds " + str(refv)
+                    break
+            elif "min"==str(kw):
+                if val<refv:
+                    errmsg = str(val) + " is below " + str(refv)
+                    break
+            elif "contains"==str(kw):
+                if not isinstance(val, str):
+                    errormsg = str(val) + " should be a string"
+                    break
+                if not isinstance(refv, list):
+                    refv=[refv]
+                for rv in refv:
+                    if str(rv) not in val:
+                        errmsg = str(val) + " does not contain " + str(rv)
+                        break
+            else:
+                errmsg = str(val) + \
+                    ": reference object contains an unknown keyword '" + \
+                    str(kw) + "'"
+        if '' != errmsg:
+            self.stats.setdefault("eval_fail_msg", []).append(msg + \
+                ": value " + errmsg)
 
     def getName(self):
         return "ampl-" + self._solver.getName()

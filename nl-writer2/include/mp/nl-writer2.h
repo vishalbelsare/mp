@@ -4,7 +4,7 @@
  NL is a format for representing optimization problems such as linear,
  quadratic, nonlinear, complementarity and constraint programming problems
  in discrete or continuous variables. It is described in the technical report
- "Writing .nl Files" (http://www.cs.sandia.gov/~dmgay/nlwrite.pdf).
+ "Writing .nl Files" (https://ampl.github.io/nlwrite.pdf).
 
  This is a complete reusable C++ implementation of an NL writer.
 
@@ -168,6 +168,10 @@ protected:
   template <class Index, class Value>
   class SparseVectorWriter {
   public:
+    /// Index type
+    using index_type = Index;
+    /// Value type
+    using value_type = Value;
     /// Construct
     SparseVectorWriter() { }
     /// Not construct(const&)
@@ -216,6 +220,12 @@ protected:
   template <class Index, class Value>
   class SingleSparseVecWrtFactory {
   public:
+    /// Index type
+    using index_type = Index;
+    /// Value type
+    using value_type = Value;
+    /// Vector writer type
+    using writer_type = SparseVectorWriter<Index, Value>;
     /// Construct.
     /// @param fmt: format string for printf()
     ///  containing %d for the number of sparse elements
@@ -277,6 +287,18 @@ protected:
     ExprArgWriter(NLWriter2& nlw, int na);
     /// Destruct. Check that all arguments are written.
     ~ExprArgWriter();
+
+    /// Don't copy-construct
+    ExprArgWriter(const ExprArgWriter& ) = delete;
+    /// Don't assign
+    void operator=(const ExprArgWriter& ) = delete;
+
+    /// Do move-construct
+    ExprArgWriter(ExprArgWriter&& eaw)
+        : nlw_(eaw.nlw_), nargs_(eaw.nargs_) { eaw.nargs_=0; }
+    /// Do move-assign
+    ExprArgWriter& operator=(ExprArgWriter&& eaw)
+    { assert(&nlw_==&eaw.nlw_); std::swap(nargs_, eaw.nargs_); return *this; }
 
     /// Write the next arg as Feeder's native expression.
     /// This recursively calls Feeder::FeedExpr().
@@ -345,6 +367,16 @@ protected:
   public:
     /// Construct
     ExprWriter(NLWriter2& nlw) : nlw_(nlw) { }
+
+    /// Don't copy-construct
+    ExprWriter(const ExprWriter& ) = delete;
+    /// Don't copy-assign
+    void operator=(const ExprWriter& ) = delete;
+
+    /// Do move-construct
+    ExprWriter(ExprWriter&& ) = default;
+    /// Do move-assign
+    ExprWriter& operator=(ExprWriter&& ) = default;
 
     /// Write Feeder's native expression.
     /// This recursively calls Feeder::FeedExpr().
@@ -551,7 +583,7 @@ protected:
     /// Start writing an int-valued suffix.
     SuffixIntWriter StartIntSuffix(
         const char* name, int kind, int nnz);
-    /// Start writing an dbl-valued suffix.
+    /// Start writing a dbl-valued suffix.
     SuffixDblWriter StartDblSuffix(
         const char* name, int kind, int nnz);
 

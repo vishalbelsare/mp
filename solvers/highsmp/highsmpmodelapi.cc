@@ -18,34 +18,40 @@ void HighsModelAPI::AddVariables(const VarArrayDef& v) {
     ubs[i] = std::isinf(v.pub()[i]) ?  Infinity() : v.pub()[i];
 
   }
-  HIGHS_CCALL(Highs_addCols(lp(), v.size(), costs.data(), lbs.data(), ubs.data(), 0, NULL, NULL, NULL));
+  HIGHS_CCALL(loader().Highs_addCols(lp(), v.size(), costs.data(), lbs.data(), ubs.data(), 0, NULL, NULL, NULL));
   if (intIndices.size() > 0) {
     std::vector<int> types(intIndices.size(), 1); // TODO get the 1 from solver API?
-    HIGHS_CCALL(Highs_changeColsIntegralityBySet(lp(), intIndices.size(),
+    HIGHS_CCALL(loader().Highs_changeColsIntegralityBySet(lp(), intIndices.size(),
       intIndices.data(), types.data()));
   }
   if (v.pnames())
     for (int i = 0; i < v.size(); i++)
-      HIGHS_CCALL(Highs_passColName(lp(), i, v.pnames()[i]));
+      HIGHS_CCALL(loader().Highs_passColName(lp(), i, v.pnames()[i]));
+  accObjectives().setNumVars(v.size());
+  has_int_vars_ = has_int_vars_ || !intIndices.empty();
 }
 
 void HighsModelAPI::SetLinearObjective( int iobj, const LinearObjective& lo ) {
-  if (iobj < 1) {
-  // Highs_changeObjectiveOffset(highs, offset); TODO offset?
-    HIGHS_CCALL(Highs_changeColsCostBySet(lp(), lo.num_terms(), 
-      lo.vars().data(), lo.coefs().data()));
-    HIGHS_CCALL(Highs_changeObjectiveSense(lp(), 
-                    obj::Type::MAX==lo.obj_sense() ? 
-      kHighsObjSenseMaximize : kHighsObjSenseMinimize) );
-  } else {
-      throw std::runtime_error("HighS does not support multiple objectives.");
-  }
+  // Note:
+  // In case of native multiobjectives, HiGHS wants priorities and other meta info
+  // passed when adding the objectives, that is available in Backend::InputExtras.
+  // So we accumulate the objectives here and set them in HiGHS in Backend::InputExtras.
+  accObjectives().add(lo.vars(), lo.coefs(), lo.obj_sense()==obj::Type::MAX);
 }
 
 
 void HighsModelAPI::SetQuadraticObjective(int iobj, const QuadraticObjective& qo) {
+  if (has_int_vars_)              // HiGHS would fail with a generic error
+    throw std::runtime_error(
+        "HiGHS cannot solve MIQP: the objective is quadratic and there "
+        "are integer variables. Set cvt:quadobj=0 to reformulate "
+        "the quadratic objective terms.");
   if (1 > iobj) {
-    SetLinearObjective(iobj, qo);
+    auto lo= qo.GetLinTerms();
+    // Note that the linear part is only stored (see SetLinearObjective)
+    accObjectives().add(lo.vars(), lo.coefs(), qo.obj_sense() == obj::Type::MAX);
+    
+
     const auto& qt = qo.GetQPTerms();
     std::vector<int> startCols(NumVars());
     std::vector<double> coeffs(qt.size());
@@ -62,41 +68,47 @@ void HighsModelAPI::SetQuadraticObjective(int iobj, const QuadraticObjective& qo
         }
       } else {
         startCols[j] = q;
-        // Could do these but not needed:
-        //        index.push_back(j);
-        //        coeffs.push_back(0.0);  // empty diagonal element
       }
     }
-    HIGHS_CCALL(Highs_passHessian(lp(), NumVars(), qt.size(),
+    HIGHS_CCALL(loader().Highs_passHessian(lp(), NumVars(), qt.size(),
                                   kHighsHessianFormatTriangular,
       startCols.data(), qt.pvars2(), coeffs.data()));
   }
   else {
-    throw std::runtime_error("Multiple quadratic objectives not supported");
+    throw std::runtime_error("Multiple quadratic objectives not supported natively, try using multi-objective\nemulator by setting option multiobj=2");
   }
 }
 
 void HighsModelAPI::AddConstraint(const LinConRange& lc) {
-  AccConstraints.add(lc);
+  acc_constraints_.add(lc);
 }
 void HighsModelAPI::AddConstraint(const LinConLE& lc) {
-  AccConstraints.add(lc);
+  acc_constraints_.add(lc);
 }
 void HighsModelAPI::AddConstraint(const LinConEQ& lc) {
-  AccConstraints.add(lc);
+  acc_constraints_.add(lc);
 }
 void HighsModelAPI::AddConstraint(const LinConGE& lc) {
-  AccConstraints.add(lc);
+  acc_constraints_.add(lc);
 }
 
 void HighsModelAPI::FinishProblemModificationPhase() {
-  HIGHS_CCALL(Highs_addRows(lp(),
-    AccConstraints.lb.size(),
-    AccConstraints.lb.data(),
-    AccConstraints.ub.data(),
-    AccConstraints.coeffs.size(),
-    AccConstraints.starts.data(),
-    AccConstraints.indices.data(),
-    AccConstraints.coeffs.data()));
+  HIGHS_CCALL(loader().Highs_addRows(lp(),
+    acc_constraints_.lb.size(),
+    acc_constraints_.lb.data(),
+    acc_constraints_.ub.data(),
+    acc_constraints_.coeffs.size(),
+    acc_constraints_.starts.data(),
+    acc_constraints_.indices.data(),
+    acc_constraints_.coeffs.data()));
+    // reinitialize accumulator for model modification 
+    acc_constraints_ = AccConstraints();     
+
+  // If in multiobjective simulator, set the objective each time
+  if (accObjectives().hadEmulatedMultiObj()) {
+    accObjectives().setAllInHighs(lp());
+    accObjectives().clear();
+  }
 }
+
 } // namespace mp

@@ -1,7 +1,7 @@
 #ifndef CONSTR_PREPRO_H
 #define CONSTR_PREPRO_H
 
-/**
+/*
  * Preprocess flat constraints before adding.
  *
  * Possible tasks:
@@ -12,6 +12,8 @@
  * 3. Narrow domain of the result variable,
  *    so that reformulations can be tight
  *    (variable bounds, integrality.)
+ *    HOWEVER this now happens only for logical expressions
+ *    since nonlinear solvers prefer unbounded result.
  *
  * Possible design for future:
  * A. Standardize fail procedure for infeasibility
@@ -22,8 +24,12 @@
  *    Example:
  *
  *      max(x, y) <= 5;
+ *
+ * After functional constraints, this file currently contains
+ * preprocessing for static constraints.
  */
 
+#include <type_traits>
 #include <cmath>
 #include <algorithm>
 
@@ -62,6 +68,35 @@ public:
   template <class PreprocessInfo>
   void PreprocessConstraint(
       PowConstraint& c, PreprocessInfo& prepro) {
+    auto x = c.GetArguments()[0];
+    auto lbx = MPCD( lb(x) );
+    if (lbx >= 0.0) {
+      auto y = c.GetArguments()[1];
+      auto ubx = MPCD( ub(x) );
+      auto lby = MPCD( lb(y) );
+      auto uby = MPCD( ub(y) );
+      if (lbx >= 1e-10 || lby >= 1e-10) {
+        std::array<double, 4> rb
+            {std::pow(lbx, lby), std::pow(lbx, uby),
+                                 std::pow(ubx, lby), std::pow(ubx, uby)};
+        prepro.narrow_result_bounds(
+            *std::min_element(rb.begin(), rb.end()),
+            *std::max_element(rb.begin(), rb.end()) );
+      } else {
+        std::array<double, 4> rb
+            {std::pow(1e-10, lby), std::pow(1e-10, uby),
+             std::pow(ubx, lby), std::pow(ubx, uby)};
+        prepro.narrow_result_bounds(
+            *std::min_element(rb.begin(), rb.end()),
+            *std::max_element(rb.begin(), rb.end()) );
+      }
+    }
+  }
+
+  /// Preprocess PowConstExp
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      PowConstExpConstraint& c, PreprocessInfo& prepro) {
     auto pwr = c.GetParameters()[0];
     if (0.0==std::fabs(pwr)) {              // decidable case
       prepro.narrow_result_bounds(1.0, 1.0);
@@ -99,12 +134,60 @@ public:
     }
   }
 
+  /// Preprocess SignpowConstExp
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      SignpowConstExpConstraint& c, PreprocessInfo& prepro) {
+    auto pwr = c.GetParameters()[0];
+    auto arg = c.GetArguments()[0];
+    if (1.0==pwr) {                         // decidable case
+      prepro.set_result_var(arg);
+      return;
+    }
+    auto& m = MP_DISPATCH( GetModel() );
+    bool lbx_neg = m.lb(arg)<0.0;
+    bool ubx_pos = m.ub(arg)>0.0;
+    bool pow_int = MPD( is_integer_value(pwr) );
+    if ((pwr<0 && lbx_neg)) {       // a<0, lbx<=0
+      // We _COULD_ PL approximate when pwr<0, pow_int, lbx<0.
+      // But we leave it here (don't even narrow result).
+      // Gurobi 13 does not handle a<1 (&& lbx<0).
+    } else {
+      auto lbr = signpow(m.lb(arg), pwr),
+          ubr = signpow(m.ub(arg), pwr);
+      prepro.narrow_result_bounds( lbr, ubr );
+      if (pow_int && pwr>=0.0) {
+        // result integer if x integer, a>=0
+        prepro.set_result_type( m.var_type(arg) );
+      }
+    }
+  }
+
+  /// Preprocess Logistic
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      LogisticConstraint& c, PreprocessInfo& prepro) {
+    auto arg = c.GetArguments()[0];
+    auto& m = MP_DISPATCH( GetModel() );
+    auto lbx = m.lb(arg);
+    auto ubx = m.ub(arg);
+    auto lb = (lbx > -INFINITY) ?
+                  1.0 / (1.0 + std::exp(-lbx)) : 0.0;
+    auto ub = (ubx < INFINITY) ?
+                  1.0 / (1.0 + std::exp(-ubx)) : 1.0;
+    prepro.narrow_result_bounds(lb, ub);
+  }
+
   /// Preprocess Min
   template <class PreprocessInfo>
   void PreprocessConstraint(
       MinConstraint& c, PreprocessInfo& prepro) {
     auto& m = MP_DISPATCH( GetModel() );
     auto& args = c.GetArguments();
+    if (MPCD( IfPreproUnnest() & 8 ))
+      IntegrateNested(c);
+    if (MPCD( IfPreproSortUnify() ))
+      SortAndUnify(args);
     prepro.narrow_result_bounds( m.lb_array(args),
                           m.ub_min_array(args) );
     prepro.set_result_type( m.common_type(args) );
@@ -116,6 +199,10 @@ public:
       MaxConstraint& c, PreprocessInfo& prepro) {
     auto& m = MP_DISPATCH( GetModel() );
     auto& args = c.GetArguments();
+    if (MPCD( IfPreproUnnest() & 8 ))
+      IntegrateNested(c);
+    if (MPCD( IfPreproSortUnify() ))
+      SortAndUnify(args);
     prepro.narrow_result_bounds( m.lb_max_array(args),
                           m.ub_array(args) );
     prepro.set_result_type( m.common_type(args) );
@@ -132,7 +219,7 @@ public:
     if (lb>=0.0) {  // When result var is set, \a c is skipped
       prepro.set_result_var(argvar);
       return;
-    } else if (ub<=0.0) {
+    } else if (ub<=0.0 && !MPCD( IfPreproBoundsOnly() )) {
       auto res = MPD( AssignResult2Args(   // create newvar = -argvar
             LinearFunctionalConstraint({ {{-1.0}, {argvar}}, 0.0 })) );
       prepro.set_result_var(res.get_var());
@@ -159,6 +246,9 @@ public:
     if (0!=MPD( IfPreproEqBinVar() ))
       if (ReuseEqualityBinaryVar(c, prepro))
         return;
+    const auto& con = c.GetConstraint();
+    if (!IfPreprocessVarBnd<0>(con.GetBody(), con.rhs(), prepro))
+      IfPreprocessHole<0>(con.GetBody(), con.rhs(), prepro);
   }
 
   /// See if the argument of a conditional
@@ -231,7 +321,7 @@ public:
     auto& m = MP_DISPATCH( GetModel() );
     const auto& con = c.GetConstraint();
     const auto& body = con.GetBody();
-    if (1==body.size()) {                           // var==const
+    if (1==body.size() && !MPCD( IfPreproBoundsOnly() )) {   // var==const; complement var
       assert( 1.0==body.coef(0) );                  // is normalized
       int var = body.var(0);
       if (m.is_binary_var(var)) {            // See if this is binary var==const
@@ -260,23 +350,101 @@ public:
     prepro.set_result_type( var::INTEGER );
     assert(kind);
     auto& algc = cc.GetArguments();
-    if (!IsNormalized(cc)) {
-      auto arg1 = algc;
-      arg1.negate();    // Negate the terms and sense
+    auto bnt = MPD(
+        ComputeBoundsAndType(algc.GetBody()) );
+    PreprocessRoundRHS(algc, bnt);
+    auto rhs = algc.rhs();
+    if (IfPreprocessDecidable<kind>(prepro, bnt, rhs))
+      return;
+    if (IfPreprocessNormalize(cc, prepro))
+      return;
+    if (IfPreprocessVarBnd<kind>(algc.GetBody(), rhs, prepro)
+        || IfPreprocessHole<kind>(algc.GetBody(), rhs, prepro))
+      return;
+    if (IfPreprocess2BndEq(cc, prepro, bnt))
+      return;
+    IfPreprocess2Related(cc, prepro, bnt);
+  }
+
+  /// Comparison  a*x (kind) rhs  inside a domain hole of x
+  /// (cvt:pre:vbnd bit 2, see var_bnd_impl.h):
+  /// reuse the comparison x >= b or its negation.
+  /// @return true if rewritten
+  template <int kind, class Body, class PreprocessInfo>
+  bool IfPreprocessHole(
+      const Body& body, double rhs, PreprocessInfo& prepro) {
+    if constexpr (std::is_same_v<Body, LinTerms>) {
+      if (1 != body.size() || !MPCD( IfPreproHoles() )
+          || MPCD( IfPreproBoundsOnly() ))
+        return false;
+      const int x = body.var(0);
+      const auto side = MPCD( GetVarDomainHoles() ).Classify(
+            x, body.coef(0), kind, rhs, MPCD( lb(x) ), MPCD( ub(x) ));
+      if (!side.side_)
+        return false;
+      const int r = MPD( AssignResultVar2Args(
+                           CondLinConGE{ { {{1.0}, {x}}, side.b_ } }) );
+      prepro.set_result_var(side.side_ > 0 ? r : MPD( MakeComplementVar(r) ));
+      return true;
+    }
+    return false;
+  }
+
+  /// Comparison  a*x (kind) rhs  decided by variable-bound
+  /// constraints on x (cvt:pre:vbnd, see var_bnd_impl.h):
+  /// reuse the binary or its negation.
+  /// @return true if decided
+  template <int kind, class Body, class PreprocessInfo>
+  bool IfPreprocessVarBnd(
+      const Body& body, double rhs, PreprocessInfo& prepro) {
+    if constexpr (std::is_same_v<Body, LinTerms>) {
+      if (1 != body.size() || !MPCD( IfPreproVarBnd() )
+          || MPCD( IfPreproBoundsOnly() ))
+        return false;
+      const int x = body.var(0);
+      const auto lit = MPCD( GetVarBinaryBounds() ).Decide(
+            x, body.coef(0), kind, rhs, MPCD( lb(x) ));
+      if (lit.var_ < 0)
+        return false;
       prepro.set_result_var(
+            lit.val_ ? lit.var_ : MPD( MakeComplementVar(lit.var_) ));
+      return true;
+    }
+    return false;
+  }
+
+  /// (Non)strict inequalities
+  /// @return true if was normalized
+  /// @todo If decidable, avoid creating the fixed var?
+  ///   E.g. in prepro, "reuseAssignResult()"?
+  template <class PreprocessInfo, class Body, int kind>
+  bool IfPreprocessNormalize(
+      ConditionalConstraint<
+          AlgebraicConstraint< Body, AlgConRhs<kind> > >& cc,
+      PreprocessInfo& prepro) {
+    if (!IsNormalized(cc) && !MPCD( IfPreproBoundsOnly() )) {
+      auto arg1 = cc.GetArguments();
+      arg1.negate();    // Negate the terms and sense
+      prepro.set_result_var(   // Add the normalized one instead
             MPD( AssignResultVar2Args(
                    ConditionalConstraint<
                      AlgebraicConstraint< Body, AlgConRhs<
                    -kind> > > { {
                    std::move(arg1.GetBody()), arg1.rhs()
                  } } ) ));
-      return;
+      return true;
     }
-    // See if we need to round the constant term
+    return false;
+  }
+
+  /// See if need to round the RHS
+  template <class Body, int kind, class BndNType>
+  void PreprocessRoundRHS(
+      AlgebraicConstraint< Body, AlgConRhs<kind> >& algc,
+      const BndNType& bnt) {
     auto rhs = algc.rhs();
-    auto bnt_body = MPD(
-          ComputeBoundsAndType(algc.GetBody()) );
-    if (var::INTEGER == bnt_body.get_result_type()
+    if (MPCD( IfPreproIneqRHS() )
+        && var::INTEGER == bnt.get_result_type()
         && std::floor(rhs) != std::ceil(rhs)) {  // rhs not int
       if (1==kind)  // algc is >=
         algc.set_rhs( std::ceil(rhs) );
@@ -291,6 +459,138 @@ public:
     }
   }
 
+  /// Decidable inequality?
+  template <int kind, class PreprocessInfo, class BndNType>
+  bool IfPreprocessDecidable(
+      PreprocessInfo& prepro, const BndNType& bnt, double rhs) {
+    if (MPCD( IfPreproIneqResBounds() )) {
+      if ((1==kind && bnt.lb()>=rhs)
+          || (-1==kind && bnt.ub()<=rhs)
+          || (2==kind && bnt.lb()>rhs)
+          || (-2==kind && bnt.ub()<rhs)) {
+        prepro.narrow_result_bounds(1.0, 1.0);   // FIX: TRUE
+        return true;
+      } else {
+        if ((1==kind && bnt.ub()<rhs)
+            || (-1==kind && bnt.lb()>rhs)
+            || (2==kind && bnt.ub()<=rhs)
+            || (-2==kind && bnt.lb()>=rhs)) {
+          prepro.narrow_result_bounds(0.0, 0.0);   // FIX: FALSE
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  /// See if we can reuse "==LB/UB"
+  template <class PreprocessInfo,
+           class Body, int kind,
+           class BndNType>
+  bool IfPreprocess2BndEq(
+      ConditionalConstraint<
+          AlgebraicConstraint< Body, AlgConRhs<kind> > >& cc,
+      PreprocessInfo& prepro, const BndNType& bnt) {
+    if (MPCD( IfPreproIneq2BndEq() ) && !MPCD( IfPreproBoundsOnly() )) {
+      auto& algc = cc.GetArguments();
+      auto convert = [&](double rhseq, bool fNegate=false) {
+        auto res = MPD( AssignResultVar2Args(
+            ConditionalConstraint<
+                AlgebraicConstraint<
+                    Body, AlgConRhs<
+                        0 > > > { {         // equality
+                std::move(algc.GetBody()),  // move is ok?
+                rhseq
+            } } ) );
+        if (fNegate)
+          res = MPD( AssignResultVar2Args(
+              NotConstraint( {res} ) ) );
+        prepro.set_result_var( res );
+        return true;             // for convenience
+      };
+      auto rhs = algc.rhs();     // Is this ok for floats?
+      auto cmpEps = MPCD( ComparisonEps( bnt ) );
+      if (1==kind && rhs>bnt.ub()-cmpEps)  // expr >= rhs > ub-eps
+        return convert(bnt.ub());               // replace as expr==ub
+      if (2==kind && rhs>=bnt.ub()-cmpEps) // expr > rhs >= ub-eps
+        return convert(bnt.ub());               // replace as expr==ub
+      if (-1==kind && rhs<bnt.lb()+cmpEps) // expr <= rhs < lb+eps
+        return convert(bnt.lb());
+      if (-2==kind && rhs<=bnt.lb()+cmpEps)// expr < rhs <= lb+eps
+        return convert(bnt.lb());
+      if (1==kind && rhs<=bnt.lb()+cmpEps) // expr >= rhs <= lb+eps
+        return convert(bnt.lb(), true);         // replace as expr!=lb
+      if (2==kind && rhs<bnt.lb()+cmpEps)  // expr > rhs < lb+eps
+        return convert(bnt.lb(), true);         // replace as expr!=lb
+      if (-1==kind && rhs>=bnt.ub()-cmpEps)// expr <= rhs >= ub-eps
+        return convert(bnt.ub(), true);
+      if (-2==kind && rhs>bnt.ub()-cmpEps) // expr < rhs > ub-eps
+        return convert(bnt.ub(), true);
+    }
+    return false;
+  }
+
+  /// Try & reuse an inequality
+  template <int kind, class PreprocessInfo, class Body>
+  bool ReuseConditional(PreprocessInfo& prepro,
+             const Body& body, double rhs, bool fNegate=false) {
+    ConditionalConstraint<
+        AlgebraicConstraint< Body, AlgConRhs<kind> > > con({body, {rhs}});
+    auto i = MPD( MapFind(con) );
+    if (i>=0) {
+      auto& ck = MPCD( GetConstraintKeeper(&con) );
+      auto resvar = ck.GetConstraint(i).GetResultVar();    // @todo dirty?
+      if (fNegate)
+        resvar = MPD( AssignResultVar2Args(
+            NotConstraint( {resvar} ) ) );
+      prepro.set_result_var(resvar);
+      return true;
+    }
+    return false;
+  }
+
+  /// See if we can reuse a related inequality
+  template <class PreprocessInfo,
+           class Body, int kind,
+           class BndNType>
+  bool IfPreprocess2Related(
+      ConditionalConstraint<
+          AlgebraicConstraint< Body, AlgConRhs<kind> > >& cc,
+      PreprocessInfo& prepro, const BndNType& bnt) {
+    if (MPCD( IfPreproIneq2Related() ) && !MPCD( IfPreproBoundsOnly() )) {
+      auto& algc = cc.GetArguments();
+      auto rhs = algc.rhs();
+      auto cmpEps = MPCD( ComparisonEps( bnt ) );
+      auto isGEGT = (kind>0);
+      auto isStrict = (1!=kind*kind);
+      // rhs's for the opposite inequalities:
+      // e.g. for cc being <=c it's <c+eps and vice versa,
+      // for >c it's >=c+eps and vice versa
+      auto rhsLo=rhs, rhsHi=rhs;
+      if (isGEGT == isStrict)
+        rhsHi += cmpEps;
+      else
+        rhsLo -= cmpEps;
+      if (-2!=kind
+          && ReuseConditional<-2>(
+              prepro, algc.GetBody(), rhsHi, kind>0))
+        return true;     // Reuse <rhsHi
+      if (-1!=kind
+          && ReuseConditional<-1>(
+              prepro, algc.GetBody(), rhsLo, kind>0))
+        return true;     // Reuse <=rhsLo
+      if (1!=kind
+          && ReuseConditional<1>(
+              prepro, algc.GetBody(), rhsHi, kind<0))
+        return true;     // Reuse <rhsHi
+      if (2!=kind
+          && ReuseConditional<2>(
+              prepro, algc.GetBody(), rhsLo, kind<0))
+        return true;     // Reuse <rhsHi
+    }
+    return false;
+  }
+
   /// Dave experiments with logic presolve.
   ///
   /// @return true if constraint is empty
@@ -300,12 +600,13 @@ public:
       const ConditionalConstraint<SubCon>& cc,
       PreprocessInfo& prepro) {
     if (cc.GetConstraint().empty()) {
+#ifndef NDEBUG
       MPD(AddWarning("empty_cmp",
                      "Empty comparison in a logical constraint\n  of type '"
-                     + std::string(cc.GetTypeName())
-                     + "'.\n  Contact authors of the NL model."));
+                     + std::string(cc.GetTypeName()) + "'"));
+#endif
       auto res = ComputeValue(cc, std::vector<double>{});
-      prepro.narrow_result_bounds(res, res);
+      prepro.narrow_result_bounds(res, res);    // here should be ok
       return true;
     }
     return false;
@@ -335,8 +636,14 @@ public:
       }
       con.GetArguments() = arg1;
     }
-    if (MPCD( IfPreproNestedAndsOrs() ))
+    if (MPCD( IfPreproUnnest() & 1 ))
       IntegrateNested(con);            // flatten nested
+    if (MPCD( IfPreproSortUnify() ))
+      SortAndUnify(con.GetArguments());
+    if (con.GetArguments().empty())
+      prepro.narrow_result_bounds(1.0, 1.0);  // empty conjunction
+    if (1 == con.GetArguments().size())
+      prepro.set_result_var(con.GetArguments()[0]);
   }
 
   template <class PreprocessInfo>
@@ -363,8 +670,14 @@ public:
       }
       con.GetArguments() = arg1;
     }
-    if (MPCD( IfPreproNestedAndsOrs() ))
+    if (MPCD( IfPreproUnnest() & 1 ))
       IntegrateNested(con);            // flatten nested
+    if (MPCD( IfPreproSortUnify() ))
+      SortAndUnify(con.GetArguments());
+    if (con.GetArguments().empty())
+      prepro.narrow_result_bounds(0.0, 0.0);  // empty disjunction
+    if (1 == con.GetArguments().size())
+      prepro.set_result_var(con.GetArguments()[0]);
   }
 
   /// Count N fixed binary vars
@@ -378,6 +691,7 @@ public:
       if (MPCD( lb(x) ) >= 1.0)
         ++ result.second;
     }
+    assert(result.first + result.second <= (int)vec.size());
     return result;
   }
 
@@ -385,7 +699,7 @@ public:
   template <class Con>
   void IntegrateNested(Con& con) {
     bool fChanges = false;
-    std::vector<int> args_new;
+    VarArray args_new;
     args_new.reserve(con.GetArguments().size());
     for (auto v: con.GetArguments()) {
       if (auto pNested = MPD( template
@@ -394,7 +708,8 @@ public:
         const auto& args2 = pNested->GetArguments();
         args_new.insert(args_new.end(),
                         args2.begin(), args2.end());
-        MPD( DecrementVarUsage(v) );
+        // Not any more #201 #266: now usage++ by FixAsTrue()
+        // MPD( DecrementVarUsage(v) );
       } else {
         args_new.push_back(v);
       }
@@ -405,7 +720,16 @@ public:
 
   template <class PreprocessInfo>
   void PreprocessConstraint(
-      AllDiffConstraint& , PreprocessInfo& prepro) {
+      EquivalenceConstraint& , PreprocessInfo& prepro) {
+    prepro.narrow_result_bounds(0.0, 1.0);
+    prepro.set_result_type( var::INTEGER );
+  }
+
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      AllDiffConstraint& c, PreprocessInfo& prepro) {
+    if (MPCD( IfPreproSortUnify() ))
+      Sort(c.GetArguments());        // @todo warn if duplicates
     prepro.narrow_result_bounds(0.0, 1.0);
     prepro.set_result_type( var::INTEGER );
   }
@@ -413,6 +737,8 @@ public:
   template <class PreprocessInfo>
   void PreprocessConstraint(
       NumberofConstConstraint& con, PreprocessInfo& prepro) {
+    if (MPCD( IfPreproSortUnify() ))
+      Sort(con.GetArguments());
     prepro.narrow_result_bounds(0.0, (double)con.GetArguments().size());
     prepro.set_result_type( var::INTEGER );
   }
@@ -420,6 +746,8 @@ public:
   template <class PreprocessInfo>
   void PreprocessConstraint(
       NumberofVarConstraint& con, PreprocessInfo& prepro) {
+    if (MPCD( IfPreproSortUnify() ))
+      Sort(con.GetArguments());
     prepro.narrow_result_bounds(0.0,     // size()-1: 1st arg is the ref var
                                 (double)con.GetArguments().size()-1);
     prepro.set_result_type( var::INTEGER );
@@ -428,15 +756,24 @@ public:
   template <class PreprocessInfo>
   void PreprocessConstraint(
       CountConstraint& con, PreprocessInfo& prepro) {
+    if (MPCD( IfPreproSortUnify() ))
+      Sort(con.GetArguments());
     prepro.narrow_result_bounds(0.0, (double)con.GetArguments().size());
     prepro.set_result_type( var::INTEGER );
   }
 
   template <class PreprocessInfo>
   void PreprocessConstraint(
-      NotConstraint& , PreprocessInfo& prepro) {
-    prepro.narrow_result_bounds(0.0, 1.0);
-    prepro.set_result_type( var::INTEGER );
+      NotConstraint& nc, PreprocessInfo& prepro) {
+    auto nfixed = count_fixed_01(nc.GetArguments());
+    if (nfixed.first) {
+      prepro.narrow_result_bounds(1.0, 1.0);
+    } else if (nfixed.second) {
+      prepro.narrow_result_bounds(0.0, 0.0);
+    } else {
+      prepro.narrow_result_bounds(0.0, 1.0);
+      prepro.set_result_type( var::INTEGER );
+    }
   }
 
   /// Preprocess Div
@@ -452,7 +789,7 @@ public:
 				u2 < MPD( PracticallyInf() ) &&
         l2 * u2 > 0.0) {
       auto l0 = std::numeric_limits<double>::max();
-      auto u0 = std::numeric_limits<double>::min();
+      auto u0 = std::numeric_limits<double>::lowest();
       {
         l0 = std::min(l0, l1 / l2);
         l0 = std::min(l0, l1 / u2);
@@ -465,6 +802,136 @@ public:
       }
       prepro.narrow_result_bounds( l0, u0 );
     }
+  }
+
+  /// Preprocess Mul: bounds from the products of the argument bounds,
+  /// integer if both arguments are
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      MulConstraint& c, PreprocessInfo& prepro) {
+    auto& m = MPD( GetModel() );
+    auto v1 = c.GetArguments()[0], v2 = c.GetArguments()[1];
+    const double b1[] = {m.lb(v1), m.ub(v1)}, b2[] = {m.lb(v2), m.ub(v2)};
+    if (b1[0] > MPD( PracticallyMinusInf() ) &&
+        b1[1] < MPD( PracticallyInf() ) &&
+        b2[0] > MPD( PracticallyMinusInf() ) &&
+        b2[1] < MPD( PracticallyInf() )) {
+      auto l0 = std::numeric_limits<double>::max();
+      auto u0 = std::numeric_limits<double>::lowest();
+      for (auto x1: b1)
+        for (auto x2: b2) {
+          l0 = std::min(l0, x1*x2);
+          u0 = std::max(u0, x1*x2);
+        }
+      prepro.narrow_result_bounds( l0, u0 );
+    }
+    prepro.set_result_type(
+          var::INTEGER==m.var_type(v1) && var::INTEGER==m.var_type(v2)
+          ? var::INTEGER : var::CONTINUOUS );
+  }
+
+  /// Preprocess floor
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      FloorConstraint& c, PreprocessInfo& prepro) {
+    PreprocessRounding(c, prepro, [](double v) { return std::floor(v); });
+  }
+
+  /// Preprocess ceil
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      CeilConstraint& c, PreprocessInfo& prepro) {
+    PreprocessRounding(c, prepro, [](double v) { return std::ceil(v); });
+  }
+
+  /// Preprocess round
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      RoundConstraint& c, PreprocessInfo& prepro) {
+    PreprocessRounding(c, prepro, [](double v) { return std::nearbyint(v); });
+  }
+
+  /// floor, ceil, round: the integer argument itself,
+  /// otherwise its rounded bounds (monotone functions)
+  template <class Con, class PreprocessInfo, class RoundFn>
+  void PreprocessRounding(
+      Con& c, PreprocessInfo& prepro, RoundFn rnd) {
+    const auto x = c.GetArguments()[0];
+    if (MPCD( is_var_integer(x) )) {
+      prepro.set_result_var(x);
+      return;
+    }
+    prepro.narrow_result_bounds( rnd(MPCD( lb(x) )), rnd(MPCD( ub(x) )) );
+    prepro.set_result_type( var::INTEGER );
+  }
+
+  /// Preprocess x div y = trunc(x/y)
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      IntDivConstraint& c, PreprocessInfo& prepro) {
+    const auto x = c.GetArguments()[0], y = c.GetArguments()[1];
+    const double lx=MPCD( lb(x) ), ux=MPCD( ub(x) ),
+        ly=MPCD( lb(y) ), uy=MPCD( ub(y) );
+    if (0.0==ly && 0.0==uy)
+      MP_RAISE("Division by 0 in 'div'");
+    if (1.0==ly && 1.0==uy && MPCD( is_var_integer(x) )) {
+      prepro.set_result_var(x);
+      return;
+    }
+    prepro.set_result_type( var::INTEGER );
+    if (!IsFiniteRange(lx, ux))
+      return;
+    if (IsFiniteRange(ly, uy) && (ly > 0.0 || uy < 0.0)) {
+      // trunc is monotone: truncate the extreme quotients
+      auto l0 = std::numeric_limits<double>::max();
+      auto u0 = std::numeric_limits<double>::lowest();
+      for (auto x1: {lx, ux})
+        for (auto y1: {ly, uy}) {
+          l0 = std::min(l0, x1 / y1);
+          u0 = std::max(u0, x1 / y1);
+        }
+      prepro.narrow_result_bounds( std::trunc(l0), std::trunc(u0) );
+    } else if (IsIntegerValued(y)) {          // |y| >= 1
+      const auto m = std::max(std::fabs(lx), std::fabs(ux));
+      prepro.narrow_result_bounds( -m, m );
+    }
+  }
+
+  /// Preprocess x mod y = x - y*(x div y):
+  /// |r| < |y|, |r| <= |x|, sign of x
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      ModConstraint& c, PreprocessInfo& prepro) {
+    const auto x = c.GetArguments()[0], y = c.GetArguments()[1];
+    const double lx=MPCD( lb(x) ), ux=MPCD( ub(x) ),
+        ly=MPCD( lb(y) ), uy=MPCD( ub(y) );
+    if (0.0==ly && 0.0==uy)
+      MP_RAISE("Division by 0 in 'mod'");
+    const bool f_int = IsIntegerValued(x) && IsIntegerValued(y);
+    auto b = std::max(std::fabs(lx), std::fabs(ux));
+    if (IsFiniteRange(ly, uy))
+      b = std::min(b,
+                   std::max(std::fabs(ly), std::fabs(uy)) - (f_int ? 1.0 : 0.0));
+    prepro.narrow_result_bounds( lx >= 0.0 ? 0.0 : -b, ux <= 0.0 ? 0.0 : b );
+    if (lx==ux && ly==uy && 0.0!=ly) {              // constant
+      const auto v = lx - ly * std::trunc(lx / ly);
+      prepro.narrow_result_bounds( v, v );
+    }
+    if (f_int)
+      prepro.set_result_type( var::INTEGER );
+  }
+
+  /// Whether \a v is integer: integer type,
+  /// or fixed at an integer value (constants are fixed variables)
+  bool IsIntegerValued(int v) const {
+    return MPCD( is_var_integer(v) )
+        || (MPCD( is_fixed(v) ) && MPCD( fixed_value(v) )
+            == std::round(MPCD( fixed_value(v) )));
+  }
+
+  /// Whether [l, u] is finite
+  bool IsFiniteRange(double l, double u) const {
+    return l > MPCD( PracticallyMinusInf() ) && u < MPCD( PracticallyInf() );
   }
 
   /// Preprocess IfThen
@@ -504,15 +971,22 @@ public:
   void PreprocessConstraint(
       LogConstraint& c, PreprocessInfo& ) {
     auto x = c.GetArguments()[0];  // if no positive lb,
-    if (MPD(lb(x))<=0.0)           // set (fixed) lb=1e-6
-      MPD( NarrowVarBounds(x, 1e-6, MPD( Infty() )) );
+    if (MPCD( IfBoundLogArg() )) {
+      MPD( NarrowVarBounds(x, 0.0, MPD( Infty() )) );
+    } else {
+      MPD( NarrowVarBestBounds(x, 0.0, MPD( Infty() )) );
+    }
   }
 
   template <class PreprocessInfo>
   void PreprocessConstraint(
       LogAConstraint& c, PreprocessInfo& ) {
-    MPD( NarrowVarBounds(
-           c.GetArguments()[0], 0.0, MPD( Infty() )) );
+    if (MPCD( IfBoundLogArg() ))
+      MPD( NarrowVarBounds(
+          c.GetArguments()[0], 0.0, MPD( Infty() )) );
+    else
+      MPD( NarrowVarBestBounds(
+          c.GetArguments()[0], 0.0, MPD( Infty() )) );
   }
 
   template <class PreprocessInfo>
@@ -536,7 +1010,7 @@ public:
   template <class PreprocessInfo>
   void PreprocessConstraint(
       AsinConstraint& , PreprocessInfo& prepro) {
-    prepro.narrow_result_bounds(-MPD(Pi())/2, MPD(Pi()));
+    prepro.narrow_result_bounds(-MPD(Pi())/2, MPD(Pi())/2);
   }
 
   template <class PreprocessInfo>
@@ -585,11 +1059,63 @@ public:
       AtanhConstraint& , PreprocessInfo& ) {
   }
 
+  /// Result bounds from the argument's domain.
+  /// Without them, a PL of a PL (via linear expressions)
+  /// would get an unbounded argument, see cvt:pl:domain.
   template <class PreprocessInfo>
   void PreprocessConstraint(
-      PLConstraint& , PreprocessInfo& ) {
+      PLConstraint& c, PreprocessInfo& prepro) {
+    const auto range = PLResultRange(c);
+    prepro.narrow_result_bounds(range.first, range.second);
   }
 
+  /// Range of a PL's result over its argument's current bounds
+  /// @return {lb, ub}, infinite if unknown
+  std::pair<double, double> PLResultRange(const PLConstraint& c) {
+    const auto x = c.GetArguments()[0];
+    const auto lb = MPD( lb(x) ), ub = MPD( ub(x) );
+    if (lb > ub)                       // infeasible, reported elsewhere
+      return { -INFINITY, INFINITY };
+    return c.GetParameters().GetPLPoints().Range(
+          lb <= MPD( PracticallyMinusInf() ) ? -INFINITY : lb,
+          ub >= MPD( PracticallyInf() ) ? INFINITY : ub);
+  }
+
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      CallConstraint& , PreprocessInfo& ) {
+  }
+
+  template <class PreprocessInfo>
+  void PreprocessConstraint(
+      SDPDotProdConstraint& , PreprocessInfo& ) {
+  }
+
+
+  /// Static constraints.
+  /// @return true iff the constraints has been presolved
+  ///   into something different, no need to keep it.
+  /// @note could accept non-const ref and modify the argument.
+  template <class Con>
+  bool PreprocessStaticConstraint(const Con& )
+  { return false; }
+
+  /// Preprocess Indicator
+  /// @note Necessary for XPRESS 9.4.2
+  template <class SubCon>
+  bool PreprocessStaticConstraint(
+      const IndicatorConstraint<SubCon>& indc) {
+    if (MPCD( is_fixed(indc.get_binary_var()) )) {
+      int fixed_var_val = MPCD( fixed_value(indc.get_binary_var()) );
+      if (fixed_var_val == indc.get_binary_value()) {
+        MPD( AddConstraint(indc.get_constraint()) );
+      } else {
+        // forget
+      }
+      return true;
+    }
+    return false;
+  }
 
 };
 

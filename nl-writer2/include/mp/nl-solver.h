@@ -9,7 +9,7 @@
  NL is a format for representing optimization problems such as linear,
  quadratic, nonlinear, complementarity and constraint programming problems
  in discrete or continuous variables. It is described in the technical report
- "Writing .nl Files" (http://www.cs.sandia.gov/~dmgay/nlwrite.pdf).
+ "Writing .nl Files" (https://ampl.github.io/nlwrite.pdf).
 
 
  Copyright (C) 2024 AMPL Optimization, Inc.
@@ -44,7 +44,7 @@
 
 namespace mp {
 
-class NLHeader;
+struct NLHeader;
 
 /**
   \rst
@@ -229,14 +229,15 @@ public:
   bool ReadSolution(SOLHandler& solh);
 
 protected:
-  void Init();
-  void Destroy();
+  void InitAutoStub();
+  void DestroyAutoStub();
   mp::NLUtils& Utils() const { return *p_ut_; }
 
 private:
   mp::NLUtils utils_;
   mp::NLUtils* p_ut_ = nullptr;
 
+  std::string pathstr_;
   std::string filestub_;
   bool filestubCustom_ = false;
   NLW2_NLOptionsBasic_C nl_opts_;
@@ -245,7 +246,7 @@ private:
   std::unique_ptr<NLHeader> p_nlheader_;
   NLModel::PreprocessData pd_;
 
-  std::string err_msg_;
+  std::string err_msg_ {"Solving not attempted"};    // We don't check if empty
   NLW2_WriteNLResultCode nl_result_
   {NLW2_WriteNL_Unset};
   NLW2_SOLReadResultCode sol_result_

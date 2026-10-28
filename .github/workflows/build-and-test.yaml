@@ -1,0 +1,52 @@
+name:  build-and-test
+run-name: ${{ github.actor }} is building "${{ github.ref_name }}"
+on: [workflow_dispatch] # trigger manually
+
+jobs:
+  build_native:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-20.04, windows-2022, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.16.5
+        with:
+          package-dir: nl-writer2/
+
+      - uses: actions/upload-artifact@v3
+        with:
+          path: ./nl-writer2/nlwpy/wheelhouse/*.whl
+
+  build_with_qemu:
+    #if: github.ref == 'refs/heads/release'
+    name: Build ${{ matrix.build }} wheels for ${{ matrix.arch }}
+    #needs: build_native
+    strategy:
+      matrix:
+        arch: [aarch64]
+        build: [cp37-*, cp38-*, cp39-*, cp310-*, cp311-*, cp312-*]
+    runs-on: ubuntu-20.04
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+        with:
+          platforms: all
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.16.5
+        with:
+          package-dir: nl-writer2/
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          CIBW_BUILD: ${{ matrix.build }}
+
+      - uses: actions/upload-artifact@v3
+        with:
+          path: ./nl-writer2/nlwpy/wheelhouse/*.whl

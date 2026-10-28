@@ -6,7 +6,8 @@
 #include "mp/backend-to-model-api.h"
 
 extern "C" {
-    #include "xprs.h"
+#include "xprs.h"
+#include "xslp.h"
 }
 
 #include "mp/format.h"
@@ -29,6 +30,13 @@ private:
 
 
 /// Common API for Xpressmp classes
+/// Control of the MIP solution pool (XPRS_MSP_*): set on the pool
+/// object, not on the problem. A distinct key type for AddSolverOption();
+/// unscoped so that it converts to int for messages.
+enum MspControl : int {};
+/// Control of the MIP solution enumerator (XPRS_MSE_*)
+enum MseControl : int {};
+
 class XpressmpCommon :
     public Backend2ModelAPIConnector<XpressmpCommonInfo> {
 public:
@@ -47,12 +55,19 @@ protected:
   int getIntAttr(int attr) const;
   double getDblAttr(int attr) const;
   
+  /// Actually all algebraic cons?
   int NumLinCons() const;
+  /// N "original" cons, relevant for NLP presolve
+  int NumLinConsOrig() const;
   int NumVars() const;
+  /// N "original" vars, relevant for NLP presolve
+  int NumVarsOrig() const;
   int NumObjs() const;
   int NumQPCons() const;
   int NumSOSCons() const;
   int NumIndicatorCons() const;
+  int NumPWLs() const;
+  int NumGenCons() const;
 
   std::string getErr()  const{
     char errmsg[512];

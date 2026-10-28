@@ -10,7 +10,8 @@
     }
   },
   {
-    "name": "mipbound_01 bestbound=1 return_mipgap=3",
+    "name": "mipbound_01 bestbound=1return_mipgap=3",
+    "comment": "Undocumented ASL/MP feature: no space after numeric option",
     "tags": [ "linear", "return_mipgap"],
     "options": { "ANYSOLVER_options": "bestbound=1 return_mipgap=3" },
     "objective": 1,
@@ -32,11 +33,23 @@
     }
   },
   {
+    "name": "mipbound_01 objno=0 writegraph",
+    "tags": [ "linear", "return_mipgap"],
+    "options": { "mp_options": "objno=0 writegraph=mipb_01.jsonl" },
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
     "name" : "dietu_stt sensitivity=1",
     "objective" : 74.273820,
-    "options": { "ANYSOLVER_options": "solnsens=1" },
+    "options": {
+      "ANYSOLVER_options": "solnsens=1",
+      "mp2nl_options": "solver_options='solnsens=1'"
+    },
     "tags" : ["linear", "continuous", "sens"],
     "values": {
+      "Buy['SPG'].sensobj": 1.99,
       "Buy['BEEF'].senslbhi": 7.129251700680272,
       "Buy['MCH'].senslblo": -7.274725274725274,
       "Buy['CHK'].sensubhi": 10.97922077922078,
@@ -46,19 +59,52 @@
       "Diet_Min['CAL'].senslblo": 15246.0,
       "Diet_Min['CAL'].senslbhi": 16670.0,
       "Diet_Max['CAL'].sensublo": 16000.0,
+      "Diet_Min['CAL'].sensrhshi": 16670.0,
+      "Diet_Max['CAL'].sensrhslo": 16000.0,
+      "Diet_Min['CAL'].up": 16670.0,
+      "Diet_Max['CAL'].down": 16000.0,
       "if Diet_Max['CAL'].sensubhi >= 1e20 then 1": 1,
       "Buy['CHK'].sensobjhi": 3.443370786516854,
-      "Buy['MTL'].sensobjlo": 1.792727272727273
+      "Buy['MTL'].sensobjlo": 1.792727272727273,
+      "Buy['CHK'].sensobj": 2.59,
+      "Buy['CHK'].current": 2.59,
+      "Buy['CHK'].up": 3.443370786516854,
+      "Buy['MTL'].down": 1.792727272727273
+    }
+  },
+  {
+    "name" : "diet   DUALS ONLY -- EXACT",
+    "files" : ["diet.mod", "diet.dat"],
+    "tags" : ["linear", "continuous"],
+    "objective" : 88.2,
+    "values": {
+      "Diet['A']": 0,
+      "Diet['B1']": 0,
+      "Diet['B2']": 0.126,
+      "Diet['C']": 0
+    }
+  },
+  {
+    "name" : "diet   DUALS ONLY -- GENERAL",
+    "files" : ["diet.mod", "diet.dat"],
+    "tags" : ["linear", "continuous"],
+    "objective" : 88.2,
+    "values": {
+      "sum{i in 1 .. _ncons} _con[i]*_con[i].lb": 88.2
     }
   },
   {
     "name" : "diet_max solnsens=1",
     "files" : ["diet_max.mod", "diet.dat"],
-    "options": { "ANYSOLVER_options": "solnsens=1" },
+    "options": {
+      "ANYSOLVER_options": "solnsens=1",
+      "mp2nl_options": "solver_options='solnsens=1'"
+    },
     "tags" : ["linear", "continuous", "sens"],
     "objective" : 1128.642,
     "values": {
-      "if Diet['A'].senslblo<=-1e20 then 1": 1,
+      "Buy['BEEF'].sensobj": 3.19,
+      "if Diet['A'].senslblo<=-1e19 then 1": 1,
       "Diet['A'].senslbhi": 10000,
       "Diet['A'].sensublo": 7850,
       "Diet['A'].sensubhi": 11600,
@@ -71,29 +117,61 @@
     }
   },
   {
+    "name" : "diet_max   DUALS ONLY",
+    "files" : ["diet_max.mod", "diet.dat"],
+    "tags" : ["linear", "continuous"],
+    "objective" : 1128.642,
+    "values": {
+      "Diet['A']": 0.04788,
+      "Diet['B1']": 0,
+      "Diet['B2']": 0,
+      "Diet['C']": 0.01586
+    }
+  },
+  {
     "name" : "diet_nonrng_max solnsens=1",
     "files" : ["diet_nonrng_max.mod", "diet.dat"],
-    "options": { "ANYSOLVER_options": "solnsens=1" },
+    "options": {
+      "ANYSOLVER_options": "solnsens=1",
+      "mp2nl_options": "solver_options='solnsens=1'"
+    },
     "tags" : ["linear", "continuous", "sens", "sstatus"],
     "objective" : 1128.642,
     "comment": "Diet_Min{} constraints are converted to <= by AMPL",
     "values": {
-      "if Diet_Max['A'].senslblo<=-1e20 then 1": 1,
-      "if Diet_Max['A'].senslbhi>=1e20 then 1": 1,
+      "if Diet_Max['A'].senslblo<=-1e19 then 1": 1,
+      "if Diet_Max['A'].senslbhi>=1e19 then 1": 1,
       "Diet_Max['A'].sensublo": 7850,
       "Diet_Max['A'].sensubhi": 11600,
-      "if Diet_Max['C'].senslblo<=-1e20 then 1": 1,
-      "if Diet_Max['C'].senslbhi>=1e20 then 1": 1,
+      "if Diet_Max['C'].senslblo<=-1e19 then 1": 1,
+      "if Diet_Max['C'].senslbhi>=1e19 then 1": 1,
       "Diet_Max['C'].sensublo": 9466.66666666666666,
       "Diet_Max['C'].sensubhi": 11500,
-      "if Diet_Min['C'].senslblo<=-1e20 then 1": 1,
-      "if Diet_Min['C'].senslbhi>=1e20 then 1": 1,
+      "if Diet_Min['C'].senslblo<=-1e19 then 1": 1,
+      "if Diet_Min['C'].senslbhi>=1e19 then 1": 1,
       "Diet_Min['C'].sensublo": -10000,
-      "if Diet_Min['C'].sensubhi>=1e20 then 1": 1,
+      "if Diet_Min['C'].sensubhi>=1e19 then 1": 1,
       "Diet_Max['A'].status": "upp",
       "Diet_Max['B1'].status": "bas",
       "Diet_Max['B1'].status": "bas",
       "Diet_Max['C'].status": "upp",
+      "Diet_Min['A']": 0,
+      "Diet_Min['B1']": 0,
+      "Diet_Min['B2']": 0,
+      "Diet_Min['C']": 0,
+      "Diet_Max['A']": 0.04788,
+      "Diet_Max['B1']": 0,
+      "Diet_Max['B2']": 0,
+      "Diet_Max['C']": 0.01586
+    }
+  },
+  {
+    "name" : "diet_nonrng_max DUALS ONLY",
+    "files" : ["diet_nonrng_max.mod", "diet.dat"],
+    "tags" : ["linear", "continuous"],
+    "objective" : 1128.642,
+    "comment": "Diet_Min{} constraints are converted to <= by AMPL",
+    "values": {
       "Diet_Min['A']": 0,
       "Diet_Min['B1']": 0,
       "Diet_Min['B2']": 0,
@@ -135,34 +213,59 @@
   {
     "name": "mip_lazy_01",
     "tags": [ "linear", "integer", "lazy_user_cuts" ],
-    "options": { "ANYSOLVER_options": "debug=1" },
+    "options": {
+      "mp_options": "debug=1",
+      "mp2nl_options": "debug=1 solver_options='debug=1'"
+    },
+    "solvers_exclude": ["copt"],
     "objective": 1,
     "values": {
       "Initial.test_quad_constr_lazy": 2
     }
   },
   {
+    "name": "mip_lazy_01 COPT linear lazy",
+    "tags": [ "linear", "integer", "lazy_user_cuts" ],
+    "comment": "COPT marks only linear constraints lazy",
+    "options": {
+      "copt_options": "debug=1"
+    },
+    "solvers": ["copt"],
+    "objective": 1,
+    "values": {
+      "Initial.test_lin_constr_lazy": 1
+    }
+  },
+  {
     "name": "funcpieces_01_lcon funcpiecesuf=1",
     "tags": [ "nonlinear", "funcpieces" ],
-    "options": { "ANYSOLVER_options": "debug=1 funcpiecesuf=1" },
+    "options": { "mp_options": "debug=1 funcpiecesuf=1" },
     "values": {
       "Initial.test_funcpieces_presolved": 38
     }
   },
   {
-    "name": "funcpieces_02",
+    "name": "funcpieces_02 sin log max abs",
     "tags": [ "nonlinear", "funcpieces" ],
-    "options": { "ANYSOLVER_options": "debug=1" },
+    "options": { "mp_options": "debug=1" },
+    "objective": -2.32,
     "values": {
       "Initial.test_funcpieces_presolved": 50
     }
   },
   {
-    "name": "funcpieces_01_01_obj",
+    "name": "funcpieces_01_01_obj acc:_expr=0 objno=2",
     "tags": [ "nonlinear", "funcpieces" ],
-    "options": { "ANYSOLVER_options": "debug=1" },
+    "options": {
+      "mp_options": "debug=1 objno=2",
+      "gurobi_options": "debug=1 acc:_expr=0 objno=2"
+    },
+    "comment": "Gurobi with expressions orders cons differently",
+    "comment1": "This also tests acc:_expr=0",
+    "objective": 1,
     "values": {
-      "Initial.test_funcpieces_presolved": 58
+      "Initial.test_funcpieces_presolved": 58,
+      "_obj[2]": -62.3363
     }
   }
 ]

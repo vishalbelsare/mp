@@ -1,17 +1,151 @@
 .. _features-guide:
 
-Features guide for MP-based AMPL solvers
+Feature guide for MP-based AMPL solvers
 ****************************************
 
 .. highlight:: ampl
 
 The MP framework defines standard *solver features* that solvers might support;
 these are usually characterized by a set of :ref:`solver-options` used to control the feature,
-sometimes suffixes to pass required data and results, and may change the behaviour
-of the solution process. Furthermore, MP offers unified :ref:`solve-result-codes`.
+`AMPL options <https://dev.ampl.com/ampl/reference/options.html>`_ and
+sometimes `AMPL suffixes <https://dev.ampl.com/ampl/reference/suffixes.html>`_
+to pass required data and results, and may change the behaviour
+of the solution process. Below, :ref:`important-features` highlight most commonly used features,
+while :ref:`support-by-solvers` gives more details.
+
+Furthermore, MP offers unified :ref:`solve-result-codes`.
 
 This page presents the semantics of the most common solver features; for a development
 reference see :ref:`howto`.
+
+
+
+.. _important-features:
+
+Important features
+==================
+
+This section lists the most important solver features and options,
+grouped by purpose.
+Which of them a solver offers, its algorithms and their essential controls
+are described on the solver's page on
+`AMPL Development <https://dev.ampl.com/solvers/index.html>`__.
+Options are written by their full names, followed by short names
+that most MP solvers accept as synonyms; ``<solver> -=`` lists them all.
+Options that only some solvers have name those solvers.
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.solve(solver="highs", highs_options="timelimit=60 mipgap=1e-4 threads=4")
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option solver highs;
+         ampl: option highs_options 'timelimit=60 mipgap=1e-4 threads=4';
+         ampl: solve;
+
+.. dropdown:: Limits and gaps
+
+   * ``lim:time`` (``timelimit``) - time limit in seconds.
+     ``lim:soltime`` (Xpress, COPT) - time limit once a feasible solution is found.
+
+   * ``mip:gap``, ``mip:gapabs`` (``mipgap``, ``mipgapabs``) - relative and absolute
+     MIP optimality gaps at which the search stops.
+     :ref:`mip:return_gap <returnMIPgap>` and :ref:`mip:bestbound <returnBestBound>`
+     report the final gap and dual bound.
+
+   * :ref:`plateauStop` (``mip:plateau:time``, ``mip:plateau:abstol``,
+     ``mip:plateau:reltol``, ``mip:plateau:warmup``, plus the gap-based options of
+     :ref:`plateauStopBound`) - stop a MIP search once the incumbent (and, optionally,
+     the MIP gap) has not improved enough for a while.
+
+.. dropdown:: Algorithm and search
+
+   * ``alg:method`` (``method``) - algorithm for continuous problems (LP/QP) and the
+     root relaxation of a MIP, which can have strong impact on solving time;
+     ``mip:nodemethod`` (Gurobi, CPLEX, MOSEK) - the same for the MIP nodes.
+
+   * ``bar:crossover`` (``crossover``) - whether a basic solution is computed after
+     the barrier algorithm; turning it off can save significant time
+     (MOSEK: ``bar:basis``).
+
+   * ``tech:threads``, ``tech:seed`` (``threads``, ``seed``) - number of threads and
+     random seed. A different seed can change a MIP search markedly; compare
+     formulations or solvers over several seeds.
+
+   * :ref:`warm-start` (``alg:start``) - start from the current variable values.
+     :ref:`basisio` (``alg:basis``) and :ref:`fixedModel` (``mip:basis``) - pass and
+     return LP bases.
+
+   * ``alg:relax`` (``relax``) - the solver relaxes integrality after MP's
+     reformulation, so the binaries MP introduces are relaxed too; AMPL option
+     ``relax_integrality`` relaxes the model before it reaches MP.
+
+   * Search emphasis, solver-specific: ``mip:focus`` (Gurobi; CPLEX ``mip:emphasis``),
+     ``mip:heuremphasis`` (Xpress), ``mip:norelheurwork`` (Gurobi),
+     ``alg:solutiontarget`` and ``alg:optimalitytarget`` (Gurobi; CPLEX ``qp:target``).
+
+.. dropdown:: Numerics and tolerances
+
+   * ``alg:feastol``, ``mip:inttol`` (``feastol``, ``inttol``) - feasibility and
+     integrality tolerances; ``lp:opttol`` (``opttol``; Gurobi, Xpress, CPLEX) -
+     reduced cost tolerance.
+
+   * ``pre:solve`` (``presolve``), ``scale`` - solver presolve and scaling;
+     ``alg:numericfocus`` (``numericfocus``; Gurobi, Xpress, CPLEX),
+     ``mip:intfocus`` (Gurobi), ``alg:refineops`` (Xpress) - numerical emphasis.
+     See :ref:`numerical_accuracy`.
+
+.. dropdown:: Reformulation
+
+   * ``cvt:bigM`` - universal bound on variables in logical expressions when they
+     have none; relates to the modeling topic recommending
+     :ref:`tight bounds on all variables <tight_bounds>`.
+
+   * ``acc:...`` - which constructs the solver receives natively, and which MP
+     reformulates (:ref:`acceptance-options`); ``cvt:...`` - how MP reformulates
+     (:ref:`explore-reformulations`).
+
+   * We recommend
+     :ref:`original piecewise-linear expressions <piecewise_linear_modeling>`
+     with MP solvers
+     (`AMPL option <https://dev.ampl.com/ampl/reference/options.html>`_
+     ``pl_linearize`` set to 0).
+
+.. dropdown:: Checking and inspecting
+
+   * ``tech:outlev`` (``outlev``) - :ref:`solver log <outlev>`;
+     ``tech:timing`` (``timing``) - :ref:`solution times <report-times>`.
+
+   * :ref:`solution-check` (``sol:chk:...``) - MP checks the solution against the
+     original model, including its logical constraints, and reports violations.
+
+   * :ref:`writeprob` (``tech:writeprob``, ``writeprob``) and :ref:`writesol`
+     (``tech:writesolution``, ``writesol``) - write the model or the solution in
+     the solver's formats.
+
+   * Infeasible models: :ref:`iis` (``iis:find``) and
+     :ref:`feasibilityrelaxation` (``alg:feasrelax``).
+
+.. dropdown:: Several solutions and objectives
+
+   * :ref:`multiplesolutions` (``sol:stub``, ``sol:count``, ``sol:poollimit``) -
+     control exploration of alternative solutions.
+
+   * :ref:`multipleObjectives` (``obj:multi``) - multi-objective solving, including
+     hierarchical and blended objectives, as well as objective-specific options;
+     ``obj:no`` selects a single objective.
+
+.. dropdown:: Options for all MP solvers
+
+   * AMPL option :ref:`mp_options <mp-options>` - options for every MP solver, read
+     before ``<solver>_options``; ``tech:optionfile`` reads options from a file.
 
 
 .. _solver-options:
@@ -31,14 +165,24 @@ AMPL/MP solver options
 AMPL/MP solver options provide a unified interface to
 MP parameters, as well as underlying solver's configuration:
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: option solver gurobi;
-    ampl: option gurobi_options 'outlev=1';      ## verbose output
-    ampl: solve;
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.solve(solver="highs", highs_options="outlev=1")   # verbose output
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option solver highs;
+         ampl: option highs_options 'outlev=1';      ## verbose output
+         ampl: solve;
 
 Many of them are
-`standardized across AMPL solvers <https://dev.ampl.com/solvers/index.html>`_.
+`standardized across AMPL solvers <https://dev.ampl.com/solvers/index.html>`__.
 
 
 List all available options
@@ -66,12 +210,24 @@ Option file
 It is possible to input a file with predefined AMPL solver options,
 using ``tech:optionfile``:
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: option cbc_options 'optionfile="options_experiment1.txt"';
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.solve(solver="cbc", cbc_options='optionfile="options_experiment1.txt"')
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option cbc_options 'optionfile="options_experiment1.txt"';
 
 For the underlying solver's native options see :ref:`native-options`.
 
+
+.. _mp-options:
 
 Solver-specific vs common MP options
 ''''''''''''''''''''''''''''''''''''''''''''''''
@@ -80,13 +236,21 @@ From AMPL, options can be passed to an MP solver in two ways.
 Solver-specific options are passed
 via AMPL option ``(solvername)_options``:
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: option solver gurobi;
-    ampl: option gurobi_options 'iis=1';         ## Tell Gurobi to find IIS
-    ampl: solve;
-    Gurobi 10.0.2:   alg:iisfind = 1
-    Gurobi 10.0.2: infeasible problem
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.solve(solver="highs", highs_options="iis=1")   # ask HiGHS to find an IIS
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option solver highs;
+         ampl: option highs_options 'iis=1';         ## ask HiGHS to find an IIS
+         ampl: solve;
 
 If your solver executable has a different name, say ``gurobi25.exe``,
 and you provide ``gurobi25_options``, they will be used instead.
@@ -94,9 +258,19 @@ and you provide ``gurobi25_options``, they will be used instead.
 Common options (for all MP solvers) can be passed via AMPL option
 ``mp_options``:
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: option mp_options 'lim:time=300';      ## Options for all MP solvers
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.option["mp_options"] = "lim:time=300"     # options for all MP solvers
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option mp_options 'lim:time=300';      ## Options for all MP solvers
 
 The value of ``mp_options`` is parsed before ``(solvername)_options``.
 Thus, ``mp_options`` allows setting parameters for all MP solvers,
@@ -122,12 +296,27 @@ Query option values
 To query the value of an option (default, or set via other methods),
 use '?' as argument:
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: option mosek_options 'threads=?';
-    ampl: solve;
-    MOSEK 10.0.43:   tech:threads = 0
-    MOSEK 10.0.43: optimal; objective 10
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.solve(solver="mosek", mosek_options="threads=?", verbose=True)
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option mosek_options 'threads=?';
+         ampl: solve;
+
+Output:
+
+.. code-block:: text
+
+    MOSEK 11.2.0:   tech:threads = 0
+    MOSEK 11.2.0: optimal; objective 10
 
 
 
@@ -156,53 +345,70 @@ Solve result codes
 
 The result of the last solve in AMPL can be seen as follows.
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: model party2.mod
-    ampl: data party2.dat
-    ampl: display solve_result_num, solve_result;
-    solve_result_num = -1
-    solve_result = '?'
+   .. tab-item:: Python
 
-    ampl: option solver gurobi;
-    ampl: option gurobi_options 'lim:time 20';
-    ampl: solve;
-    Gurobi 11.0.0:   lim:time = 20
-    Gurobi 11.0.0: time limit, feasible solution
-    35671 simplex iteration(s)
-    1 branching node(s)
-    absmipgap=27, relmipgap=0.818182
-    ampl: display solve_result_num, solve_result;
-    solve_result_num = 402
-    solve_result = limit
+      .. code-block:: python
 
-    ampl: option solve_result_table;
-    option solve_result_table '\
-    0       solved\
-    100     solved?\
-    200     infeasible\
-    300     unbounded\
-    400     limit\
-    500     failure\
-    ';
+         ampl.read("party2.mod")
+         ampl.read_data("party2.dat")
+         print(ampl.solve_result, ampl.get_value("solve_result_num"))    # ? -1
+         ampl.solve(solver="gurobi", gurobi_options="lim:time=20")
+         print(ampl.solve_result, ampl.get_value("solve_result_num"))    # limit 402
+         print(ampl.get_value("solve_message"))
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: model party2.mod
+         ampl: data party2.dat
+         ampl: display solve_result_num, solve_result;
+         solve_result_num = -1
+         solve_result = '?'
+
+         ampl: option solver gurobi;
+         ampl: option gurobi_options 'lim:time=20';
+         ampl: solve;
+         Gurobi 13.0.3:   lim:time = 20
+         Gurobi 13.0.3: time limit, feasible solution; objective 21
+         94305 simplex iterations
+         1 branching node
+         absmipgap=15, relmipgap=0.714286
+         ampl: display solve_result_num, solve_result;
+         solve_result_num = 402
+         solve_result = limit
+
+         ampl: option solve_result_table;
+         option solve_result_table '\
+         0       solved\
+         100     solved?\
+         200     infeasible\
+         300     unbounded\
+         400     limit\
+         500     failure\
+         ';
 
 MP details the solve result codes as follows:
 
 .. code-block:: ampl
 
     ampl: shell "mosek -!";
-    Solve result table for MOSEK 10.0.43
-              0- 99 solved: optimal for an optimization problem, feasible for a satisfaction problem
-            100-199 solved? solution candidate returned but error likely
-                150 solved? MP solution check failed (option sol:chk:fail)
-            200-299 infeasible
-            300-349 unbounded, feasible solution returned
-            350-399 unbounded, no feasible solution returned
-            400-449 limit, feasible: stopped, e.g., on iterations or Ctrl-C
-            450-469 limit, problem is either infeasible or unbounded
-            470-499 limit, no solution returned
-            500-999 failure, no solution returned
-                550 failure: numeric issue, no feasible solution
+    Solve result table for MOSEK 10.2.0
+        0- 99	solved: optimal for an optimization problem,
+              feasible for a satisfaction problem
+      100-199	solved? solution candidate returned but error likely
+          150	solved? MP solution check failed (option sol:chk:fail)
+      200-299	infeasible
+      300-349	unbounded, feasible solution returned
+      350-399	unbounded, no feasible solution returned
+      400-449	limit, feasible: stopped, e.g., on iterations or Ctrl-C
+      450-469	limit, problem is either infeasible or unbounded.
+              Disable dual reductions or run IIS finder for definitive answer.
+      470-499	limit, no solution returned
+      500-999	failure, no solution returned
+          550	failure: numeric issue, no feasible solution
 
 Individual solvers may add more specific values in the corresponding ranges.
 To list solver-specific codes, use command-line switch ``-!`` as above,
@@ -210,6 +416,96 @@ or visit `AMPL Development <https://dev.ampl.com/solvers/index.html>`_.
 More information is in Chapter 14 of the
 `AMPL Book <https://ampl.com/learn/ampl-book/>`_.
 See also the roll cutting example on `AMPL Colab <https://colab.ampl.com>`_.
+
+What a status means depends on the solver. For a local nonlinear solver on a
+nonconvex model, ``solved`` means a locally optimal point, not a proof; a
+``limit`` status can come with no improved point, so the variables may still
+hold the starting values. See :ref:`reading-solver-results`.
+
+
+.. _support-by-solvers:
+
+Support by solvers
+==================
+
+.. |y| unicode:: U+2705 
+   :trim:
+  
+.. |n| unicode:: U+274C
+   :trim:
+
+.. |e| unicode:: U+2713
+   :trim:
+
+This table summarizes the solver driver support for each solver feature; some features,
+denoted by |e|, are supported through emulation (they are not available in the original
+solver but are emulated by MP). For MP2NL, solver features also depend
+on the subsolver. For more solver-specific information, click on the solver name,
+or visit `AMPL Development solver page <https://dev.ampl.com/solvers/index.html>`__.
+
+.. _Copt: https://dev.ampl.com/solvers/copt/
+.. _CPLEX: https://dev.ampl.com/solvers/cplex/
+.. _Gurobi: https://dev.ampl.com/solvers/gurobi/
+.. _Mosek: https://dev.ampl.com/solvers/mosek/
+.. _Xpress: https://dev.ampl.com/solvers/xpress/
+.. _CBC: https://dev.ampl.com/solvers/cbc/
+.. _GCG: https://dev.ampl.com/solvers/gcg/
+.. _HiGHS: https://dev.ampl.com/solvers/highs/
+.. _SCIP: https://dev.ampl.com/solvers/scip/
+.. _CPSAT: https://dev.ampl.com/solvers/cpsat/
+.. _cuOpt: https://dev.ampl.com/solvers/cuopt/
+.. _BaronMP: https://dev.ampl.com/solvers/baron/
+.. _MP2NL: https://dev.ampl.com/solvers/mp2nl/
+
+.. rst-class:: solver-support
+
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| Feature                      | Copt_ | CPLEX_ | Gurobi_ | Mosek_ | Xpress_ | CBC_ | GCG_ | HiGHS_ | SCIP_ | CPSAT_ | cuOpt_ | BaronMP_ | MP2NL_ |
++==============================+=======+========+=========+========+=========+======+======+========+=======+========+========+==========+========+
+| :ref:`writeprob`             | |y|   | |y|    | |y|     | |y|    | |y|     | |y|  | |y|  | |y|    | |y|   | |y|    | |n|    | |y|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`writesol`              | |y|   | |y|    | |y|     | |y|    | |y|     | |n|  | |y|  | |y|    | |y|   | |n|    | |y|    | |y|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`report-times`          | |y|   | |y|    | |y|     | |y|    | |y|     | |y|  | |y|  | |y|    | |y|   | |y|    | |y|    | |y|      | |y|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`feasibilityrelaxation` | |y|   | |y|    | |y|     | |n|    | |n|     | |n|  | |n|  | |y|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`iis`                   | |y|   | |y|    | |y|     | |n|    | |y|     | |n|  | |n|  | |y|    | |y|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`basisio`               | |y|   | |y|    | |y|     | |y|    | |y|     | |y|  | |n|  | |y|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`kappa`                 | |n|   | |y|    | |y|     | |n|    | |n|     | |n|  | |n|  | |n|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`multiplesolutions`     | |y|   | |y|    | |y|     | |n|    | |y|     | |n|  | |y|  | |n|    | |y|   | |y|    | |n|    | |y|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`multipleObjectives`    | |y|   | |y|    | |y|     | |e|    | |y|     | |e|  | |e|  | |e|    | |e|   | |e|    | |e|    | |e|      | |e|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`sensitivityAnalysis`   | |y|   | |y|    | |y|     | |y|    | |n|     | |n|  | |n|  | |y|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`unboundedRays`         | |y|   | |y|    | |y|     | |y|    | |n|     | |n|  | |n|  | |y|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`warm-start`            | |y|   | |y|    | |y|     | |y|    | |y|     | |y|  | |n|  | |y|    | |y|   | |y|    | |n|    | |y|      | |y|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`fixedModel`            | |y|   | |y|    | |y|     | |y|    | |y|     | |n|  | |n|  | |y|    | |y|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`lazyConstraints`       | |y|   | |n|    | |y|     | |n|    | |n|     | |n|  | |n|  | |n|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`returnMIPgap`          | |y|   | |y|    | |y|     | |y|    | |y|     | |n|  | |y|  | |y|    | |y|   | |y|    | |y|    | |y|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`returnBestBound`       | |y|   | |y|    | |y|     | |y|    | |y|     | |n|  | |y|  | |y|    | |y|   | |y|    | |y|    | |y|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`varPriorities`         | |n|   | |n|    | |y|     | |n|    | |n|     | |n|  | |n|  | |n|    | |n|   | |n|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`plateauStop`           | |n|   | |n|    | |y|     | |n|    | |n|     | |n|  | |n|  | |y|    | |n|   | |y|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+| :ref:`plateauStopBound`      | |n|   | |n|    | |y|     | |n|    | |n|     | |n|  | |n|  | |y|    | |n|   | |y|    | |n|    | |n|      | |n|    |
++------------------------------+-------+--------+---------+--------+---------+------+------+--------+-------+--------+--------+----------+--------+
+
+
+* |n| = Not supported
+* |e| = Emulated
+* |y| = Supported natively
+
 
 
 General features
@@ -235,6 +531,7 @@ to suppress it a redirection is needed::
   option solver_msg 0;
   solve > NUL;
 
+*Related option*: `tech:timing`.
 
 .. list-table::
    :header-rows: 0
@@ -257,13 +554,22 @@ Model export
 ------------
 
 Most solvers can export the model before solving. This is usually
-controlled by the option ``writeprob``::
+controlled by the option `writeprob`::
 
     option <solver>_options 'writeprob=/tmp/diet.lp';
 
 
 The format is solver-dependent and determined by the file extension
-('.lp' in the example).
+('.lp' in the example). What to look for in the exported model when comparing
+formulations is described in :ref:`before-benchmarking`.
+
+.. admonition:: Exporting with names
+
+   To pass variable, constraint and objective names to the solver,
+   set `AMPL option <https://dev.ampl.com/ampl/reference/options.html>`_
+   `<solver>_auxfiles rc` before the `solve` command, or option `auxfiles rc`
+   before `write`, see
+   `model export example <https://mp.ampl.com/modeling-troublesh.html#exporting-the-solver-model>`_.
 
 
 .. list-table::
@@ -278,6 +584,111 @@ The format is solver-dependent and determined by the file extension
 
        * **filename** - Filename for the exported model
 
+.. admonition:: Explore model in AMPL
+
+   If you only want to explore the expanded constraint list in AMPL,
+   use command `expand [ConName] [>redirect_file.txt];`.
+   Use `solexpand;` to see the AMPL presolved model as sent to
+   the driver (set `option presolve 0;` to disable
+   `AMPL presolve <https://dev.ampl.com/ampl/reference/options.html#presolve-options>`_).
+
+
+.. _writesol:
+
+Solution export
+---------------
+
+Many solvers can also write the solution in their own format, for example
+to compare it with a run outside AMPL or to attach it to a support request.
+The format is the solver's; the file extension may select among several::
+
+    option <solver>_options 'writesol=/tmp/diet.sol';
+
+The option can be repeated to write several files.
+
+.. list-table::
+   :header-rows: 0
+
+   * - **Option**
+     - ``tech:writesolution``, ``writesol``
+   * - **Applicability**
+     - All models
+   * - **Values**
+     - Values:
+
+       * **filename** - Filename for the exported solution
+
+
+.. _report-times:
+
+Report solution time
+--------------------
+
+All solvers can measure the execution times of the solution process;
+is this option is sset to 1 the solver will display and return via
+problem suffixes this information. Setting it to 2 will give more granular
+information. The reported times with the options set to 1 are: `time_solver` 
+(the time taken by the solver itself to solve the model), `time_setup` (the time spent in the solver driver for
+reading the model file, reformulating it and prepare all the memory structures)
+and  `time` (=time_solver+time_setup, the total time spent in the driver). By setting
+it to 2 `time_read`, `time_conversion` and `time_output` are also reported. Example::
+
+
+    option <solver>_options 'timing=1';
+
+
+.. list-table::
+   :header-rows: 0
+
+   * - **Option**
+     - ``tech::timing``, ``tech:reporttimes``
+   * - **Applicability**
+     - All models
+   * - **Input**
+     - None
+   * - **Output**
+     - Suffixes (on problem):
+
+       * ``time`` total time spent in the driver
+       * ``time_setup`` time spent to read, reformulate and allocate the model
+       * ``time_solver`` time spent solving the model
+       * ``time_read`` time spent to read the NL file
+       * ``time_conversion`` time spent in the reformulation process
+       * ``time_output`` time spent reporting the results
+   
+   * - **Values**
+     - Values:
+  
+       * **0** - No (default)
+       * **1** - Yes, basic information
+       * **2** - Yes, granular information 
+
+   * - **Example**
+     - Use :ref:`this model <nQueensModel>`
+
+       Execute::
+
+         option <solver>_options "tech:reporttimes=1";
+         solve;
+
+         display Initial.time, Initial.time_setup, Initial.time_solver;
+
+       Output:
+
+       .. code-block:: bash
+
+          tech:reporttimes = 1
+          Setup time:    0.0113952s
+          Solution time: 0.0016453s
+
+          suffix time OUT;
+          suffix time_setup OUT;
+          suffix time_solver OUT;
+
+          Initial.time = 19.43
+          Initial.time_setup = 0.88
+          Initial.time_solver = 19.46
+
 
 .. _warm-start:
 
@@ -291,6 +702,11 @@ have a value assigned. Note that, for LP problems, also the dual values can be p
 This option controls whether to use incoming primal (and dual, for LP) variable values in 
 a warmstart.
 
+When comparing formulations or solvers, give every run the same starting
+values, derived from the data (for example the current operating state),
+never from a solve of the same model: a start near the optimum flatters
+whichever run receives it. See also :ref:`comparing-formulations`.
+
 .. list-table::
    :header-rows: 0
 
@@ -303,11 +719,12 @@ a warmstart.
    * - **Output**
      - None
    * - **Values**
-     - Sum of:
+     - Values:
 
-       * **0** - No (default)
-       * **1** - Yes (for LP: if there is no incoming alg:basis) (default)
+       * **0** - No
+       * **1** - Yes (for LP: if there is no incoming alg:basis)
        * **2** - Yes (for LP: ignoring the incoming alg:basis, if any)
+       * **3** - Yes (for LP: together with the incoming alg:basis, if any; default).
    * - **Example**
      - Use :ref:`this model <nQueensModel>`
 
@@ -320,7 +737,8 @@ a warmstart.
          printf "Solution without warm start took %fs\n", _solve_time;
 
          # Now an optimal solution is already present, we pass it to the solver
-         # which would use to start the solution process
+         # which would use it to start the solution process
+         option reset_initial_guesses 0;    # Do not reset (the default)
          solve;
          printf "Solution with warm start took %fs\n", _solve_time;
 
@@ -360,48 +778,51 @@ This option controls whether to use or return a basis.
    * - **Input**
      - Suffixes:
 
-       * ``sstatus`` on variables and constraints
+       * ``status`` on variables and constraints
    * - **Output**
      - Suffixes:
 
-       * ``sstatus`` on variables and constraints
+       * ``status`` on variables and constraints
    * - **Values**
-     - Sum of:
+     - Values:
 
        * **0** - No
        * **1** - Use incoming basis (if provided)
        * **2** - Return final basis
-       * **3** - Both (1 + 2, default)
-
+       * **3** - Both (1 + 2, default).
    * - **Example**
      - Use :ref:`this model <multiObjectiveDiet>`
 
        Execute::
 
-         option gurobi_options "alg:start=0 outlev=1"; # disable passing the solution
-
          solve;
-         display Buy.sstatus; # display basis status
+         display Buy.status, Diet.status;   # display basis statuses
 
-         solve; # second solve with take much less although a solution is not provided
+         option send_statuses 1;            # do send, already the default
+         solve; # second solve should take much less although a solution is not provided
 
        In the solver logs, we can see the expected behaviour:
 
        .. code-block:: shell
 
-          x-Gurobi 9.5.2: optimal solution; objective 74.27382022
+          Gurobi 13.0.2: optimal solution; objective 74.27382022
           3 simplex iterations
           Objective = total_cost['A&P']
-          ampl: display Buy.sstatus;
-          Buy.sstatus [*] :=
-          BEEF  low
-          CHK  upp
-          FISH  low
-          HAM  low
-          MCH  low
-          MTL  bas
-          SPG  bas
-          TUR  low;
+          ampl: display Buy.status, Diet.status;;
+          :    Buy.status Diet.status    :=
+          A          .      bas
+          B1         .      bas
+          B2         .      low
+          BEEF   low            .
+          C          .      bas
+          CHK    low            .
+          FISH   low            .
+          HAM    low            .
+          MCH    bas            .
+          MTL    low            .
+          SPG    low            .
+          TUR    low            .
+          ;
 
           ... # second solve:          
 
@@ -415,7 +836,8 @@ Feasibility Relaxation
 
 The feasibility relaxation functionality enables the solver to find a feasible
 solution even if the original model is unfeasible without explicitly adding
-slack variables to the constraints.
+slack variables to the constraints. It is also a way to check an "infeasible"
+status that may be wrong, see :ref:`reading-solver-results`.
 In the feasibility relaxation problem, 
 
 #. Each variable :math:`x` can violate its bounds (:math:`lb \leq x \leq ub`):
@@ -469,9 +891,11 @@ Penaly weights < 0 are treated as Infinity, allowing no violation.
    * - **Example**
      - Use :ref:`this model <infeasibleModel>`
 
-       Solve the model changing the penalties to get different solutions::
+       Solve the model changing the penalties to get different solutions
+       (the values shown are from Gurobi 13; another solver can return a
+       different solution with the same relaxation objective)::
 
-          options <solver>_options "alg:feasrelax=1";
+          option <solver>_options "alg:feasrelax=1";
           option presolve 0;    # otherwise the model could be oversimplified
 
           solve; display x,y;
@@ -485,7 +909,7 @@ Penaly weights < 0 are treated as Infinity, allowing no violation.
         
        Now we want to force all variable lower bounds to be respected::
 
-          options <solver>_options "alg:feasrelax=1 alg:lbpen=-1";
+          option <solver>_options "alg:feasrelax=1 alg:lbpen=-1";
           solve; display x,y;
 
        Gives, as expected x=5 (it had a lower bound of 5):
@@ -498,7 +922,7 @@ Penaly weights < 0 are treated as Infinity, allowing no violation.
        Single violations can be controlled via suffixes; in this case we
        want to control the constraints violations::
 
-          options <solver>_options "alg:feasrelax=1 alg:lbpen=1"; # allow lower bounds to be violated again
+          option <solver>_options "alg:feasrelax=1 alg:lbpen=1"; # allow lower bounds to be violated again
 
           suffix rhspen IN;
           let C1.rhspen := 1; # normal weight
@@ -516,7 +940,7 @@ Penaly weights < 0 are treated as Infinity, allowing no violation.
           C3.slack = 0
 
        C1 is violated - which makes sense as we specified that C2 cannot be violated
-       and we gave an higher avoidance weight to C2. If we want to violate C1 instead,
+       and we gave a higher avoidance weight to C3. If we want to violate C1 instead,
        we can::
 
           let C1.rhspen := 10; # We'd rather not violate C1
@@ -539,16 +963,17 @@ Penaly weights < 0 are treated as Infinity, allowing no violation.
 Multiple solutions
 ------------------
 
-More often than not, optimization problems have more than one optimal solution; moreover, during the 
+More often than not, optimization problems have more than one optimal solution. It might be
+important to explore various solutions, especially in the model design phase. During the
 solution process, MIP solvers usually find sub-optimal solutions, which are normally discarded.
-They can be however be kept, and in most cases there are solver-specific options to control how
-the search for additional solutions is performed.
+They can however be kept, and some solvers offer systematic enumeration of solution space.
 
-The main (and generic) options that controls the search are ``sol:stub`` amd ``sol:count``, which
-control respecitvely the base-name for the files where additional solution will be stored and
+The main (and generic) options that control the search are ``sol:stub`` amd ``sol:count``, which
+control respectively the base-name for the files where additional solutions will be stored and
 if to count additional solutions and return them in the ``nsol`` problem suffix.
 Specifying a stub name automatically enables the solutions count; found solutions are written to 
-files [``solutionstub1.sol'``,  ... ``solutionstub<nsol>.sol``].
+files [``solutionstub1.sol'``,  ... ``solutionstub<nsol>.sol``]. Option ``sol:poollimit``
+constrains the number of alternative solutions.
 
 
 .. list-table::
@@ -649,6 +1074,7 @@ This option controls whether to calculate these values and return them in the su
 
        * ``sensobjlo`` smallest objective coefficient
        * ``sensobjhi`` greatest objective coefficient
+       * ``sensobj``   objective coefficients in the solver model
 
        Suffixes for variables and constraints:
 
@@ -668,7 +1094,7 @@ This option controls whether to calculate these values and return them in the su
 
        Execute::
 
-          options <solver>_options "alg:sens=1"; 
+          option <solver>_options "alg:sens=1";
           option presolve 0;  # disable model transformations in AMPL
           solve;
 
@@ -727,7 +1153,7 @@ if crossover is not applied.
 
        Solve the model and report kappa::
 
-          options <solver>_options "alg:kappa=3"; 
+          option <solver>_options "alg:kappa=3";
           solve;
 
           display Initial.kappa, total_number.kappa;
@@ -785,23 +1211,25 @@ or suffix ``dunbdd`` if the constraints are infeasible.
 
        Solve the (infeasible) model and report the ``dunbdd`` rays::
 
-          options gurobi_options "alg:rays=3"; # it is default already
+          option <solver>_options "alg:rays=3"; # it is default already
           option presolve 0;  # else the model could be oversimplified
           solve;
-          display c1.dunbdd, c2.dunbdd, c3.dunbdd;
+          display c1.dunbdd, c2.dunbdd, c3.dunbdd, c4.dunbdd;
 
-       Output:
+       Output (HiGHS 1.15.1; the sign convention of the ray depends on the
+       solver):
 
        .. code-block:: shell
 
-          x-Gurobi 9.5.2: alg:rays=3
-          x-Gurobi 9.5.2: infeasible problem
+          HiGHS 1.15.1:   alg:rays = 3
+          HiGHS 1.15.1: infeasible problem
 
           suffix dunbdd OUT;
 
           c1.dunbdd = 1
-          c2.dunbdd = 0
-          c3.dunbdd = 0
+          c2.dunbdd = -1
+          c3.dunbdd = -1
+          c4.dunbdd = 0
 
 
 .. _multipleObjectives:
@@ -809,12 +1237,24 @@ or suffix ``dunbdd`` if the constraints are infeasible.
 Multiple objectives
 -------------------
 
-Many real world problems have multiple objectives; often this scenario is tackled by blending all the objectives
-by linear combination when formulating the model, or by minimizing each unwanted objective deviations from a pre-specified
-goal.
-Many solvers can facilitate the formulation; the available functionalities are solver-specific; at MP level
-they accessible via the main option ``obj:multi``. Consult the solver documentation for the functionalities available
-on your solver.
+Many real-world problems have multiple objectives; often this scenario
+is tackled by blending all the objectives
+by linear combination when formulating the model, or by minimizing
+unwanted objective deviations from a pre-specified goal.
+
+Alternatively, if some constraints are 'soft', they can be modeled
+by penalties included in the primary or secondary objectives.
+Consult the :ref:`multiobjective modeling guide <multiple-objectives>`.
+
+Many solvers can facilitate the formulation; the available
+functionalities are solver-specific. For all solvers,
+MP can :ref:`emulate the blended and hierarchical mutliple-objective capability <multiple-objectives>`
+and :ref:`objective-specific solver options <objective-specific-options>`.
+Consult the ``obj:multi``
+:ref:`option <solver-options>` documentation
+for the functionalities available in your solver
+and `Multi-objective AMPL Colab notebooks <https://colab.ampl.com/tags/multi-objective.html>`_
+for examples.
 
 .. list-table::
    :header-rows: 0
@@ -832,13 +1272,15 @@ on your solver.
      - Values:
 
        * **0** - No (default)
-       * **1** - Yes
+       * **1** - Yes, natively supported if available, otherwise emulated.
+         Most solvers only support linear objectives natively.
+       * **2** - Yes, emulated
    * - **Example**
      - Use :ref:`multiObjectiveDiet`
 
        Execute::
 
-          options <solver>_options "obj:multi=1"; 
+          option <solver>_options "obj:multi=1"; 
           solve;
 
        Output:
@@ -854,6 +1296,7 @@ on your solver.
             _sobj[4] = 31.49438202
 
 
+.. _iis:
    
 Irreducible Inconsistent Subset (IIS)
 ------------------------------------------
@@ -864,6 +1307,8 @@ An IIS is a subset of constraints and variables that is still infeasible and whe
 the subsystem becaomes feasible. Note that an infeasible model can have more than one IIS.
 
 This options controls whether to perform the additional computational steps required to find an IIS.
+Before acting on an "infeasible" status of a hard nonconvex or numerically
+difficult model, see also :ref:`reading-solver-results`.
 
 .. list-table::
    :header-rows: 0
@@ -890,22 +1335,21 @@ This options controls whether to perform the additional computational steps requ
         option <solver>_options "iisfind=1";
         option presolve 0;  # else the model could be oversimplified
         solve;
-        display c1.iis, c2.iis, c3.iis;
+        display c1.iis, c2.iis, c3.iis, c4.iis;
 
-       Output:
+       Output (HiGHS 1.15.1):
 
        .. code-block:: shell
 
-          x-Gurobi 9.5.2: alg:iisfind=1
-          x-Gurobi 9.5.2: infeasible problem
-          2 simplex iterations
+          HiGHS 1.15.1:   iis:find = 1
+          HiGHS 1.15.1: infeasible problem
 
           suffix iis symbolic OUT;
-          suffix dunbdd OUT;
-  
+
           c1.iis = mem
           c2.iis = mem
           c3.iis = mem
+          c4.iis = non
 
 
 MIP-only features
@@ -1073,24 +1517,48 @@ positive to denote a lazy constraint and negative to mark a contraint as a user 
        * **2** - Accept <0 values to denote user cuts
        * **3** - Accept both (default)
    * - **Example**
-     - Following ampl model
-
-       .. code-block:: ampl
- 
-            TODO Model
-
-       end of code block
+     - For the model
 
        .. code-block:: ampl
 
-            option presolve 0;  # disable model transformations in AMPL
+            var x integer >= 0, <= 10;
+            var z >= 0, <= 10;
+            maximize Profit: 5*x + 4*z;
+            subject to c1: 6*x + 4*z <= 24;
+            subject to c2: x + 2*z <= 7;
+            subject to c3: x + z <= 8;     # redundant: implied by c1 and the bounds
 
-            suffix lazy IN;
-            let c1.lazy := 1;  # lazy constraint
-            let c2.lazy := -1; # user cut, must be redundant as it might never be pulled in
-            solve;
+       mark ``c1`` as a lazy constraint and the redundant ``c3`` as a user cut
+       (a user cut must be redundant, since it might never be pulled in):
 
-            # TODO SHOW OUTPUT
+       .. tab-set::
+
+          .. tab-item:: Python
+
+             .. code-block:: python
+
+                ampl.option["presolve"] = 0   # keep AMPL from removing c3
+                ampl.eval("suffix lazy IN; let c1.lazy := 1; let c3.lazy := -1;")
+                ampl.solve(solver="gurobi", gurobi_options="mip:lazy=3")
+
+          .. tab-item:: AMPL
+
+             .. code-block:: ampl
+
+                option presolve 0;  # keep AMPL from removing c3
+                suffix lazy IN;
+                let c1.lazy := 1;   # lazy constraint
+                let c3.lazy := -1;  # user cut
+                option gurobi_options 'mip:lazy=3';
+                solve;
+
+       Output:
+
+       .. code-block:: text
+
+            Gurobi 13.0.3: optimal solution; objective 21
+            2 simplex iterations
+            1 branching node
 
 
 
@@ -1124,23 +1592,34 @@ This option controls whether to read those values and use them in the solution p
        * **0** - Ignore priorities
        * **1** - Read priorities (default)
    * - **Example**
-     - Following AMPL model
+     - For the model shown under :ref:`lazyConstraints`, give ``x`` a higher
+       branching priority (the suffix must be declared first):
 
-       .. code-block:: ampl
- 
-            TODO Model
+       .. tab-set::
 
-       end of code block
+          .. tab-item:: Python
 
-       .. code-block:: ampl
+             .. code-block:: python
 
-            option presolve 0;  # disable model transformations in AMPL
+                ampl.eval("suffix priority IN; let x.priority := 5;")
+                ampl.solve(solver="gurobi", gurobi_options="mip:priorities=1")
 
-            let x.priority := 1;
-            let y.priority := 5;
-            solve;
+          .. tab-item:: AMPL
 
-            # TODO SHOW OUTPUT
+             .. code-block:: ampl
+
+                suffix priority IN;
+                let x.priority := 5;
+                option gurobi_options 'mip:priorities=1';
+                solve;
+
+       Output:
+
+       .. code-block:: text
+
+            Gurobi 13.0.3: optimal solution; objective 21
+            2 simplex iterations
+            1 branching node
 
 
 
@@ -1158,6 +1637,29 @@ dual values or sensitivity information that wouldn't normally be available for M
 
 This option controls if to generate and solve the fixed model after solving the integer problem.
 
+COPT, MOSEK, HiGHS, and SCIP emulate this operation for linear algebraic
+models by fixing all integer columns to an integer-feasible incumbent and
+solving a separate continuous model. The incumbent need not be proven optimal.
+SOS, piecewise-linear, logical, and nonlinear inputs are not supported by
+this initial emulation. Duals describe the fixed continuous problem and are
+not MIP shadow prices. Basis statuses can differ across solvers, especially
+for fixed variables and degenerate solutions. Sensitivity is available only
+when supported by the driver and requested with ``alg:sens``.
+
+The supplementary solve preserves the MIP status, bounds, gaps, pool, and
+statistics. If successful, the reported primal and objective values correspond
+to the fixed solution; continuous variables may move. If unsuccessful, the
+MIP solution is retained, supplementary duals/basis/sensitivity are omitted,
+and the solve message explains the failure.
+
+``mip:basis:timelimit`` specifies a separate time limit in seconds, and
+``mip:basis:iterlimit`` specifies a separate iteration limit. Both default
+to -1 (independent solver defaults). For emulation, zero skips the fixed solve.
+COPT uses simplex by default; an explicit iteration limit selects barrier
+with crossover and counts barrier iterations. HiGHS, MOSEK, and SCIP use
+simplex. These options also apply to native fixed-model solves in Gurobi,
+CPLEX, and Xpress.
+
 .. list-table::
    :header-rows: 0
 
@@ -1171,8 +1673,8 @@ This option controls if to generate and solve the fixed model after solving the 
    * - **Output**
      - Suffixes:
   
-       * ``dual`` on variables
-       * ``sstatus`` on variables
+       * Constraint dual values
+       * ``sstatus`` on variables and constraints
        * See :ref:`sensitivityanalysis` if requested
   
    * - **Values**
@@ -1181,19 +1683,195 @@ This option controls if to generate and solve the fixed model after solving the 
        * **0** - No (default)
        * **1** - Yes
    * - **Example**
-     - Following ampl model
+     - For the model shown under :ref:`lazyConstraints`, solve the MIP, then the
+       fixed model, and read its duals and basis status:
 
-       .. code-block:: ampl
- 
-            TODO Model
+       .. tab-set::
 
-       end of code block
+          .. tab-item:: Python
 
-       .. code-block:: ampl
+             .. code-block:: python
 
-            option <solver>_options "mip:basis=1";
+                ampl.solve(solver="gurobi", gurobi_options="mip:basis=1")
+                print(ampl.get_output("display c1.dual, c2.dual, c3.dual, x.sstatus, z.sstatus;"))
 
-            # TODO SHOW OUTPUT
+          .. tab-item:: AMPL
+
+             .. code-block:: ampl
+
+                option gurobi_options 'mip:basis=1';
+                solve;
+                display c1.dual, c2.dual, c3.dual, x.sstatus, z.sstatus;
+
+       Output:
+
+       .. code-block:: text
+
+            c1.dual = 1
+            c2.dual = 0
+            c3.dual = 0
+            x.sstatus = low
+            z.sstatus = bas
+
+
+.. _plateauStop:
+
+Plateau stop (stall-based MIP termination)
+-------------------------------------------
+
+For long-running MIP searches it is often useful to give up once the
+solver is spending a lot of time without making meaningful progress,
+rather than waiting for a hard time or gap limit. This feature stops
+the MIP search once the incumbent objective has not improved by at
+least ``mip:plateau:abstol`` (absolute) or ``mip:plateau:reltol``
+(relative to the current incumbent) for ``mip:plateau:time`` seconds.
+
+The check only starts after an initial grace period of
+``mip:plateau:warmup`` seconds after the solve begins, so that the
+absence of a first (or an early) incumbent does not immediately count
+as a plateau. (Solvers that also support :ref:`plateauStopBound` offer
+a second, gap-based way to end this grace period early -- see below.)
+
+For the algorithm behind this option see :ref:`plateauStopTheory`.
+
+.. list-table::
+   :header-rows: 0
+
+   * - **Option**
+     - ``mip:plateau:time``, ``mip:plateau:abstol``, ``mip:plateau:reltol``,
+       ``mip:plateau:warmup``, ``mip:plateau:log``
+   * - **Applicability**
+     - MIP models, for solvers that support it (see :ref:`support-by-solvers`)
+   * - **Input**
+     - None
+   * - **Output**
+     - None; the solve terminates early, similarly to a time or gap limit.
+       If ``mip:plateau:log=1``, a status line is also printed to stdout
+       on every native callback report.
+   * - **Values**
+     - * ``mip:plateau:time`` - seconds without sufficient improvement
+         before stopping; **0** (default) disables the feature
+       * ``mip:plateau:abstol`` - minimum absolute objective improvement
+         counted as progress; default **0** (any improvement, however
+         small, counts)
+       * ``mip:plateau:reltol`` - minimum relative objective improvement
+         (fraction of the current incumbent) counted as progress;
+         default **0**
+       * ``mip:plateau:warmup`` - grace period in seconds before the
+         plateau: check starts; default **0**
+       * ``mip:plateau:log`` - **0** (default, silent) or **1**: print
+         the current plateau status (value, baseline, time since last
+         progress, whether the report counted as progress) on every
+         callback report used by ``mip:plateau:time``
+   * - **Example**
+     - .. admonition:: mip:plateau:abstol and mip:plateau:reltol combine with OR, not AND
+
+          Progress is counted if *either* tolerance is cleared
+          (``absDelta > abstol || relDelta > reltol``). Since
+          ``mip:plateau:abstol`` defaults to **0**, leaving it unset while
+          only setting ``mip:plateau:reltol`` does **not** enforce the
+          relative threshold: any nonzero absolute change already
+          clears ``absDelta > 0``, so the relative tolerance never
+          becomes the binding condition. To make a relative threshold
+          actually bind, also raise ``mip:plateau:abstol`` above the
+          absolute-improvement floor you're willing to ignore.
+
+       ::
+
+          option <solver>_options "mip:plateau:time=30 mip:plateau:abstol=1e-6 mip:plateau:reltol=0.001";
+          solve;
+
+       Stops the search if the incumbent has not improved by at least
+       0.1% (or, failing that, by at least ``1e-6`` in absolute terms)
+       for 30 seconds -- here ``mip:plateau:abstol`` is set small enough
+       that it only matters near-zero objectives, so
+       ``mip:plateau:reltol`` is effectively the binding criterion for
+       any incumbent of realistic magnitude.
+
+       ::
+
+          option <solver>_options "mip:plateau:time=30 mip:plateau:log=1";
+          solve;
+
+       With both tolerances left at their default of 0 (any improvement
+       at all resets the timer), prints a line like the following on
+       every reported incumbent::
+
+          MP Plateau [incumbent]: current=145.2 previous=150 progress=no elapsed=8.1s (limit=30.0s)
+
+
+.. _plateauStopBound:
+
+Plateau stop including MIP gap progress
+-------------------------------------------
+
+By default, :ref:`plateauStop` only considers new incumbent solutions
+as progress. Some solvers can also report the current MIP gap from the
+same (or an additional) native callback; for those,
+``mip:plateau:absgaptol`` and ``mip:plateau:relgaptol`` each
+independently add a *gap* progress channel: if set to a value greater
+than 0, the plateau timer also resets whenever the absolute /
+relative MIP gap shrinks by at least that amount, even while the
+incumbent stays fixed. Unlike ``mip:plateau:abstol``/``mip:plateau:reltol``
+(whose default of **0** means "any change counts"), both gap options
+are opt-in: **0** (the default) means that channel isn't tracked at
+all. Set one, the other, or both; whichever channels are active
+(incumbent, absolute gap, relative gap) contribute to the same shared
+timer via a logical OR -- any one of them making sufficient progress
+resets it, not a requirement that all of them advance together.
+
+These solvers also get a second, gap-based way to end the
+:ref:`plateauStop` warmup grace period early, via
+``mip:plateau:warmup:relgap``/``mip:plateau:warmup:absgap``: the grace
+period ends as soon as *either* the time-based ``mip:plateau:warmup``
+elapses *or* the reported gap first reaches one of these two
+thresholds, whichever comes first. Solvers that only support
+:ref:`plateauStop` (not this feature) never see a live gap value at
+all, so these two options only exist, and only ever matter, alongside
+the two gap-progress options above.
+
+All four of these options, and the feature that makes them available
+at all, are only valid for solvers that support it -- see
+:ref:`support-by-solvers`.
+
+.. list-table::
+   :header-rows: 0
+
+   * - **Option**
+     - ``mip:plateau:warmup:relgap``, ``mip:plateau:warmup:absgap``,
+       ``mip:plateau:absgaptol``, ``mip:plateau:relgaptol``
+   * - **Applicability**
+     - MIP models, for solvers that support it (see :ref:`support-by-solvers`)
+   * - **Input**
+     - None
+   * - **Output**
+     - None
+   * - **Values**
+     - * ``mip:plateau:warmup:relgap`` / ``mip:plateau:warmup:absgap`` -
+         relative / absolute MIP gap at which the :ref:`plateauStop`
+         warmup grace period ends early; default **0** (disabled --
+         only the time-based ``mip:plateau:warmup`` applies)
+       * ``mip:plateau:absgaptol`` - **0** (default, disabled) or a value
+         greater than 0: also treat an absolute-gap decrease of at
+         least this amount (in raw objective units, matching
+         ``mip:bestbound``'s units) as progress
+       * ``mip:plateau:relgaptol`` - **0** (default, disabled) or a value
+         greater than 0: also treat a relative-gap decrease of at
+         least this amount as progress
+   * - **Example**
+     - ::
+
+          option <solver>_options "mip:plateau:time=30 mip:plateau:abstol=15 mip:plateau:relgaptol=0.01";
+          solve;
+
+       Stops the search if the incumbent has not improved by at least
+       15 (in raw objective units) *and* the relative gap has not
+       narrowed by more than 0.01 (one percentage point) for 30
+       seconds -- here ``mip:plateau:abstol=15`` is set explicitly (its
+       default of 0 would otherwise make any incumbent change at all
+       count as progress, per the OR-not-AND note above); the
+       incumbent and the relative-gap channels are both live, and
+       either can independently reset the timer.
 
 
 * Round

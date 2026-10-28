@@ -5,6 +5,10 @@
 extern "C" {
 #endif
 
+/// Warning callback
+typedef void (*AMPLS_Warning_Callback_T)(
+    const char* expr_type, const char** warn_type, const char** warn_text);
+
 /// Model traits for license check
 typedef struct AMPLS_ModelTraits_T {
 	long long
@@ -13,10 +17,12 @@ typedef struct AMPLS_ModelTraits_T {
 	n_log_con,
 	n_quad_con,
 	n_conic_con;
+  char** additional_options;
+  AMPLS_Warning_Callback_T warn_cb;
 } AMPLS_ModelTraits;
 
 
-typedef void (*Checker_AMPLS_ModeltTraits)(const AMPLS_ModelTraits*);
+typedef void (*Checker_AMPLS_ModeltTraits)(AMPLS_ModelTraits*);
 
 
 /// Set of callbacks provided to a driver for licensing issues
@@ -31,6 +37,7 @@ typedef struct CCallbacks_T {
   const char* (*additionalText)();
   /// Function called after failures to provide additional diagnostics
   void (*diagnostics)();
+
 } CCallbacks;
 
 #ifdef __cplusplus

@@ -57,7 +57,7 @@ namespace mp {
   \rst
     SOLHandler: reads solution details on request
     via provided callback objects.
-    See the examples folder.
+    See the examples folder and the MP2NL driver.
 
     `~mp::SOLHandler` can be used as a base class for other handlers,
     or just be an interface prototype.
@@ -132,6 +132,9 @@ public:
   /**
    * Receive notification of the objective index
    * used by the driver (solver option 'objno'-1).
+   *
+   * @note AMPL .sol file does not provide
+   *   objective values, only in the solve message if at all.
    */
   void OnObjno(int ) { }
 

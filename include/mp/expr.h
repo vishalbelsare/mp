@@ -178,6 +178,12 @@ class BasicExpr : private internal::ExprBase {
   using ExprBase::operator SafeBool;
 };
 
+// Returns true if e is of ExprType.
+template <typename ExprType>
+inline bool Is(Expr e) {
+  return internal::Is<ExprType>(e.kind());
+}
+
 template <typename ExprType>
 inline ExprType internal::UncheckedCast(Expr e) {
   MP_ASSERT(Is<ExprType>(e.kind()), "invalid cast");
@@ -355,6 +361,7 @@ class PLTerm : public BasicExpr<expr::PLTERM> {
 class Function {
  private:
   struct Impl {
+    int index;
     func::Type type;
     int num_args;
     char name[1];
@@ -390,6 +397,9 @@ class Function {
   ///   }
   operator SafeBool() const { return impl_ != 0 ? &Function::True : 0; }
 
+  /// The index
+  int index() const { return impl_->index; }
+
   /// Returns the name of this function.
   const char *name() const { return impl_->name; }
 
@@ -408,8 +418,14 @@ class Function {
 namespace internal {
 /// An expression iterator
 template <typename ExprType>
-class ExprIterator :
-    public std::iterator<std::forward_iterator_tag, ExprType> {
+class ExprIterator {
+ public:
+  typedef std::forward_iterator_tag iterator_category;
+  typedef ExprType value_type;
+  typedef std::ptrdiff_t difference_type;
+  typedef const ExprType *pointer;
+  typedef ExprType reference;
+
  private:
   const ExprBase::Impl *const *ptr_;
 
@@ -781,7 +797,8 @@ class BasicExprFactory : private Alloc {
     dst[size] = 0;
   }
 
-  Function CreateFunction(const Function::Impl *&impl, fmt::StringRef name,
+  Function CreateFunction(const Function::Impl *&impl,
+                          int index, fmt::StringRef name,
                           int num_args, func::Type type);
 
  public:
@@ -810,7 +827,9 @@ class BasicExprFactory : private Alloc {
     /// Call push_back first to make sure that the impl pointer doesn't leak
     /// if push_back throws an exception.
     funcs_.push_back(0);
-    return CreateFunction(funcs_.back(), name, num_args, type);
+    return CreateFunction(funcs_.back(),
+                          (int)funcs_.size()-1,
+                          name, num_args, type);
   }
 
   /// Adds a function that will be defined later.
@@ -825,8 +844,8 @@ class BasicExprFactory : private Alloc {
     internal::CheckIndex(index, funcs_.size());
     const Function::Impl *&impl = funcs_[index];
     if (impl)
-      throw Error("function {} is already defined", index);
-    return CreateFunction(impl, name, num_args, type);
+      throw Error(fmt::format("function {} is already defined", index));
+    return CreateFunction(impl, index, name, num_args, type);
   }
 
   /// Makes a numeric constant.
@@ -1087,7 +1106,8 @@ void BasicExprFactory<Alloc>::Deallocate(const std::vector<T> &data) {
 
 template <typename Alloc>
 Function BasicExprFactory<Alloc>::CreateFunction(
-    const Function::Impl *&impl, fmt::StringRef name,
+    const Function::Impl *&impl,
+    int index, fmt::StringRef name,
     int num_args, func::Type type) {
   /// Function::Impl already has space for terminating null char so
   /// we need to allocate extra size chars only.
@@ -1095,6 +1115,7 @@ Function BasicExprFactory<Alloc>::CreateFunction(
   SafeInt<std::size_t> size = sizeof(Impl);
   // Replace by ::new due to #174
   Impl* new_impl = (Impl*) new char* [val(size + name.size())];
+  new_impl->index = index;
   new_impl->type = type;
   new_impl->num_args = num_args;
   this->Copy(name, new_impl->name);

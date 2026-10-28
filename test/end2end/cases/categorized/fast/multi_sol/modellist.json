@@ -2,19 +2,26 @@
   {
     "name": "multi_sol_01",
     "tags": [ "linear"],
+    "options": {
+      "ilogcp_options": "tech:optimizer=cplex lim:time=1 tech:threads=1 mip:gap=1e-5"
+    },
     "objective": 1
   },
   {
     "name": "multi_sol_01 countsolutions=1, check .nsol",
     "tags": [ "linear", "multisol"],
     "objective": 1,
-    "options": { "ANYSOLVER_options": "countsolutions=1" },
+    "options": { "mp_options": "countsolutions=1" },
     "values": {
       "Initial.nsol": 6
+    },
+    "values_per_solver_category": {
+      "CP": { "Initial.nsol": { "min": 1 } }
     }
   },
   {
     "name": "multi_sol_01 poolgap=0.1 solutionstub=stub",
+    "solvers_exclude": ["cpsat"],
     "tags": [ "linear", "multisol"],
     "objective": 1,
     "options": { "ANYSOLVER_options": "poolgap=0.1 solutionstub=stub" },
@@ -24,6 +31,7 @@
   },
   {
     "name": "multi_sol_01 poolgapabs=0.1 solutionstub=stub poolmode=2",
+    "solvers_exclude": ["cpsat"],
     "tags": [ "linear", "multisol"],
     "objective": 1,
     "options": { "ANYSOLVER_options": "poolgapabs=0.1 solutionstub=stub poolmode=2" },
@@ -33,6 +41,7 @@
   },
   {
     "name": "multi_sol_01 poollimit=2 solutionstub=stub",
+    "solvers_exclude": ["cpsat"],
     "tags": [ "linear", "multisol"],
     "objective": 1,
     "options": { "ANYSOLVER_options": "poollimit=2 solutionstub=stub" },
@@ -44,18 +53,137 @@
     "name": "multi_sol_01 sol:count=1, check .npool",
     "tags": [ "linear", "multisol"],
     "objective": 1,
-    "options": { "ANYSOLVER_options": "countsolutions=1" },
+    "options": { "mp_options": "countsolutions=1" },
     "values": {
       "Initial.npool": 6
+    },
+    "values_per_solver_category": {
+      "CP": { "Initial.npool": { "min": 1 } }
     }
   },
   {
     "name": "multi_sol_01 poolgap=0.1 ams_stub=stub",
+    "solvers_exclude": ["cpsat"],
     "tags": [ "linear", "multisol"],
     "objective": 1,
     "options": { "ANYSOLVER_options": "poolgap=0.1 ams_stub=stub" },
     "values": {
       "TotalSum.npool": 3
+    }
+  },
+  {
+    "name": "multi_sol_02 poolmode=2 poollimit=10 poolgap=0.01",
+    "solvers_exclude": ["cpsat"],
+    "tags": [ "linear", "multisol"],
+    "comment": "The primary solution must be the pool's best (Xpress enumerator)",
+    "objective": 413,
+    "options": { "ANYSOLVER_options": "sol:poolmode=2 sol:poollimit=10 sol:poolgap=0.01 solutionstub=stub" },
+    "values": {
+      "Cost": 413
+    }
+  },
+  {
+    "name": "multi_sol_02 poolmode=2 return_mipgap=3 bestbound=1 Xpress",
+    "tags": [ "linear", "multisol"],
+    "comment": "Gap and bound refer to the primary (best) solution, not to the enumerator's last",
+    "objective": 413,
+    "options": { "xpress_options": "sol:poolmode=2 sol:poollimit=10 sol:poolgap=0.01 solutionstub=stub return_mipgap=3 bestbound=1" },
+    "solvers": ["xpress"],
+    "values": {
+      "_obj[1].absmipgap": 0,
+      "_obj[1].bestbound": 413
+    }
+  },
+  {
+    "name": "multi_sol_03 poolmode=2 mip:basis=1 Xpress",
+    "tags": [ "linear", "multisol"],
+    "comment": "Duals of the fixed LP match the reported (best) solution: complementary slackness",
+    "objective": 400.6,
+    "options": { "xpress_options": "sol:poolmode=2 sol:poollimit=10 sol:poolgap=0.01 solutionstub=stub mip:basis=1" },
+    "solvers": ["xpress"],
+    "values": {
+      "sum {i in FAC: 1e-6 < over[i] < 6-1e-6} abs(Cap[i].dual + 2)": 0,
+      "sum {i in FAC: Cap[i].slack > 1e-6} abs(Cap[i].dual)": 0
+    }
+  },
+  {
+    "name": "multi_sol_01 MIP strategy options CPLEX",
+    "tags": [ "linear"],
+    "objective": 1,
+    "options": {
+      "cplex_options": "mipcuts=1 nodes=1000 heureffort=0.5 rinsheur=20 lbheur=1 probe=1 probetime=100 symmetry=1 repeatpresolve=1 repairtries=2 submipnodelim=100 strongcand=5 strongit=10 treememory=1024 polishafter_time=1e5 polishafter_nodes=1000 mipkappa=1 miqcpstrat=1 ordertype=1 varsel=3 nodesel=2 bbinterval=5 mipemphasis=1 fpheur=1 mipsearch=1 cutpass=3 cutsfactor=5 aggcutlim=2 eachcutlim=100 fraccand=50 fracpass=2 submipalg=2 submipscale=0 submipstartalg=2 presolvenode=1 prerelax=1 prereduce=3 prereformulations=3 presos1reform=1 presos2reform=1 boundstr=1 coeffreduce=1 dependency=1 aggregate=1 agglim=5 aggtol=0.1"
+    }
+  },
+  {
+    "name": "multi_sol_01 populate=2 poolcapacity=3 CPLEX",
+    "tags": [ "linear", "multisol"],
+    "objective": 1,
+    "options": { "cplex_options": "populate=2 poolcapacity=3 poolstub=stub" },
+    "solvers": ["cplex"],
+    "values": {
+      "TotalSum.nsol": 3
+    }
+  },
+  {
+    "name": "multi_sol_01 tuning tunefix CPLEX",
+    "tags": [ "linear"],
+    "objective": 1,
+    "options": { "cplex_options": "tunetime=0.5 tunedisplay=0 tunefix=mipgap tunefile=tune_out.prm" }
+  },
+  {
+    "name": "multi_sol_01 COPT pool options",
+    "tags": [ "linear"],
+    "comment": "COPT only reports the solutions found during the search",
+    "objective": 1,
+    "options": { "copt_options": "sol:count=1 poolgap=0.1 poolgapabs=0.5 poollimit=2 poolmode=2" },
+    "solvers": ["copt"],
+    "values": {
+      "Initial.nsol": { "min": 1, "max": 2 }
+    }
+  },
+  {
+    "name": "multi_sol_01 COPT solutionstub",
+    "tags": [ "linear"],
+    "objective": 1,
+    "options": { "copt_options": "solutionstub=stub poollimit=2" },
+    "solvers": ["copt"],
+    "values": {
+      "TotalSum.npool": { "min": 1, "max": 2 }
+    }
+  },
+  {
+    "name": "multi_sol_01 COPT tuning",
+    "tags": [ "linear"],
+    "objective": 1,
+    "options": { "copt_options": "tech:tunebase=copt_tune.par tech:tunetimelim=1 tech:tuneoutlev=0" },
+    "solvers": ["copt"]
+  },
+  {
+    "name": "multi_sol_01 solutionstub=stub CP-SAT",
+    "files": ["multi_sol_01.mod"],
+    "tags": ["linear", "multisol"],
+    "comment": "CP-SAT: the improving solutions found",
+    "solvers": ["cpsat"],
+    "objective": 1,
+    "options": { "cpsat_options": "solutionstub=stub countsolutions=1" },
+    "values": { "TotalSum.nsol": { "min": 1 }, "Initial.nsol": { "min": 1 } }
+  },
+  {
+    "name": "multi_sol_04 no objective, countsolutions=1",
+    "tags": [ "logical" ],
+    "comment": "Feasibility problem: objective suffixes nsol/npool must not be written (used to crash)",
+    "options": { "mp_options": "countsolutions=1" },
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name": "multi_sol_04 no objective, solutionstub=stub",
+    "tags": [ "logical" ],
+    "comment": "Same with solution files written",
+    "options": { "mp_options": "solutionstub=stub" },
+    "values": {
+      "solve_result_num": 0
     }
   }
 ]

@@ -25,8 +25,8 @@ representing *numerical expressions* and *constraints:*
 - **constr**
      represents a constraint of the model, which may evaluate to true or false
      depending on the values of variables that it contains. It may be built from the
-     familiar relational operators ``>(=)``, ``<(=)``, and ``=``, but also from other
-     operators such as ``or`` and ``alldiff`` that create constraints.
+     familiar relational operators `>(=)`, `<(=)`, and `=`, but also from other
+     operators such as `or` and `alldiff` that create constraints.
 
 The return value of an operator or function is also one of the above,
 as indicated by *expr-valued* or *constr-valued* at the beginning of each syntax summary.
@@ -40,7 +40,8 @@ of various kinds; for example,
                        max((x+1)*x*z, y, y-z)<=3 and exp(y)<=12);
 
 AMPL represents these combinations as expression trees,
-which are sent to MP-based solver interfaces to be processed as solvers require.
+which are sent to MP-based solver interfaces to be processed as solvers require,
+or user desires.
 
 Indexing over sets is a common feature of AMPL expressions.
 The examples below use two kinds of indexing expressions,
@@ -88,10 +89,16 @@ Thus where necessary, the MP interface constructs an approximate closed region b
 use of a small tolerance. For example, if x is minimized subject to x > 5, then any
 x value greater than 5 is not minimal, and any x value less than or equal to 5 is
 not feasible. Thus, to insure that a minimum is well defined, the constraint must
-be changed to x >= 5 + eps for some small constant eps. Each solver has its own
-default value of the eps constant, which can be adjusted through
-an :ref:`option setting <solver-options>`.
+be changed to x >= 5 + eps for some small constant eps. The value of the
+eps constant can be adjusted through the :ref:`MP option setting <solver-options>`
+``cvt:mip:eps``.
 
+The reformulations performed by MP can be configured, as described
+in :ref:`supported-constraints`. Those performed by AMPL itself,
+can be configured by `AMPL options <https://dev.ampl.com/ampl/options.html>`_.
+
+
+.. _conditional-operators:
 
 Conditional operators
 ***********************************
@@ -133,6 +140,30 @@ are "indicator" constraints that can be handled natively by some solvers. Otherw
 they are transformed to simpler constraints that use relational operators. The other
 cases are treated similarly.
 
+AMPL transmits *binary-var* = 1 ==> *constr2* to the solver as the disjunction
+*binary-var* != 1 or *constr2*. MP recovers the indicator form: a disjunction
+*literal* or *constr2*, where *constr2* is a comparison (or a conjunction of
+comparisons) not used elsewhere, is converted into indicator(s) on the binary
+variable, saving an auxiliary binary variable and a constraint per implication,
+with the same LP relaxation. This applies when the solver does not accept
+such comparisons natively, including MP2NL with full linearization (e.g.,
+*config=knitro*). See option *cvt:pre:disj2ind*. Its further bits treat
+a disjunct which is a conjunction of comparisons
+(as in *(x <= 1 and y >= 2) or (x >= 5 and y <= 0) or z >= 3*)
+with one binary variable per disjunct, as the standard big-M
+formulation of a disjunction does, and distribute a static disjunction
+over a conjunction of binary conditions. Whether an implication solves faster
+as an indicator or as a big-M row depends on the model; see
+:ref:`indicator-vs-bigm`.
+
+For a variable declared as *var x in {0} union interval[L, U]*, AMPL adds
+a binary variable *b* with *x >= L*b* and *x <= U*b*. A comparison of *x*
+with a threshold in *[0, L]*, such as *x >= L/2* or *x = 0*, is then decided
+by *b*, and MP uses *b* instead of a new binary variable
+(option *cvt:pre:vbnd*). The same holds for a variable restricted by
+a disjunction such as *x = 0 or x >= L*: comparisons of *x* with
+thresholds between *0* and *L* reuse the comparison *x >= L*.
+
 .. code-block:: ampl
 
     subject to Multi_Min_Ship {i in ORIG, j in DEST}:
@@ -155,9 +186,12 @@ Logical operators
 - not *constr*
     *constr-valued:* Satisfied when *constr* is false.
 
-Expressions using these operators are transformed to use Gurobi's native AND
-and OR "general constraints" when possible. In other cases, they are
+Solvers with native AND and OR constraints (currently Gurobi, Xpress, SCIP
+and CP-SAT) receive them directly. For other solvers, they are
 transformed to simpler constraints that use relational operators.
+Whether a solver accepts a construct natively is shown by the corresponding
+:ref:`acceptance option <acceptance-options>` in its option list
+(``<solver> -=``).
 
 .. code-block:: ampl
 
@@ -224,9 +258,18 @@ Piecewise-linear expressions
     *expr-valued:* Equals the largest value among the *expr* operands.
 - max ( expr-list )
     *expr-valued:* Equals the largest value among all of the operands in the *expr-list*.
+- << *breakpoint-list*; *slope-list* >> var
+    *expr-valued:* Computes a piecewise-linear function of a single variable; see
+    `Chapter 17. Piecewise-Linear Programs <https://ampl.com/BOOK/CHAPTERS/20-piecewise.pdf>`_ in
+    the `AMPL book <https://ampl.com/resources/the-ampl-book/>`_ for a complete description of the
+    forms that AMPL recognizes.
 
-Expressions using these operators are transformed to use Gurobi's native ABS, MIN, and MAX
-"general constraints" when possible. In other cases, they are transformed to simpler constraints
+ABS, MIN, MAX
+^^^^^^^^^^^^^^^^^^^
+
+Solvers with native support receive abs, min and max directly (abs: currently
+Gurobi, Xpress, COPT, SCIP and CP-SAT; min and max: Gurobi, Xpress and CP-SAT).
+For other solvers, they are transformed to simpler constraints
 that use relational operators, and in particular are linearized where all of the operands are linear.
 
 .. code-block:: ampl
@@ -245,29 +288,34 @@ that use relational operators, and in particular are linearized where all of the
     maximize WeightSum:
        sum {t in TRAJ} max {n in NODE} weight[t,n] * Use[n];
 
-- << *slope-list*; *breakpoint-list* >> var
-    *expr-valued:* Computes a piecewise-linear function of a single variable; see
-    `Chapter 17. Piecewise-Linear Programs <https://ampl.com/BOOK/CHAPTERS/20-piecewise.pdf>`_ in
-    the `AMPL book <https://ampl.com/resources/the-ampl-book/>`_ for a complete description of the
-    forms that AMPL recognizes.
+General piecewise-linear expressions
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-This piecewise-linear expression is defined by lists of ``n`` *breakpoints* and ``n+1``
+A piecewise-linear expression
+<< *breakpoint-list*; *slope-list* >> *var*
+is defined by a list of ``n`` *breakpoints* and ``n+1``
 *slopes*. The *var* must be a reference to a single variable.
 
-When AMPL's option ``pl_linearize`` is at its default value of 1, AMPL linearizes these
+We recommend setting `AMPL option <https://dev.ampl.com/ampl/reference/options.html>`_
+``pl_linearize`` to 0 for MP solvers. Then piecewise-linear expressions are represented to the solver
+in the form of expression trees. The MP-based interface transforms them to use a solver's native
+methods for piecewise-linear functions (Gurobi, CPLEX, Xpress), and linearizes them for other
+solvers (for example COPT, HiGHS, MOSEK).
+
+When AMPL option ``pl_linearize`` is at its default value of 1, AMPL linearizes these
 piecewise-linear expressions, and sends the linearized versions to the solver. The linearization
 is continuous where possible, in certain convex and concave cases (where the slopes are
 increasing and decreasing, respectively); but in general, the linearization includes both
 continuous and binary variables.
 
-When ``pl_linearize`` is set to 0, piecewise-linear expressions are represented to the solver
-in the form of expression trees. The MP-based interface transforms them to use a solver's native
-methods for piecewise-linear functions (Gurobi, COPT), and linearizes them for other solvers (HiGHS).
-
 When a piecewise-linear function is linearized (rather than being handled natively by the solver),
 numerical accuracy becomes a concern. To promote numerical stability, it is recommended that
-the argument and result variables be explicitly bounded within [-1e+4,+1e-4]. See more in the section
+the argument and result variables be explicitly bounded within at most [-1e+4,+1e+4]. See more in the section
 on :ref:`numerical_accuracy`.
+
+A convex piecewise-linear cost charged only while a unit is on (a
+semicontinuous variable) has a stronger linear formulation, the
+:ref:`perspective <perspective>`.
 
 
 .. code-block:: ampl
@@ -275,7 +323,7 @@ on :ref:`numerical_accuracy`.
     maximize Total_Profit:
        sum {p in PROD, t in 1..T} (revenue[p,t]*Sell[p,t] -
           prodcost[p]*Make[p,t] - <<0; -backcost[p],invcost[p]>> Inv[p,t]) -
-       sum {t in 1..T} <<avail_min[t]; 0,time_penalty[t]>> Use[t]
+       sum {t in 1..T} <<avail_min[t]; 0,time_penalty[t]>> Use[t] -
        sum {p in PROD, t in 1..T}
           <<commit[p,t]; -100000,0>> (Sell[p,t],commit[p,t]);
 
@@ -294,6 +342,7 @@ Counting operators
     *expr-valued:* The number of members of the indexing set such that the *constr* is satisfied.
 
 AMPL’s ``count`` operator examines an indexed collection of constraints, and returns the number of those constraints that are satisfied. The AMPL translator instantiates the specified constraint for each member of the indexing set, and communicates all of the instantiated constraints to the solver interface; then the solver interface transforms the counting operation to a form that the solver can accept.
+Constraint programming solvers (CP-SAT) receive ``count`` and ``numberof`` natively.
 
 .. code-block:: ampl
 
@@ -376,8 +425,8 @@ require careful modeling in regard to :ref:`numerical_accuracy`.
     *constr-valued:* Satisfied when all of the items in the *expr-list* take different values.
 
 This operator provides a much more concise alternative to specifying ``!=`` between all pairs
-in a specified collection of expressions. Currently none of the MP-based solvers support this
-operator natively, so the interface transforms it to a representation in terms of simpler
+in a specified collection of expressions. Constraint programming solvers (CP-SAT) receive it
+natively; for other solvers, the interface transforms it to a representation in terms of simpler
 constraints.
 
 .. code-block:: ampl
@@ -391,11 +440,13 @@ constraints.
        alldiff {i in I..I+2, j in J..J+2} X[i,j];
 
 
+.. _complementarity:
+
 Complementarity operator
 ***********************************
 
 - *constr1* complements *constr2*
-    *constr-valued:* Satisfied when both *const1* and *constr2* are satisfied,
+    *constr-valued:* Satisfied when both *constr1* and *constr2* are satisfied,
     and at least one of them holds with equality. Each of *constr1* and *constr2*
     must have the form *expr1 <= expr2* or *expr1 >= expr2* (and the trivial special case *expr1 = expr2* is also recognized).
 - *expr* complements *constr*,  *constr* complements *expr*
@@ -410,7 +461,10 @@ a common kind of relationship between two single-inequality constraints, or betw
 
 Certain nonlinear solvers, notably Knitro, handle complementarity constraints natively.
 For MP-based solvers, the interface converts uses of ``complements`` to equivalent
-constraints using logical operators.
+constraints using logical operators or certain nonlinear functions,
+see :ref:`solver options <ampl-solver-options>`
+``cvt:compl``, ``cvt:compl:eps``; the available reformulations are listed in
+:ref:`mp2nl-complementarity`.
 
 .. code-block:: ampl
 
@@ -426,6 +480,8 @@ constraints using logical operators.
 
 
 
+.. _set-membership:
+
 Set membership operator
 **********************************
 
@@ -436,6 +492,34 @@ Set membership operator
 This is the simplest use of ``in`` to restrict the domain of a set; more
 generally, the *in set-expr* phrase may appear in any ``var`` definition
 that does not contain an *=* phrase.
+
+.. admonition:: Work in Progress
+   :class: warning
+
+   The set membership feature is currently under rework. Until further notice,
+   it is recommended to use disjunctive constraints instead,
+   especially when the involved variables participate in logical
+   expressions. Example:
+   
+   .. code-block:: ampl
+
+       var grade in
+           0..2 union {5}
+           union interval[8.1,9]
+           union interval[10,13.7];
+       #
+       # replace by
+       #
+       var grade >=0 <=13.7;
+       s.t. GradeDomain:
+           grade <= 0 || grade == 1 || grade == 2
+               || grade == 5 || 8.1 <= grade <= 9
+               || grade >= 10;
+
+   Which of the two forms solves faster depends on the model and the solver;
+   on two models with the same structure they won in opposite directions.
+   Where performance matters, try both (:ref:`modeling-formulations`).
+
 
 Before sending a problem to the solver interface, AMPL converts variable
 definitions of this kind to alternative definitions that do not use the
@@ -468,17 +552,33 @@ Quadratic and power operators
 - *expr1* / *expr2*
     *expr-valued:* Division of *expr1* by *expr2*.
 - *expr1* ^ *expr2*
-    *expr-valued:* *expr1* raised to the *expr2* power, for the special cases where
-    either *expr1* or *expr2* is a constant. For *expr2* positive integer, the operator
-    is decomposed into quadratic constraints if the solver supports them,
-    otherwise passed to the solver natively or approximated by a piecewise-linear function.
+    *expr-valued:* *expr1* raised to the *expr2* power.
+    For *expr2* constant positive integer, the operator
+    is passed to the solver natively if supported, otherwise
+    decomposed into quadratic constraints if the solver supports them,
+    otherwise approximated by a piecewise-linear function.
+    See :ref:`nonlinear-functions` for details.
 
 For quadratic expressions of the form *linear \* linear* and *linear^2*, the operands
 are multiplied out so that coefficients of individual quadratic terms can be extracted.
+For example, :math:`(x-2)(y+3)` is multiplied out as :math:`xy-2y+3x-6`.
 If the solver natively handles quadratic terms, then the quadratic coefficients are
 passed to the solver, which decides whether and how to handle them. Otherwise, quadratic
-terms are linearized where possible, such as where one of the operands is a binary variable,
-or approximated.
+terms are linearized where possible, or approximated:
+
+- a product with a binary variable is linearized exactly;
+- a product with an integer variable of finite bounds (the other factor being
+  bounded too) is reformulated exactly by binary expansion of the integer factor
+  with the smaller range: :math:`y = l_y + \sum_j 2^j b_j`, so that
+  :math:`xy = l_y x + \sum_j 2^j (b_j x)` (Gupte, Ahmed, Cheon, Dey, 2013).
+  Option ``cvt:mip:intprodbits`` limits the number of binary variables
+  (default 30; 0 restores the approximation below);
+  integer powers :math:`x^k` are built from such products;
+- other products :math:`xy` are approximated as
+  :math:`((x+y)^2 - x^2 - y^2)/2` with piecewise-linear squares.
+
+Equal products share their reformulation. Constraint programming solvers
+(CP-SAT) receive products and integer powers natively (``acc:mul``, ``acc:powc``).
 
 Piecewise linearization allows handling of nonconvex QP and nonlinear models
 by convex MIP solvers.
@@ -486,12 +586,13 @@ For convex MIQP solvers,
 to apply linearization of quadratic expressions (it is the default for linear solvers only),
 use options ``cvt:quadobj=0``, ``cvt:quadcon=0``.
 
-Other expressions involving these operators are converted, where possible, to simpler
+Other expressions involving these operators are converted, where needed and possible, to simpler
 quadratic expressions and equality constraints through the use of auxiliary variables;
 then the resulting quadratic expressions and equality constraints are handled in ways
 previously described. For example:
 
-- ``(x-1)^3`` is converted to ``(x-1) * y`` with the added constraint ``y = (x-1)^2``.
+- ``(x-1)^3``, unless natively supported, is converted to ``(x-1) * y`` with
+  the added constraint ``y = (x-1)^2``.
 - ``x * max {j in 1..n} y[j]`` is converted to ``x * z`` with the added constraint
   ``z = max {j in 1..n} y[j]``.
 - ``x / sum {j in 1..n} y[j]`` is converted to ``z`` with the added constraints
@@ -504,14 +605,56 @@ previously described. For example:
           c[i] * x[i] / (40 * b[i] * sum {j in J} x[j] / b[j]);
 
 
+Rounding and integer division
+**************************************
+
+- floor( *expr* ), ceil( *expr* )
+- round( *expr* [, *n* ] ), trunc( *expr* [, *n* ] )
+    *expr-valued:* rounding to an integer, or to *n* decimal places
+    (*n* a constant integer). ``round`` rounds ties to even, as AMPL does
+    (``round(2.5) = 2``).
+- *expr1* div *expr2*, *expr1* mod *expr2*
+    *expr-valued:* truncated quotient ``trunc(expr1/expr2)`` and
+    remainder ``expr1 - expr2 * (expr1 div expr2)``, which has the sign
+    of *expr1*; also for real numbers (``7.5 mod 2 = 1.5``).
+
+For an integer argument, ``floor``, ``ceil``, ``round`` and ``trunc``
+return the argument itself. Otherwise, with an integer variable :math:`r`
+and the tolerance :math:`\epsilon` of option ``cvt:mip:eps``:
+
+- :math:`r = \lfloor x \rfloor`: :math:`r \le x \le r + 1 - \epsilon`;
+  :math:`r = \lceil x \rceil` symmetrically;
+- :math:`r = \mathrm{round}(x)`: :math:`r = 2m + p` with integer :math:`m`
+  and binary :math:`p`, :math:`|x - r| \le 1/2 - \epsilon p`, so that a tie
+  rounds to the even neighbor;
+- ``trunc`` uses ``floor`` for nonnegative and ``ceil`` for nonpositive
+  arguments;
+- :math:`q = x \mathop{\rm div} y`: with the remainder
+  :math:`\rho = x - yq`, :math:`|\rho| \le |y| - \epsilon` (1 for integer
+  :math:`\rho`), :math:`\rho` has the sign of :math:`x`, and :math:`y \ne 0`,
+  as in MiniZinc's linearization library. For a variable divisor, :math:`yq`
+  is a product, reformulated exactly for bounded integer :math:`q`
+  (see above); ``mod`` reuses the quotient.
+
+Decimal values such as 0.15 are not exact in binary floating point, so ties
+of ``round(x, n)`` with *n* > 0 can be resolved differently from AMPL's own
+evaluation. AMPL's ``trunc(x, n)`` with negative *n* can differ from
+the mathematical truncation that MP applies.
+
+CP-SAT receives ``div`` and ``mod`` natively (``acc:intdiv``, ``acc:mod``).
+
+
 Conic optimization
 **************************************
 
 Some solvers can handle conic constraints with tailored algorithms:
-Mosek, Gurobi, COPT. Note that general non-linear solvers accept them too,
+Mosek, Gurobi, COPT, SCIP, CPLEX, Xpress.
+Note that general non-linear solvers accept them too,
 but might not provide any specialized methods.
-See `conic examples <https://colab.ampl.com/tags/conic.html>`_
+See `conic examples <https://colab.ampl.com/tags/conic.html>`__
 at Google Colab.
+
+.. _socp:
 
 Second-order cone programming (SOCP)
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -544,16 +687,54 @@ complaining::
     The problem contains both conic and nonlinear constraints.
 
 
-In this case, setting :ref:`option <solver-options>` ``cvt:socp=0`` results in second-order conic
-constraints being passed to the solver as quadratics, even if
-the solver has native SOCP API. This gives the solver a chance to recognize
-SOCP forms in preprocessing.
+In this case, change the model to use standard SOCP forms,
+or consider playing with
+the :ref:`options <solver-options>` ``cvt:socp`` and ``cvt:socp2qp``.
+
+
+.. _redundant-convex-constraints:
+
+Redundant convex constraints on lifted variables
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+MP recognizes a cone from its algebraic form, so the variables of the cone
+must appear by name. Inline them and the structure is gone. This also
+enables a useful technique: when the model's own definitions imply a convex
+inequality, add it. It removes no feasible point, and can give a global
+solver the convex bound it otherwise lacks. The classical example is the
+lifted form of AC power flow (Jabr 2006):
+
+.. code-block:: ampl
+
+    var Wii {i in BUS} >= vmin[i]^2, <= vmax[i]^2;
+    var Wc {(i,j) in LINE} >= wc_lo[i,j], <= wc_hi[i,j];
+    var Ws {(i,j) in LINE} >= -ws_hi[i,j], <= ws_hi[i,j];
+    subject to Wii_Def {i in BUS}: Wii[i] = V[i]^2;
+    subject to Wc_Def {(i,j) in LINE}: Wc[i,j] = V[i]*V[j]*cos(Th[i]-Th[j]);
+    subject to Ws_Def {(i,j) in LINE}: Ws[i,j] = V[i]*V[j]*sin(Th[i]-Th[j]);
+    # an identity of the definitions, and a rotated second-order cone:
+    subject to SOC {(i,j) in LINE}: Wc[i,j]^2 + Ws[i,j]^2 <= Wii[i]*Wii[j];
+
+On an AC optimal power flow test with discrete transformer taps, this one
+row took the medium instance from "not proven optimal in 60 seconds" to a
+proof in under a second. The lifted variables must be variables with
+declared bounds (not defined variables, which would be substituted back), and
+the bounds should be tight. On meshed networks the cone is a cut, not an
+exact relaxation (Kocuk, Dey & Sun 2016). To check that the solver received
+the row as a cone, export its model (:ref:`explore-final-model`); for when to
+keep a quantity as a named variable at all, see :ref:`substitute-or-name`.
+
+*References:* R.A. Jabr (2006). Radial distribution load flow using conic
+programming. *IEEE Trans. Power Syst.* 21(3). B. Kocuk, S.S. Dey, X.A. Sun
+(2016). Inexactness of SDP relaxation and valid inequalities for optimal
+power flow. *IEEE Trans. Power Syst.* 31(1).
+
 
 Exponential cones
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Mosek natively handles exponential conic constraints.
-They are recognized by MP and passed to Mosek via its API.
+MOSEK and COPT natively handle exponential conic constraints.
+They are recognized by MP and passed to the solver via its API.
 Example:
 
 .. code-block:: ampl
@@ -580,10 +761,65 @@ e.g., to see which constraints are received as conic vs quadratic,
 see :ref:`explore-final-model`.
 
 
-
+.. _nonlinear-functions:
 
 General nonlinear functions
 **********************************
+
+How nonlinear functions reach the solver depends on its class:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 65
+
+   * - Solvers
+     - Handling
+   * - Gurobi, Xpress, SCIP; COPT with ``acc:_expr=1``
+     - Passed natively as expression trees (:ref:`flat-vs-expressions`).
+       Gurobi and SCIP solve globally, Xpress too if its license allows
+       (otherwise, or with ``alg:nlpsolver=1``, locally); COPT solves locally.
+   * - Linear-quadratic solvers (CPLEX, HiGHS, MOSEK, CBC, GCG, cuOpt;
+       COPT by default)
+     - Approximated piecewise-linearly (:ref:`nonlinear-pl-approx`), so the
+       solver optimizes the approximation.
+   * - NL solvers through :ref:`MP2NL <mp2nl>` (e.g. Knitro, Ipopt, BARON)
+     - Passed in the NL file, after MP's reformulation of the other constructs.
+
+For example, the Chichinadze test function has many local minima:
+
+.. code-block:: ampl
+
+    param pi := 4*atan(1);
+    var x {1..2} >= -30, <= 30;
+    minimize Chichinadze:
+       x[1]^2 - 12*x[1] + 11 + 10*cos(pi*x[1]/2) +
+          8*sin(pi*5*x[1]) - exp(-(x[2]-.5)^2/2)/sqrt(5);
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         ampl.solve(solver="scip")            # or gurobi, xpress: global solvers
+         print(ampl.obj["Chichinadze"].value(), ampl.var["x"].to_list())
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option solver scip;            # or gurobi, xpress: global solvers
+         ampl: solve;
+         SCIP 10.0.2: optimal solution; objective -43.31586211
+
+Gurobi, Xpress and SCIP all prove the global minimum :math:`-43.3159` at
+:math:`x \approx (5.9013, 0.5)`. A local solver can stop at one of the local
+minima, and a linear-quadratic solver works with the piecewise-linear
+approximation, whose accuracy depends on the bounds and on
+``cvt:plapprox:reltol``.
+
+For an interactive example of global optimization, see the Christmas tree
+decorations app in our `Streamlit gallery <https://ampl.com/streamlit>`_.
 
 Supported functions
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -598,101 +834,77 @@ Supported functions
     *expr-valued:* The hyperbolic sine, cosine, tangent of *expr* and the corresponding
     inverse functions.
 - *expr1* ^ *expr2*
-    *expr-valued:* *expr1* raised to the *expr2* power, for the special cases where
-    either *expr1* or *expr2* is a constant. For *expr2* positive integer, the operator
-    is decomposed into quadratic constraints if the solver supports them,
-    otherwise passed to the solver natively or approximated by a piecewise-linear function.
+    *expr-valued:* *expr1* raised to the *expr2* power.
+    For *expr1* and *expr2* both variable, the operator is passed
+    to the solver natively if supported, otherwise
+    reformulated as `exp(expr2 * log(expr1))`.
+    For *expr1* constant positive, the operator is passed to the solver
+    natively if supported, otherwise :ref:`nonlinear-pl-approx` is applied.
+    For *expr2* constant positive integer, the operator
+    is passed to the solver natively if supported, otherwise
+    decomposed into quadratic constraints if the solver supports them,
+    otherwise approximated by a piecewise-linear function.
+    To avoid using native handling
+    of the ^ operator, set options ``acc:pow=0``, ``acc:expa=0``,
+    or ``acc:powconstexp=0``,
+    respectively.
 
-General solvers
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Functions recognized from the model
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The following functions are recognized from the user input, for solvers that
+accept them natively (currently Gurobi); other solvers receive the original
+expression:
+
+
+Signpow function
+~~~~~~~~~~~~~~~~~~~~~
+
+- :math:`signpow(x, p) := sign(x) |x|^p, \quad p>1`.
+
+The following forms are recognized:
+
+.. code-block:: ampl
+
+   abs(x+x*y+7)^0.5*(x+x*y+7)     # gives signpow(x+x*y+7, 1.5)
+   sqrt(z^2)^2.3*z                # signpow(z, 3.3)
+                                  # With a single-variable argument only
+
+Set ``cvt:pre:signpow=0`` to skip recognition of :math:`signpow`.
+
+When using `abs`, note that if `x+x*y+7` has deduced bounds of equal sign,
+`abs` is eliminated and the result is `([-] (x+x*y+7))^0.5 * (x+x*x+7)`.
+Using `sqrt` is better in this regard - it is always converted,
+but less efficient
+for other solvers where it's left as-is.
+
+
+Logistic function
+~~~~~~~~~~~~~~~~~~~~~~
+
+- :math:`logistic(x) := \displaystyle\frac{1}{1 + e^{-x}}`.
+
+The following forms are recognized:
+
+.. code-block:: ampl
+
+   0.9 / (1.0 + exp(-2*x - 1.5*y))     # gives 0.9*logistic(2*x + 1.5*y)
+
+Set ``cvt:pre:logistic=0`` to skip recognition of :math:`logistic`.
+
+
+.. _nonlinear-pl-approx:
+
+Piecewise-linear approximation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 For linear-quadratic MP-based solvers,
 most of these nonlinear functions are handled by piecewise-linear approximation,
 except products with binary variables.
-The appoximation is constructed by the MP interface, using options
-``cvt:plapprox:reltol`` and ``cvt:plapprox:domain``,
-and is then processed as described in
+The appoximation is constructed by the MP interface, using :ref:`options <solver-options>`
+``cvt:plapprox:reltol`` and ``cvt:plapprox:domain``.
+
+To reduce the approximation size and improve numerical properties,
+set tight bounds on the variables, as described in
 :ref:`piecewise_linear_modeling`.
-
-Handling in Gurobi
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-For Gurobi, the following univariate nonlinear functions are instead handled natively:
-**exp**, **log**, **^**, **sin**, **cos**, **tan**.
-After suitable transformations, the MP interface sends Gurobi the expressions that use
-these functions.
-
-Gurobi 11 defaults to piecewise-linear approximation of these functions
-as part of its preprocessing. However, Gurobi :ref:`option <solver-options>` ``alg:global``
-(``pre:funcnonlinear``) sets the default to the new MINLP capability ---
-`global nonlinear solving <https://www.gurobi.com/>`_ via spatial branching:
-
-.. code-block:: ampl
-
-  ampl: option gurobi_options 'global=1'; solve;
-
-For individual constraints and objectives, the choice of global solving vs
-piecewise-linear approximation can be performed via the ``.global`` suffix:
-
-.. code-block:: text
-
-  pre:funcnonlinear (funcnonlinear, global)
-      Controls how general functions with their constraint's or objective's
-      suffix .funcnonlinear or, if not available, .global unset (or set to 0)
-      are treated (ATTENTION: different meaning than Gurobi FuncNonLinear
-      parameter and attribute):
-
-      -1 - Piecewise-linear approximation
-      0  - Automatic (default)
-      1  - Treated as nonlinear functions
-
-      Suffix values mean the same.
-
-See our `Christmas tree decorations Streamlit example <https://ampl.com/streamlit>`_
-using global optimization.
-
-Piecewise-linear aproximation can be influenced by setting
-the following options in the AMPL ``gurobi_options`` string:
-
-.. code-block:: text
-
-  pre:funcpieces
-      Sets the strategy for constructing a piecewise-linear approximation of a
-      function:
-
-      0   - Automatic choice (default)
-      >=2 - Sets the number of pieces, of equal width
-      1   - Uses a fixed width for each piece, as specified by the
-            funcpiecelength option
-      -1  - Bounds the absolute error of the approximation, as specified
-            by the funcpieceerror option
-      -2  - Bounds the relative error of the approximation, as specified
-            by the funcpieceerror option
-
-  pre:funcpiecelength
-      When funcpieces = 1, specifies the length of each piece of the
-      approximation.
-
-  pre:funcpieceerror
-      When funcpieces = -1 or -2, specifies the maximum allowed
-      error (absolute for -1, relative for -2) in the approximation.
-
-  pre:funcpieceratio
-      Controls whether the piecewise-linear approximation is an underestimate
-      of the function, an overestimate, or somewhere in between. A value of
-      0.0 will always underestimate, while a value of 1.0 will always
-      overestimate; a value in between will interpolate between the
-      underestimate and the overestimate. A special value of -1 chooses
-      points that are on the original function.
-
-These options can also be overridden for a particular objective or constraint,
-by setting suffixes of the same names. For example, after defining the objective
-shown below, setting ``suffix funcpieces IN; let Chichinadze.funcpieces := 12;``
-specifies 12 pieces for approximating the sin, cos, and exp functions in that objective.
-
-.. code-block:: ampl
-
-    minimize Chichinadze:
-       x[1]^2 - 12*x[1] + 11 + 10*cos(pi*x[1]/2) +
-          8*sin(pi*5*x[1]) - exp(-(x[2]-.5)^2/2)/sqrt(5);
-

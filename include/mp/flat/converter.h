@@ -5,25 +5,33 @@
 #include <map>
 #include <cmath>
 #include <utility>
+#include <cstdio>
 #include <cassert>
 
 #include "mp/env.h"
 #include "mp/format.h"
 #include "mp/solver-base.h"
+#include "mp/suffix.h"
+#include "mp/flat/converter_info.h"
 #include "mp/flat/converter_model.h"
 #include "mp/flat/convert_functional.h"
 #include "mp/flat/constr_keeper.h"
 #include "mp/flat/constr_std.h"
 #include "mp/flat/expr_bounds.h"
 #include "mp/flat/constr_prepro.h"
+#include "mp/flat/var_bnd_impl.h"
 #include "mp/flat/constr_prop_down.h"
+#include "mp/flat/expr_alg_inline.h"
+#include "mp/flat/converter_multiobj.h"
+#include "mp/flat/constr_2_expr.h"
 #include "mp/flat/sol_check.h"
 #include "mp/valcvt.h"
 #include "mp/flat/redef/std/range_con.h"
 #include "mp/flat/redef/conic/cones.h"
 #include "mp/flat/redef/conic/qcones2qc.h"
-#include "mp/utils-file.h"
+#include "mp/flat/redef/SDP/sdp.h"
 #include "mp/ampls-ccallbacks.h"
+#include "mp/utils-misc.h"
 
 namespace mp {
 
@@ -36,20 +44,34 @@ namespace mp {
 template <class Impl, class ModelAPI,
           class FlatModel = FlatModel< > >
 class FlatConverter :
-    public BasicFlatConverter,
-    public FlatModel,
-    public BoundComputations<Impl>,
-    public ConstraintPreprocessors<Impl>,
-    public ConstraintPropagatorsDown<Impl>,
-    public SolutionChecker<Impl>,
-    public EnvKeeper
+                      public ConverterInfo,
+                      public BasicFlatConverter,
+                      public FlatModel,
+                      public BoundComputations<Impl>,
+                      public ConstraintPreprocessors<Impl>,
+                      public ConstraintPropagatorsDown<Impl>,
+                      public AlgebraicExpressionInliner<Impl>,
+                      public MOManager<Impl>,
+                      public Constraints2Expr<Impl>,
+                      public SolutionChecker<Impl>,
+                      public EnvKeeper
 {
 public:
   /// Class name
   static const char* GetTypeName() { return "FlatConverter"; }
 
   /// Construct with Env&
-  FlatConverter(Env& e) : EnvKeeper(e), modelapi_(e) { }
+  FlatConverter(Env& e) : EnvKeeper(e), modelapi_(e) {
+    this->AddConversionAction(
+        [this](BasicFlatConverter& cvt) {
+          MP_ASSERT_ALWAYS(&cvt == this, "Bad ptr");
+          return this->InlineAlgSubexpr();
+        }, 3099);     // 3099: before LinFuncCon/QuadFuncCon
+  }
+
+  /// Converter info
+  const ConverterInfo* GetConverterInfo() const override
+  { return this; }
 
   /// Trying to use 'Var' instead of bare 'int'
   using Var = typename FlatModel::Var;
@@ -74,7 +96,8 @@ public:
   /// Currently this happens for all root-context logical constraints,
   /// i.e., we create an auxiliary variable which is later fixed to 1.
   void FixAsTrue(int resvar) {
-    PropagateResultOfInitExpr(resvar, 1.0, 1.0, +Context());
+    IncrementVarUsage(resvar);
+    PropagateResultOfInitExpr(resvar, 1.0, 1.0, +Context());  // afterwards #201 #266
   }
 
 
@@ -86,13 +109,41 @@ public:
 
   /// Reverse propagate result variable of an expression
   void PropagateResultOfInitExpr(int var, double lb, double ub, Context ctx) {
-    NarrowVarBounds(var, lb, ub);
-    if (HasInitExpression(var)) {
+    assert(!ctx.IsNone());
+    bool tighterBounds = (lb > MPCD(lb(var)) || ub < MPCD(ub(var)));
+    lb = std::max(lb, MPCD(lb(var)));
+    ub = std::min(ub, MPCD(ub(var)));
+    if (tighterBounds)
+      NarrowVarBestBounds(var, lb, ub);       // cvt:pre:boundsbest
+    if (HasActiveOrInactiveInitExpression(var)) {
       const auto& ckid = GetInitExpression(var);
-      ckid.GetCK()->PropagateResult(*this, ckid.GetIndex(), lb, ub, ctx);
+      const auto ctx_old = ckid.GetCK()->GetContext(ckid.GetIndex());
+      if (tighterBounds
+          || !ctx.IsSubsetOf(ctx_old)) {      // new context
+        ckid.GetCK()->PropagateResult(*this, ckid.GetIndex(), lb, ub, ctx);
+      }
     }
   }
 
+  /// Propagate objective contexts
+  void PropagateObjContexts() {
+    auto& objs = MPD( get_objectives() );
+    const auto objwgt = MPD( GetMOWeights() );
+    if (GetEnv().multiobj())               // only in obj:multi mode
+      assert(objs.size() == objwgt.size());
+    for (size_t i=0; i<objs.size(); ++i) {
+      auto isMax = obj::MAX==objs[i].obj_sense();
+      if (GetEnv().multiobj() && objwgt[i]<0.0) {  // only in obj:multi
+        isMax = !isMax;
+        objs[i].set_sense_true(isMax ? obj::MAX : obj::MIN);
+      }
+      auto ctx = isMax ? Context::CTX_POS : Context::CTX_NEG;
+      MPD( PropagateResult2LinTerms(objs[i].GetLinTerms(),
+                          MPD( MinusInfty() ), MPD( Infty() ), ctx) );
+      MPD( PropagateResult2QuadTerms(objs[i].GetQPTerms(),
+                          MPD( MinusInfty() ), MPD( Infty() ), ctx) );
+    }
+  }
 
 public:
   //////////////////////////////////// VISITOR ADAPTERS /////////////////////////////////////////
@@ -101,22 +152,27 @@ public:
 
   /// From an affine expression:
   /// Adds a result variable r and constraint r == expr
-  int Convert2Var(AffineExpr&& ee) {
+  int Convert2Var(AffineExpr ee) {
     if (ee.is_variable())
       return ee.get_representing_variable();
     if (ee.is_constant())
       return int( MakeFixedVar(ee.constant_term()) );
+    ee.sort_terms();
+    ee.shrink_to_fit();
     return AssignResultVar2Args(
             LinearFunctionalConstraint(std::move(ee)));
   }
 
   /// From a quadratic expression:
   /// Adds a result variable r and constraint r == expr
-  int Convert2Var(QuadraticExpr&& ee) {
+  int Convert2Var(QuadraticExpr ee) {
     if (ee.is_variable())
       return ee.get_representing_variable();
     if (ee.is_constant())
       return int(MakeFixedVar(ee.constant_term()));
+    ee.sort_terms();
+    ee.GetLinTerms().shrink_to_fit();
+    ee.GetQPTerms().shrink_to_fit();
     if (ee.is_affine())
       return AssignResultVar2Args(
             LinearFunctionalConstraint(
@@ -143,6 +199,7 @@ public:
   }
 
   /// Same, but always return a variable
+  /// (a fixed varible if the result is a constant).
   template <class FuncConstraint>
   typename FCC<Impl, FuncConstraint>::Var
   AssignResultVar2Args(FuncConstraint&& fc) {
@@ -152,10 +209,26 @@ public:
     return vc.get_var();
   }
 
+  /// Same, but for constant result, still add the full
+  /// expression.
+  /// This is necessary for complementarity constraints
+  /// in NL expression output where the constant part
+  /// needs to be an actual expression.
+  template <class FuncConstraint>
+  typename FCC<Impl, FuncConstraint>::Var
+  AssignResult2Args__FullExpression(FuncConstraint&& fc) {
+    auto fcc = MakeFuncConstrConverter<Impl, FuncConstraint>(
+        *this, std::forward<FuncConstraint>(fc));
+    return fcc.Convert(true).get_var();
+  }
+
 	/// Typedef ConInfo; constraint location
 	using ConInfo = AbstractConstraintLocation;
 
 	/// Replace functional expression defining a given variable.
+  /// After this, if the arguments are any new expressions,
+  /// the original context should be propagated into \a res_var:
+  /// PropagateResultOfInitExpr(res_var, ctx);
   template <class FuncConstraint>
   void RedefineVariable(int res_var, FuncConstraint&& fc) {
     assert( MPD( HasInitExpression(res_var) ) );
@@ -165,11 +238,18 @@ public:
 		// TODO make sure any new context is re-converted
 		// if necessary.
 		auto i = MPD( MapFind(fc) );
-		if (i<0)
-      i = int( MPD( AddConstraint(std::move(fc)) ) );
-		auto& ck = GET_CONSTRAINT_KEEPER( FuncConstraint );
+    // TODO preprocess, try map again, and use the result.
+    // assert(i<0);
+    auto& ck = GET_CONSTRAINT_KEEPER( FuncConstraint );
+    if (i<0)
+      i = int( MPD( AddFunctionalConstraint(std::move(fc)) ) );
+    else {       // #270 see redefvar_02.mod. Just add a new copy
+      i = ck.AddConstraint(constr_depth_, std::move(fc));
+      AutoLink(ck.SelectValueNodeRange(i));
+    }
     ConInfo ci{&ck, i};
     ReplaceInitExpression(res_var, ci);
+    MarkAsUsed(ci);          // Now manually #201 #266
     MarkAsBridged(ci_old);
   }
 
@@ -177,35 +257,89 @@ public:
 	/// Variables' reference counting ///////////////////////////////////
 	/// Currently only for defined variables ////////////////////////////
 
-	/// Use "+1" a variable
-	void IncrementVarUsage(int v) {
-		++VarUsageRef(v);
-	}
+  /// Use "+1" a variable.
+  /// When changing from 0 to 1,
+  /// mark as "used" if not redefined.
+  void IncrementVarUsage(int v) {
+    if (1==++VarUsageRef(v)) {
+      if (HasActiveOrInactiveInitExpression(v)) {
+        auto& ci = GetInitExpression(v);
+        if (ci.GetCK()->IsUnused(ci.GetIndex())
+            && !ci.GetCK()->IsBridged(ci.GetIndex())) {
+          MarkAsUsed(ci);
+        }
+      }
+    }
+    // Not catching reuse after redef:
+    // just checking new context in context propagation,
+    // see PropagateBoundsAndContext().
+#ifdef CATCH_REUSE_AFTER_REDEF
+    // If unused, no reformulation tried,
+    // currently no repetition of reformulation cycle.
+    // @todo could allow if redefined in CTX_MIX.
+    MP_ASSERT_ALWAYS(!IsUnused(GetInitExpression(v))
+                     || IsBridgingToBeConsidered(GetInitExpression(v)),
+                     "An expression's redefinition\n"
+                     "could be lost. Please contact\n"
+                     "AMPL customer support.");
+#endif
+  }
 
 	/// Unuse result variable.
   /// Actually this is to 'unuse' the init expression
   /// - might change naming.
-	/// Throw if already not used.
-	void DecrementVarUsage(int v) {
-		assert(VarUsageRef(v)>0);
-		if (! (--VarUsageRef(v))) {
-			if (HasInitExpression(v))
-        MarkAsUnused(GetInitExpression(v));
-		}
-	}
+  /// Throw if already not used.
+  /// When changing from 1 to 0,
+  /// mark "unused" if not already and not redefined
+  void DecrementVarUsage(int v) {
+    assert(VarUsageRef(v)>0);
+    if (VarUsageRef(v)>0)          // in Release build
+      if (! (--VarUsageRef(v))) {
+        if (HasInitExpression(v)) {
+          auto& ci = GetInitExpression(v);
+          if (IsConActive(ci)) { // used && !bridged
+            MarkAsUnused(ci);
+          }
+        }
+      }
+  }
 
-	/// Fix unused defined vars.
+  /// Count argument references.
+  /// @todo currently called manually for objectives
+  template <class ConObj>
+  void CountArgRefs(const ConObj& con) {
+    VisitArguments(con,
+                   [this](int v) {
+      IncrementVarUsage(v);
+    });
+  }
+
+  /// Uncount argument references
+  /// @todo currently called manually for objectives
+  template <class ConObj>
+  void UncountArgRefs(const ConObj& con) {
+    VisitArguments(con,
+                   [this](int v) {
+      DecrementVarUsage(v);
+    });
+  }
+
+  /// Mark unused defined vars for elimination.
 	/// Normally should delete them.
-	void FixUnusedDefinedVars() {
+  void EliminateUnusedDefinedVars() {
 		for (auto i=num_vars(); i--; ) {
-			if (HasInitExpression(i) &&
+      if (HasActiveOrInactiveInitExpression(i) &&      // why only defined?
 					! VarUsageRef(i)) {
-				set_var_lb(i, 0.0);      // fix to 0
-				set_var_ub(i, 0.0);
+        MPD( MarkVarAsEliminated(i) );
 			}
 		}
 	}
 
+  /// Var usage
+  int VarUsage(int i) const {
+    return (i<(int)refcnt_vars_.size())
+               ? refcnt_vars_[i] : 0;
+  }
 
 protected:
 	int& VarUsageRef(int i) {
@@ -217,51 +351,160 @@ protected:
 		return refcnt_vars_[i];
 	}
 
+
+public:
+  /// Signal if the model needs a solve.
+  /// This should be used in particular with MO emulation.
+  /// @return true if the next solve should be executed
+  /// and its results passed via ProcessSolveIterationSolution().
+  bool PrepareNextSolveIteration(
+      std::function<sol::Status(void)> get_stt, std::function<Solution(void)> get_sol) {
+    if (MPCD( IsMOActive() ))
+      return MPD( PrepareMOIteration(get_stt, get_sol) );
+    return !(n_solve_iter_++);
+  }
+
+  /// Objective weights, adapted according to obj:multi:weight
+  ArrayRef<double> GetObjWeightsAdapted() { return MPD( GetMOWeightsLegacy() ); }
+
+
+protected:
   //////////////////////////// CUSTOM CONSTRAINTS CONVERSION ////////////////////////////
   ///
   //////////////////////////// THE CONVERSION LOOP: BREADTH-FIRST ///////////////////////
   void ConvertItems() {
     try {
-			MPD( Convert2Cones(); );                 // sweep before other conversions
+      MPD( OutputModelInfo("AMPL MP initial flat model", 0, "flat0_"); );
+      MPD( Convert2SDP(); );                   // Scan SDP before cones?
+      MPD( Convert2Cones(); );                 // sweep before other conversions
       MP_DISPATCH( ConvertAllConstraints() );
       // MP_DISPATCH( PreprocessIntermediate() );     // preprocess after each level
       constr_depth_ = 1;  // Workaround. TODO have maps as special constraints
 			MP_DISPATCH( ConvertMaps() );
-      MP_DISPATCH( PreprocessFinal() );               // final prepro
+      MP_DISPATCH( ConvertDelayedItems() );           // reassess delayed items
+      MP_DISPATCH( PreprocessFlatFinal() );           // final flat model prepro
+      MP_DISPATCH( ConsiderEmulatingMultiobj() );     // Before NL conversion
+      if constexpr (IfAcceptingNLOutput()) {
+        if (IfWantNLOutput()) {
+          MPD( Convert2NL() );                        // Possibly for emulated objectives
+          MPD( PreprocessNLFinal() );
+        }
+      }
     } catch (const ConstraintConversionFailure& cff) {
       MP_RAISE(cff.message());
     }
   }
 
-  void OpenGraphExporter() {
-    if (graph_export_file().size()) {
-      if (!graph_exporter_app_->Open(graph_export_file().c_str(), true))
-        MP_RAISE("Failed to open the graph export file.");
-      value_presolver_.SetExport(true);
+  /// Print model info and/or output such suffixes
+  void OutputModelInfo(const char* header, bool aux_vars,
+      const char* suf_prefix) {
+    if (GetEnv().verbose_mode() || GetEnv().debug_mode()) {
+      MPD( CreateFlatModelInfo(GetModelAPI()) );
+      if (GetEnv().debug_mode())
+        ReportModelInfoSuffixes(
+            *MPCD( GetModelInfo() ), suf_prefix, suf_get_set_);
+      if (GetEnv().verbose_mode()) {
+        const auto* fmi = MPCD( GetModelInfo() );
+        if (!aux_vars) {                      // 1st output
+          fmt::print("\n");
+            modelinfo_flat0_vars_ = fmi->GetVarInfo();
+          modelinfo_flat0_objs_ = fmi->GetObjInfo();
+          modelinfo_flat0_cons_ = fmi->GetConstraintTypes();
+          PrintModelInfo(
+              *fmi, header, aux_vars);
+        } else {                              // 2nd output
+          if (fmi->GetVarInfo() != modelinfo_flat0_vars_
+              || fmi->GetObjInfo() != modelinfo_flat0_objs_
+              || fmi->GetConstraintTypes() != modelinfo_flat0_cons_)
+            PrintModelInfo(
+                *fmi, header, aux_vars);
+          else
+            fmt::print("AMPL MP did not modify the model.\n\n");
+          fmt::print("\n");
+          std::fflush(stdout);
+        }
+      }
     }
   }
 
-	/// Offload the conic logic to a functor
-	void Convert2Cones() {
-		conic_cvt_.Run();
-	}
+  void OpenGraphExporter() {
+    if (graph_export_file().size()) {
+      if (!GetModel().GetFileAppender().Open(
+            graph_export_file().c_str(), true))
+        MP_RAISE("Failed to open the graph export file.");
+    }
+  }
+
+  /// Offload the SDP logic to a functor
+  void Convert2SDP() {
+    sdp_cvt_.Run();
+  }
+
+  /// Offload the conic logic to a functor
+  void Convert2Cones() {
+    conic_cvt_.Run();
+  }
 
   /// Can be called from ConvertMaps()
   void ConvertAllConstraints() {
     GetModel().ConvertAllConstraints(*this);
   }
 
+  /// Inline algebraic subexpr.
+  /// @return true iff anything changed.
+  bool InlineAlgSubexpr() {
+    auto preu = MPCD( IfPreproUnnest() );
+    return MPD(
+        ConsiderInliningAlgExpr(preu) );
+  }
+
   /// Default map conversions. Currently empty
   void ConvertMaps() { }
 
+  /// Final reassessment: convert the items delayed
+  /// in the main loop (IfDelayConversion()), and anything new.
+  /// From here on, no delays are accepted.
+  void ConvertDelayedItems() {
+    if_final_cvt_phase_ = true;
+    while (GetModel().ConvertDelayedItems(*this))
+      MP_DISPATCH( ConvertAllConstraints() );
+  }
+
+public:
+  /// Are we in the final conversion phase
+  /// (ConvertDelayedItems()), where delays are not accepted?
+  bool IfFinalConversionPhase() const { return if_final_cvt_phase_; }
+
+protected:
+
+  /// Acceptance level for all constr/expr,
+  /// if provided (>=0)
+  int AcceptanceLevelCommon() const { return options_.accAll_; }
+
+public:
+  /// Option to actually use expressions if available
+  bool IfWantNLOutput() const { return options_.accExpr_==1; }
+
+  /// Whether solver CAN accept expressions
+  static constexpr bool IfAcceptingNLOutput()
+  { return
+        ExpressionAcceptanceLevel::AcceptedButNotRecommended
+        == ModelAPI::ExpressionInterfaceAcceptanceLevel()
+        ||
+           ExpressionAcceptanceLevel::Recommended
+               == ModelAPI::ExpressionInterfaceAcceptanceLevel(); }
+
+protected:
+  /// Finish exporting the reformulation graph
   void CloseGraphExporter() {
     value_presolver_.FinishExportingLinkEntries();
-    graph_exporter_app_->Close();
+    GetModel().GetFileAppender().Close();
   }
 
   //////////////////////// WHOLE-MODEL PREPROCESSING /////////////////////////
   void PreprocessIntermediate() { }
-  void PreprocessFinal() { }
+  void PreprocessFlatFinal() { }
+  void PreprocessNLFinal() { }
 
 
   //////////////////////////// CONSTRAINT PROPAGATORS ///////////////////////////////////
@@ -273,7 +516,7 @@ protected:
   //////////////////////////// SPECIFIC CONSTRAINT RESULT-TO-ARGUMENTS PROPAGATORS //////
   /// Currently we should propagate to all arguments, be it always the CTX_MIX.
 
-  /// Allow ConstraintKeeper to PropagateResult(), use GetBackend() etc
+  /// Allow ConstraintKeeper to PropagateResult(), use GetModelAPI() etc
   template <class , class , class >
   friend class ConstraintKeeper;
 
@@ -281,10 +524,15 @@ protected:
   //////////////////////////// CUSTOM CONSTRAINTS CONVERSION ////////////////////////////
   ///
 public: // for ConstraintKeeper
-  /// RunConversion() of a constraint:
+  /// RunConversion() of a constraint in the flat phase:
   /// Assume mixed context if not set.
+  /// @return Context used for redefinition
+  /// @note Do not use directly. Call via
+  ///   ConstraintKeeper.ConvertConstraint().
   template <class Constraint>
-  void RunConversion(const Constraint& con, int i, int depth) {
+  Context RunConversion(const Constraint& con, int i, int depth) {
+    assert(
+        !GET_CONSTRAINT_KEEPER(Constraint).IsRedundant(i));
     constr_depth_ = depth+1;
     if (con.UsesContext())              // If context relevant,
       if (con.GetContext().IsNone())    // ensure we have context, mixed if none
@@ -293,15 +541,7 @@ public: // for ConstraintKeeper
       *static_cast<Impl*>(this),
       GET_CONSTRAINT_KEEPER(Constraint).SelectValueNodeRange(i)
     };
-    MP_DISPATCH(Convert(con, i));
-  }
-
-  /// Query if a constraint type
-  /// is natively accepted by the solver.
-  /// The parameter is only needed for type.
-  template <class Con>
-  ConstraintAcceptanceLevel GetConstraintAcceptance(Con* ) const {
-    return GET_CONST_CONSTRAINT_KEEPER(Con).GetChosenAcceptanceLevel();
+    return MP_DISPATCH(Convert(con, i));
   }
 
   /// Query the number of addable constraints of type.
@@ -336,7 +576,8 @@ public: // for ConstraintKeeper
   /// specialize IfNeedsCvt_impl instead.
   template <class Constraint>
   bool IfNeedsConversion(const Constraint& con, int i) {
-    return MPD( IfNeedsCvt_impl(con, i) );
+    return MPD( IfNeedsCvt_impl(con, i) )
+        || MPD( IfNeedsCvtForParent(con, i) );
   }
 
   /// Generic query if a constraint needs to be converted,
@@ -349,43 +590,189 @@ public: // for ConstraintKeeper
     return false;
   }
 
-  /// Check whether ModelAPI accepts and recommends the constraint
+  /// Query if the specific item of the constraint
+  /// needs to be skipped in regular conversion,
+  /// despite being not accepted by the ModelAPI.
+  /// For example, some conditional comparisons.
+  /// This method should not be redefined;
+  /// specialize IfNeedsCvt_impl instead.
   template <class Constraint>
-  static bool ModelAPIAcceptsAndRecommends(const Constraint* pcon) {
-    return ConstraintAcceptanceLevel::Recommended ==
-        ModelAPI::AcceptanceLevel(pcon);
+  bool IfDelayConversion(const Constraint& con, int i) {
+    return !IfFinalConversionPhase()
+        && (MPD( IfDelayCvt_impl(con, i) )
+            || MPD( IfDelayCvtForParent(con, i) ));
   }
+
+  /// Generic query if a constraint needs to be
+  /// skipped from regular conversion,
+  /// despite being not accepted by the ModelAPI.
+  /// Specialize this method, or even
+  /// ConstraintConverter::IfDelayConversion
+  /// (see class CondEQConverter_MIP).
+  template <class Constraint>
+  bool IfDelayCvt_impl(const Constraint& , int ) {
+    return false;
+  }
+
+  ////////// Hooks for reformulations spanning several items //////////
+  /// A Converter can overload these for specific types,
+  /// e.g., to reformulate a parent constraint together
+  /// with its argument's defining constraint
+  /// (see redef/MIP/disj2ind.h).
+
+  /// Hook: constraint \a con has been stored at index \a i.
+  template <class Constraint>
+  void NoteConstraintAdded(const Constraint& , int ) { }
+
+  /// Hook: should accepted constraint \a con be converted
+  /// for the sake of a reformulation involving its arguments?
+  template <class Constraint>
+  bool IfNeedsCvtForParent(const Constraint& , int ) { return false; }
+
+  /// Hook: should \a con's conversion be delayed
+  /// for the sake of a reformulation involving its parent(s)?
+  template <class Constraint>
+  bool IfDelayCvtForParent(const Constraint& , int ) { return false; }
+
+  /// Hook: before converting \a con, convert its parent,
+  /// which might make \a con unused.
+  /// Called by ConstraintKeeper::ConvertConstraintStd().
+  /// @return whether the parent was converted
+  template <class Constraint>
+  bool TryConvertParentFirst(const Constraint& , int ) { return false; }
+
+
+  ////////////////// Constraint/expression accpetance ////////////////
+
+  /// Check whether ModelAPI (not user) accept and recommend the constraint
+  template <class Constraint>
+  bool ModelAPIOk() const {
+    return ModelAPIAcceptsAndRecommends((const Constraint*)0);
+  }
+
+  /// Whether user (ONLY) recommends either the constraint or corr. expr,
+  /// for the expression also check if expression output is desired
+  template <class Constraint>
+  bool UserAcceptsConOrExpr() const {
+    return
+        MPCD( UserAcceptsAndRecommends((const Constraint*)0) )
+           || (MPCD( IfWantNLOutput() )
+               && MPCD( template UserAcceptsExprForCon<Constraint>()));
+  }
+
+
+  /// Check whether ModelAPI and user accept and recommend the constraint
+  template <class Constraint>
+  bool UserAcceptsAndRecommends(const Constraint* pcon) const {
+    return ConstraintAcceptanceLevel::Recommended ==
+           GetConstraintAcceptance_USER(pcon);
+  }
+
+  /// Check whether ModelAPI accept and recommend the constraint
+  template <class Constraint>
+  bool ModelAPIAcceptsAndRecommends(const Constraint* pcon) const {
+    return ConstraintAcceptanceLevel::Recommended ==
+           GetConstraintAcceptance_DEFAULT(pcon);
+  }
+
+  /// Check whether user accepts and recommends
+  /// the expression corresponding to constraint
+  template <class Constraint>
+  bool UserAcceptsExprForCon() const {
+    return UserAcceptsAndRecommendsEXPR((
+        const ExprWrapper<Constraint>*)0);
+  }
+
+  /// Check whether ModelAPI and user accept and recommend the expression
+  template <class Expression>
+  bool UserAcceptsAndRecommendsEXPR(const Expression* pcon) const {
+    return ExpressionAcceptanceLevel::Recommended ==
+           GetConstraintAcceptanceEXPR_USER(pcon);
+  }
+
+  /// Check whether ModelAPI accept and recommend the expression
+  template <class Expression>
+  bool ModelAPIAcceptsAndRecommendsEXPR(const Expression* pcon) const {
+    return ExpressionAcceptanceLevel::Recommended ==
+           GetConstraintAcceptanceEXPR_DEFAULT(pcon);
+  }
+
+  /// Query if a constraint type
+  /// is natively accepted by the solver (and user setting).
+  /// The parameter is only needed for type.
+  template <class Con>
+  ConstraintAcceptanceLevel GetConstraintAcceptance_USER(Con* ) const {
+    return GET_CONST_CONSTRAINT_KEEPER(Con).GetChosenAcceptanceLevel();
+  }
+
+  /// Query if an expression type
+  /// is natively accepted by the solver (and user setting).
+  /// The parameter is only needed for type.
+  template <class Con>
+  ExpressionAcceptanceLevel GetConstraintAcceptanceEXPR_USER(
+      const ExprWrapper< Con >* ) const {
+    return GET_CONST_CONSTRAINT_KEEPER(Con).GetChosenAcceptanceLevelEXPR();
+  }
+
+  /// Query if a constraint type
+  /// is natively accepted by the solver.
+  /// The parameter is only needed for type.
+  template <class Con>
+  ConstraintAcceptanceLevel GetConstraintAcceptance_DEFAULT(Con* ) const {
+    return GET_CONST_CONSTRAINT_KEEPER(Con).GetModelAPIAcceptance();
+  }
+
+  /// Query if an expression type
+  /// is natively accepted by the solver.
+  /// The parameter is only needed for type.
+  template <class Con>
+  ExpressionAcceptanceLevel GetConstraintAcceptanceEXPR_DEFAULT(
+      const ExprWrapper< Con >* ) const {
+    return GET_CONST_CONSTRAINT_KEEPER(Con).GetModelAPIAcceptanceEXPR();
+  }
+
 
   /// Generic adapter for old non-bridged Convert() methods
   ///
   /// New way is to use the \a i parameter for bridging
   template <class Constraint>
-  void Convert(const Constraint& con, int ) {
-    MPD( Convert(con) );
+  Context Convert(const Constraint& con, int ) {
+    return MPD( Convert(con) );
   }
 
-  /// By default, we complain about someone trying to convert an unknown constraint
+  /// By default, we complain about someone trying to
+  /// convert an unknown constraint
   template <class Constraint>
-  void Convert(const Constraint& ) {
+  Context Convert(const Constraint& ) {
     MP_RAISE(
           std::string("Constraint type '") +
             Constraint::GetTypeName() +
             "' is neither accepted by '" +
             ModelAPI::GetTypeName() +
             "', nor is conversion implemented");
+    return Context::CTX_NONE;
   }
 
   //////////////////////////// SOME SPECIFIC CONSTRAINT CONVERTERS
   /// ///////////////////////////////////// ///////////////////////////
 
   /// If backend does not like LFC, we redefine it here
-  void Convert(const LinearFunctionalConstraint& ldc) {
+  Context Convert(const LinearFunctionalConstraint& ldc) {
     MPD( AddConstraint(ldc.to_linear_constraint()) );
+    return Context::CTX_MIX;
+  }
+  /// Say we can (for acc:_all=0)
+  bool IfHasCvt_impl(const LinearFunctionalConstraint* ) {
+    return true;
   }
 
   /// If backend does not like QFC, we redefine it
-  void Convert(const QuadraticFunctionalConstraint& qdc) {
-    qdc.AddQuadraticConstraint(*(Impl*)this);
+  Context Convert(const QuadraticFunctionalConstraint& qdc) {
+    return qdc.AddQuadraticConstraint(*(Impl*)this);
+  }
+  /// Say we can
+  bool IfHasCvt_impl(const QuadraticFunctionalConstraint* ) {
+    return true;
   }
 
 
@@ -399,28 +786,44 @@ public:
   /// If any conversions are performed, need to have intermediate nodes,
   /// as for constraints
   pre::NodeRange AddObjective(QuadraticObjective&& qo) {
+    CountArgRefs(qo);     // no "used" flag for objectives
     GetModel().AddObjective( std::move(qo) );
     /// Temporarily removing AutoLinking for objectives
     // return AutoLink( GetObjValueNode().Add() );
     return GetObjValueNode().Select(-1);
   }
 
-  /// ADD CUSTOM CONSTRAINT, does not propagate result
+  /// ADD STATIC CONSTRAINT.
+  ///
+  /// Does not propagate result
   /// (use AddConstraint_AS_ROOT() otherwise).
+  ///
+  /// Counts argument references.
+  ///
+  /// This method is enough
+  /// (instead of the _AS_ROOT() version)
+  /// if the arguments already have contexts.
   ///
   /// Use only for non-mapped constraints. For functional constraints
   /// stored __WITH_MAP, use AssignResult(Var)2Args().
   /// Non-functional constraints cannot be unified currently.
   /// Takes ownership.
+  ///
   /// @return Node reference for the stored constraint
   template <class Constraint>
   pre::NodeRange AddConstraint(Constraint con) {
+    assert(!con.HasResultVar());
+    if (MPD( PreprocessStaticConstraint(con) ))
+      return {};  // we should not need the presolver nodes
     auto node_range =
         AddConstraintAndTryNoteResultVariable( std::move(con) );
+    auto& ck = GET_CONSTRAINT_KEEPER( Constraint );
+    ConInfo ci{&ck, int(node_range)};
+    MarkAsUsed(ci);      // this also counts arg refs #266
     return AutoLink( node_range );
   }
 
-  /// ADD CUSTOM CONSTRAINT and propagate root-ness
+  /// ADD STATIC CONSTRAINT and propagate root-ness
   /// (use AddConstraint() otherwise).
   ///
   /// Use only for non-mapped constraints. For functional constraints
@@ -429,11 +832,31 @@ public:
   /// @return Node reference for the stored constraint
   template <class Constraint>
   pre::NodeRange AddConstraint_AS_ROOT(Constraint con) {
-    MPD( PropagateResult(con) );
-    return AddConstraint( std::move(con) );
+    auto nr = AddConstraint( std::move(con) );
+    MPD( PropagateResult(             // after AddConstraint() #201 #266
+           GetConstraint<Constraint>(int(nr))) );
+    return nr;
   }
 
-	/// Retrieve constraint of specified type at location \a ci.
+  /// ADD FUNCTIONAL CONSTRAINT.
+  ///
+  /// Do not use directly. For functional constraints
+  /// stored __WITH_MAP, use AssignResult(Var)2Args().
+  /// Takes ownership.
+  ///
+  /// @note Does not propagate result
+  ///   (use PropagateResult()).
+  ///
+  /// @return Node reference for the stored constraint
+  template <class Constraint>
+  pre::NodeRange AddFunctionalConstraint(Constraint con) {
+    assert(con.HasResultVar());
+    auto node_range =
+        AddConstraintAndTryNoteResultVariable( std::move(con) );
+    return AutoLink( node_range );
+  }
+
+  /// Retrieve constraint of specified type at location \a ci.
   template <class Constraint>
 	const Constraint& GetConstraint(const ConInfo& ci) const {
 		assert(MPCD(template IsConInfoType<Constraint>(ci) ));
@@ -444,7 +867,8 @@ public:
 	/// Retrieve constraint of specified type at index \a i.
 	template <class Constraint>
 	const Constraint& GetConstraint(int i) const {
-		return GET_CONST_CONSTRAINT_KEEPER(Constraint).GetConstraint(i);
+    return
+        GET_CONST_CONSTRAINT_KEEPER(Constraint).GetConstraint(i);
 	}
 
   /// Mark constraint as reformulated
@@ -452,9 +876,37 @@ public:
 		ci.GetCK()->MarkAsBridged(ci.GetIndex());
 	}
 
+  /// Mark constraint as unused.
+  /// Do not decrease argument usage.
+  void MarkAsBridged_ThisOnly(const ConInfo& ci) {
+    ci.GetCK()->MarkAsBridged_ThisOnly(ci.GetIndex());
+  }
+
   /// Mark constraint as unused
   void MarkAsUnused(const ConInfo& ci) {
     ci.GetCK()->MarkAsUnused(ci.GetIndex());
+  }
+
+  /// Mark constraint as used
+  void MarkAsUsed(const ConInfo& ci) {
+    ci.GetCK()->MarkAsUsed(ci.GetIndex());
+  }
+
+  /// Is bridging of constraint \a i
+  /// to be considered yet?
+  bool IsBridgingToBeConsidered(const ConInfo& ci) const {
+    return ci.GetCK()->IsBridgingToBeConsidered(ci.GetIndex());
+  }
+
+
+  /// Is constraint reformulated?
+  bool IsBridged(const ConInfo& ci) const {
+    return ci.GetCK()->IsBridged(ci.GetIndex());
+  }
+
+  /// Is constraint unused?
+  bool IsUnused(const ConInfo& ci) const {
+    return ci.GetCK()->IsUnused(ci.GetIndex());
   }
 
 
@@ -469,13 +921,22 @@ protected:
     ConInfo ci{&ck, i};
     if (resvar>=0)
       AddInitExpression(resvar, ci);
+    MarkTypeRequiredVars(ck.GetConstraint(i));
+    MarkNLVars(ck.GetConstraint(i));
+    MPD( NoteConstraintAdded(ck.GetConstraint(i), i) );
     /// Can also cache non-functional constraints,
     /// but then implement checking before
     if (! MP_DISPATCH( MapInsert(
                          MPD(template GetConstraint<Constraint>(i)), i ) ))
       MP_RAISE("Trying to MapInsert() duplicated constraint: " +
                              ck.GetDescription());
-    return ck.SelectValueNodeRange(i);
+    pre::NameChunk old_nc {};
+    if (name_chunk_)
+      old_nc = ck.GetValueNode().SetNameChunk(name_chunk_);
+    auto result = ck.SelectValueNodeRange(i);
+    if (name_chunk_)
+      ck.GetValueNode().SetNameChunk(old_nc);
+    return result;
   }
 
 
@@ -497,15 +958,17 @@ public:
     MPD( ConvertModel() );
     if (relax())
       GetModel().RelaxIntegrality();
-		FixUnusedDefinedVars();       // Until we have proper var deletion
+    EliminateUnusedDefinedVars();       // Until we have proper var deletion
     CheckLinearCons();
     PresolveNames();
+    GetModel().PrepareVariables();      // Should this be Converter's task?
+    MPD( OutputModelInfo("AMPL MP final model", 1, "flat1_"); );
     GetModel().PushModelTo(GetModelAPI());
     MPD( CloseGraphExporter() );
     if (value_presolver_.GetExport())
       assert( value_presolver_.AllEntriesExported() );
-//    if (GetEnv().verbose_mode())
-      GetEnv().PrintWarnings();
+//  Printing always.  if (GetEnv().verbose_mode())
+    GetEnv().PrintWarnings();
   }
 
   /// Check linear constraints.
@@ -535,11 +998,20 @@ public:
     } );
   }
 
+  /// Reset local item counters, for redefinitions
+  void ResetLocalCounters() {
+    ConstraintManager::ResetLocalCounters();
+    GetVarValueNode().ResetLocalCounter();
+  }
+
   /// Presolve item names
   void PresolveNames() {
     if (var_names_.size()) {
       /// Check that constr / obj names are present too?
       GetValuePresolver().CleanUpNameNodes();
+      // They are at top level of the reformulation tree
+      TransferNames2Node((SOS1Constraint*)nullptr);
+      TransferNames2Node((SOS2Constraint*)nullptr);
       auto vm = GetValuePresolver().
           PresolveNames({
                           {var_names_},
@@ -556,6 +1028,12 @@ public:
         obj[i].set_name(ocs[i]);
       ConstraintManager::CopyNamesFromValueNodes();  // cons
     }
+  }
+
+  template <class Con>
+  void TransferNames2Node(Con* pcon) {
+    auto& ck = GetConstraintKeeper(pcon);
+    ck.CopyNames2ValueNodes();
   }
 
   /// Fill model traits for license check.
@@ -582,7 +1060,9 @@ public:
         + fmi->GetNumberOfConstraints(typeid(LinConLE))
         + mt.n_quad_con
         + fmi->GetNumberOfConstraints(typeid(ComplementarityLinear))
-        + fmi->GetNumberOfConstraints(typeid(ComplementarityQuadratic));
+                   + fmi->GetNumberOfConstraints(typeid(ComplementarityQuadratic))
+                   + fmi->GetNumberOfConstraints(typeid(NLComplementarity))
+        ;
     mt.n_log_con =
         fmi->GetNumberOfConstraints(typeid(AndConstraint))
         + fmi->GetNumberOfConstraints(typeid(OrConstraint))
@@ -631,11 +1111,14 @@ public:
   //////////////////////////// CREATE OR FIND A FIXED VARIABLE //////////////////////////////
   pre::NodeRange MakeFixedVar(double value) {
     auto it = map_fixed_vars_.find(value);
-    if (map_fixed_vars_.end()!=it)
-      return AutoLink( GetVarValueNode().Select( it->second ) );
-    auto v = MPD( DoAddVar(value, value) );
-    map_fixed_vars_[value] = (int)v;
-    return GetVarValueNode().Select( (int)v );  // no autolink, done in DoAddVar()
+    if (map_fixed_vars_.end()==it) {
+      auto v = GetModel().AddVar__basic(value, value);
+      it = map_fixed_vars_.insert({value, v}).first;
+    }
+    // A constant is shared and belongs to no item: no autolink.
+    // Otherwise, e.g., its IIS status would be reported
+    // for all original constraints using it.
+    return GetVarValueNode().Select( it->second );
   }
 
   /// Create or find a fixed variable
@@ -646,6 +1129,7 @@ public:
   }
 
   /// Add several variables once.
+  /// @note this is only to be called once for the original vars.
   /// @return value node range for them
   pre::NodeRange AddVars(const typename BaseFlatModel::VarBndVec& lbs,
                const typename BaseFlatModel::VarBndVec& ubs,
@@ -673,6 +1157,10 @@ public:
   pre::ValueNode& GetValueNode(Constraint*)
   { return GET_CONSTRAINT_KEEPER(Constraint).GetValueNode(); }
 
+  /// Reuse ValuePresolver's source nodes for all objectives
+  pre::ValueNode& GetObjValueSourceNode()
+  { return GetValuePresolver().GetSourceNodes().GetObjValues().MakeSingleKey(); }
+
   /// Reuse ValuePresolver's target nodes for all objectives
   pre::ValueNode& GetObjValueNode()
   { return GetValuePresolver().GetTargetNodes().GetObjValues().MakeSingleKey(); }
@@ -688,7 +1176,48 @@ public:
   double lb(int var) const { return this->GetModel().lb(var); }
   /// Shortcut ub(var)
   double ub(int var) const { return this->GetModel().ub(var); }
-  /// lb_array()
+  /// Shortcut lb_hard(var)
+  double lb_hard(int var) const { return this->GetModel().lb_hard(var); }
+  /// Shortcut ub_hard(var)
+  double ub_hard(int var) const { return this->GetModel().ub_hard(var); }
+
+  /// Lower bound of \a var as the solver will see it:
+  /// best-known if submitted (cvt:pre:boundsbest, or fixed), else hard
+  double lb_subm(int var) const {
+    return (GetModel().if_submit_best_bounds_var(var) || is_fixed(var))
+        ? lb(var) : lb_hard(var);
+  }
+  /// Upper bound of \a var as the solver will see it
+  double ub_subm(int var) const {
+    return (GetModel().if_submit_best_bounds_var(var) || is_fixed(var))
+        ? ub(var) : ub_hard(var);
+  }
+  /// Lower bound of a linear body from the submitted variable bounds
+  double lb_subm_body(const LinTerms& lt) const {
+    double result = 0.0;
+    for (size_t i=0; i<lt.size(); ++i) {
+      const auto c = lt.coef(i);
+      const auto bnd = c>=0.0 ? lb_subm(lt.var(i)) : ub_subm(lt.var(i));
+      if (std::fabs(bnd) >= PracticallyInf())
+        return MinusInfty();
+      result += c * bnd;
+    }
+    return result;
+  }
+  /// Upper bound of a linear body from the submitted variable bounds
+  double ub_subm_body(const LinTerms& lt) const {
+    double result = 0.0;
+    for (size_t i=0; i<lt.size(); ++i) {
+      const auto c = lt.coef(i);
+      const auto bnd = c>=0.0 ? ub_subm(lt.var(i)) : lb_subm(lt.var(i));
+      if (std::fabs(bnd) >= PracticallyInf())
+        return Infty();
+      result += c * bnd;
+    }
+    return result;
+  }
+  /// lb_array().
+  /// @todo best-known bounds currently. ?
   template <class VarArray>
   double lb_array(const VarArray& va) const
   { return this->GetModel().lb_array(va); }
@@ -696,39 +1225,156 @@ public:
   template <class VarArray>
   double ub_array(const VarArray& va) const
   { return this->GetModel().ub_array(va); }
+  /// Does the variable have stronger solver-submitted bounds
+  /// than its init expression?
+  /// We might extend this to automatically recompute bounds from bottom up.
+  /// @note this was done when creating the functional constraint,
+  ///   but we might obtain stronger new bounds,
+  ///   such as in redefinition of complementarity.
+  /// @note Considers option *cvt:pre:boundsbest*.
+  /// @note Should not be used directly,
+  ///   use CanBeEliminated().
+  bool IfSubmittedVarBoundsStrongerThanInitExpr(int res_var) const {
+    if (MPCD( HasActiveOrInactiveInitExpression(res_var) )) {
+      if (lb(res_var)>MPCD( MinusInfty() )
+          || ub(res_var)<MPCD( Infty() )) {
+        const auto& cloc = MPCD( GetInitExpression(res_var) );
+        PreprocessInfoStd preinfo;
+        {
+          PreproBoundsOnlyScope bounds_only{prepro_bounds_only_};
+          cloc.GetCK()->PreprocessConstraint(cloc.GetIndex(), preinfo);
+        }
+        if (lb_hard(res_var) > preinfo.lb()     // If some hard bound better:
+            || ub_hard(res_var) < preinfo.ub())
+          return true;
+        return (lb(res_var) > preinfo.lb() // If some best-known bound better:
+                || ub(res_var) < preinfo.ub()) ?
+                   (GetModel().if_submit_best_bounds_var(res_var)
+                    || is_fixed(res_var)) :
+                   is_fixed(res_var);         // Only if fixed by default
+      }
+    }
+    return false;
+  }
   /// Set lb(var)
   void set_var_lb(int var, double lb) { this->GetModel().set_lb(var, lb); }
   /// Set ub(var)
   void set_var_ub(int var, double ub) { this->GetModel().set_ub(var, ub); }
   /// Set lb(var), propagate context if functional result
   void set_var_lb_context(int var, double lb, Context ctx) {
-    set_var_lb(var, lb);
-    PropagateResultOfInitExpr(var, ctx);
+    set_var_lb(var, lb);   // Because PropResult() only hint bounds
+    PropagateResultOfInitExpr(var, lb, ub(var), ctx);
   }
   /// Set ub(var), propagate context
   void set_var_ub_context(int var, double ub, Context ctx) {
-    set_var_ub(var, ub);
-    PropagateResultOfInitExpr(var, ctx);
+    set_var_ub(var, ub);   // Because PropResult() only hint bounds
+    PropagateResultOfInitExpr(var, lb(var), ub, ctx);
   }
   /// Set bounds(var), propagate context
   void set_var_bounds_context(int var, double lb, double ub, Context ctx) {
-    set_var_lb(var, lb);
-    set_var_ub(var, ub);
-    PropagateResultOfInitExpr(var, ctx);
+    NarrowVarBounds(var, lb, ub);       // Because PropResult() only hint bounds
+    PropagateResultOfInitExpr(var, lb, ub, ctx);
+  }
+
+  /// Mark \a var as an auxiliary variable whose integrality
+  /// is implied by its defining constraint (cvt:pre:auxint)
+  void MarkVarImpliedInt(int var) { GetModel().MarkVarImpliedInt(var); }
+
+  /// Mark \a var as needing its type in the solver
+  void MarkVarTypeRequired(int var) { GetModel().MarkVarTypeRequired(var); }
+
+  /// Make \a var a hard binary: bounds [0, 1] and type-required.
+  /// For variables used as indicator binaries.
+  void RequireVarBinary(int var) {
+    NarrowVarBounds(var, 0.0, 1.0);
+    MarkVarTypeRequired(var);
+  }
+
+  /// Mark the variables which the solver needs declared with their
+  /// type, should \a con reach it. By default none (algebraic
+  /// constraints, objectives, SOS, complementarity).
+  template <class Con>
+  void MarkTypeRequiredVars(const Con& ) { }
+  /// Indicator: the binary
+  template <class Con>
+  void MarkTypeRequiredVars(const IndicatorConstraint<Con>& ic)
+  { RequireVarBinary(ic.get_binary_var()); }
+  /// Logical constraints and count/numberof: the arguments
+  void MarkTypeRequiredVars(const AndConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const OrConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const NotConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const AllDiffConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const ImplicationConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const EquivalenceConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const CountConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const NumberofConstConstraint& c) { MarkArgsTypeRequired(c); }
+  void MarkTypeRequiredVars(const NumberofVarConstraint& c) { MarkArgsTypeRequired(c); }
+  /// Mark all arguments of \a con
+  template <class Con>
+  void MarkArgsTypeRequired(const Con& con) {
+    for (auto v: con.GetArguments())
+      MarkVarTypeRequired(v);
+  }
+
+  /// Mark the result variable of a smooth nonlinear expression
+  /// (cvt:pre:boundsbest 2/3). Default: nothing
+  template <class Con>
+  void MarkNLVars(const Con& con) {
+    if constexpr (IsSmoothNLFuncCon<Con>())
+      GetModel().MarkVarNL(con.GetResultVar());
+  }
+  /// Products: the result
+  void MarkNLVars(const QuadraticFunctionalConstraint& con)
+  { GetModel().MarkVarNL(con.GetResultVar()); }
+
+  /// Narrow "best-known" variable domain range
+  /// @todo we could automatically decrement var usage
+  ///   in appropriate context when the variable is fixed
+  ///   at one of the original/upwards-implied bounds.
+  /// Then remove manual DecrementVarUsage()'s
+  void NarrowVarBestBounds(int var, double lb, double ub) {
+    auto& m = GetModel();
+    m.set_best_lb(var, lb);
+    m.set_best_ub(var, ub);
+    if (m.lb(var)>m.ub(var))
+      CheckVarConDomain(m.lb(var), m.ub(var), "_svar", var, true);
   }
 
   /// Narrow variable domain range
+  /// @todo we could automatically decrement var usage
+  ///   in appropriate context when the variable is fixed
+  ///   at one of the original/upwards-implied bounds.
+  /// Then remove manual DecrementVarUsage()'s
   void NarrowVarBounds(int var, double lb, double ub) {
     auto& m = GetModel();
-    m.set_lb(var, std::max(m.lb(var), lb));
-    m.set_ub(var, std::min(m.ub(var), ub));
+    m.set_lb(var, lb);
+    m.set_ub(var, ub);
     if (m.lb(var)>m.ub(var))
-      MP_INFEAS("empty variable domain");
+      CheckVarConDomain(m.lb(var), m.ub(var), "_svar", var);
+  }
+
+  /// Check var/con domain
+  bool CheckVarConDomain(
+      double lb, double ub, const char* kind, int i, bool bestb=false) {
+    if (lb>ub
+        && lb-ub > MPCD( model_feas_tol() )
+        && lb-ub
+               > std::max(std::abs(lb), std::abs(ub))
+                     * MPCD( model_feas_tol_rel() )) {
+      GetEnv().AddWarning(
+          std::string(kind) + (bestb ? " best-known" : "") + " bounds",
+          fmt::format("Bounds [{:.17}, {:.17}]\nof {}[{}] "
+                      "contradict pre:eps and pre:epsrel.\n"
+                      "Model can be infeasible",
+                      lb, ub, kind, i+1).c_str());
+      return true;
+    }
+    return true;
   }
 
   /// var_type()
   var::Type var_type(int var) const { return this->GetModel().var_type(var); }
-  /// is_fixed()
+  /// is_fixed(), uses best-known bounds
   bool is_fixed(int var) const { return this->GetModel().is_fixed(var); }
   /// fixed_value()
   double fixed_value(int var) const
@@ -736,11 +1382,18 @@ public:
 
   /// MakeComplementVar()
   int MakeComplementVar(int bvar) {
-    if (! (lb(bvar)==0.0 && ub(bvar)==1.0) )
-      MP_RAISE("Asked to complement variable with bounds "
-                             + std::to_string(lb(bvar)) + ".." + std::to_string(ub(bvar)));
-    AffineExpr ae({{-1.0}, {bvar}}, 1.0);
-    return MP_DISPATCH( Convert2Var(std::move(ae)) );
+    if ( !(lb(bvar)==0.0 && ub(bvar)==1.0) ) {
+      // Should be (hard-?)fixed at 0 or 1
+      MP_ASSERT_ALWAYS( ((!lb(bvar) && !ub(bvar))
+                        || (1.0==lb(bvar) && 1.0==ub(bvar))),
+                "Asked to complement variable with best-known bounds "
+                    + std::to_string(lb(bvar))
+                    + ".." + std::to_string(ub(bvar)));
+    }
+    /// Algebraic way: AffineExpr ae({{-1.0}, {bvar}}, 1.0);
+    /// return MP_DISPATCH( Convert2Var(std::move(ae)) );
+    return
+        AssignResultVar2Args( NotConstraint{{bvar}} );
   }
 
   /// Add vector of variables. Type: var::CONTINUOUS by default
@@ -760,6 +1413,14 @@ public:
 
 private:
   std::vector<ConInfo> var_info_;
+
+  /// If non-0, use this chunk when adding cons
+  const char* name_chunk_ {nullptr};
+
+
+public:
+  /// Pass 0 to use default for constraints
+  void SetNameChunk(const char* nc) { name_chunk_ = nc; }
 
 
 protected:
@@ -784,22 +1445,95 @@ protected:
 
 
 public:
-  /// Variable has an init expr?
+  /// Variable has an active init expr?
   bool HasInitExpression(int var) const {
-    return int(var_info_.size())>var && var_info_[var].HasId();
+    if (HasActiveOrInactiveInitExpression(var)) {
+      const auto& ci0 = MPCD( GetInitExpression(var) );
+      return IsConActive(ci0);
+    }
+    return false;
   }
 
-  /// Get the init expr
+  /// Variable has an unbridged init expr?
+  /// (even if currently unused)
+  bool HasUnbridgedInitExpression(int var) const {
+    if (HasActiveOrInactiveInitExpression(var)) {
+      const auto& ci0 = MPCD( GetInitExpression(var) );
+      return !IsBridged(ci0);
+    }
+    return false;
+  }
+
+  /// Has active or inactive init expr?
+  /// @param var: variable index, or -1 for none
+  ///   (e.g., Constraints2Expr::ConvertToNLCon() without expression)
+  bool HasActiveOrInactiveInitExpression(int var) const {
+    return var >= 0 && int(var_info_.size())>var
+        && var_info_[var].HasId();
+  }
+
+  /// Get the init expr (active or inactive)
   const ConInfo& GetInitExpression(int var) const {
+    assert(HasActiveOrInactiveInitExpression(var));
 		return var_info_.at(var);
   }
 
-	/// Get the init expression pointer.
+  /// The variable has an init expr,
+  /// and the init expr is a logical constraint?
+  bool IsInitExprLogical(int var) const {
+    if (!MPCD(HasActiveOrInactiveInitExpression(var)))
+      return false;
+    const auto& ie = GetInitExpression(var);
+    return ie.GetCK()->IsLogical();
+  }
+
+  /// Do the LinTerms have an arg with init expr?
+  bool HasInitExpression(const LinTerms& lt) {
+    for (auto v: lt.vars())
+      if (HasInitExpression(v))
+        return true;
+    return false;
+  }
+
+  /// Do the QuadTerms have an arg with init expr?
+  bool HasInitExpression(const QuadTerms& qt) {
+    for (auto e: qt.get_folded())
+      if (HasInitExpression(e.first.first)
+          || HasInitExpression(e.first.second))
+        return true;
+    return false;
+  }
+
+  /// Get func con context.
+  /// Does not check if that's a func con,
+  /// user check for != CTX_NONE
+  Context GetInitExprContext(int var) const {
+    const auto& ie = GetInitExpression(var);
+    return ie.GetCK()->GetContext(ie.GetIndex());
+  }
+
+  /// Set func expr context.
+  /// @warning 1 level only, no propagation.
+  ///   Use PropagateResultOfInitExpr() otherwise.
+  void SetInitExprContext_NoProp(int var, Context ctx) {
+    const auto& ie = GetInitExpression(var);
+    ie.GetCK()->SetContext(ie.GetIndex(), ctx);
+  }
+
+  /// Add func expr context.
+  /// @warning 1 level only, no propagation.
+  ///   Use PropagateResultOfInitExpr() otherwise.
+  void AddInitExprContext_NoProp(int var, Context ctx) {
+    const auto& ie = GetInitExpression(var);
+    ie.GetCK()->AddContext(ie.GetIndex(), ctx);
+  }
+
+  /// Get the init expression pointer.
 	/// @return nullptr if no init expr or not this type
 	template <class ConType>
-	const ConType* GetInitExpressionOfType(int var) {
-		if (MPCD( HasInitExpression(var) )) {
-			auto ci0 = MPCD( GetInitExpression(var) );
+  const ConType* GetInitExpressionOfType(int var) const {
+    if (MPCD( HasActiveOrInactiveInitExpression(var) )) {
+      const auto& ci0 = MPCD( GetInitExpression(var) );
 			if (IsConInfoType<ConType>(ci0)) {
 				const auto& con =
 						GetConstraint<ConType>(ci0);
@@ -810,7 +1544,25 @@ public:
 		return nullptr;
 	}
 
-	/// Check if the constraint location points to the
+  /// Get the init expression pointer.
+  /// @return nullptr if no init expr,
+  ///   or not this type, or redefined/eliminated.
+  template <class ConType>
+  const ConType* GetActiveInitExpressionOfType(int var) const {
+    if (MPCD( HasInitExpression(var) )) {
+      const auto& ci0 = MPCD( GetInitExpression(var) );
+      if (IsConInfoType<ConType>(ci0)
+              && IsConActive(ci0)) {
+        const auto& con =
+            GetConstraint<ConType>(ci0);
+        assert(&con);
+        return &con;
+      }
+    }
+    return nullptr;
+  }
+
+  /// Check if the constraint location points to the
 	/// constraint keeper used for this ConType.
 	template <class ConType>
 	bool IsConInfoType(const ConInfo& ci) const {
@@ -819,7 +1571,39 @@ public:
 				== ci.GetCK();
 	}
 
+  /// Check if \a ci points to an active constraint
+  bool IsConActive(const ConInfo& ci) const {
+    return !ci.GetCK()->IsRedundant(ci.GetIndex());
+  }
+
+
   /////////////////////// AUTO LINKING ////////////////////////////
+
+  /// Make AutoLinker.
+  /// @param con: source constraint
+  /// @param i: \a con's index
+  /// @return An AutoLinkScope object for \a con
+  ///   which is about to be converted.
+  template <class Con>
+  pre::AutoLinkScope<Impl> MakeAutoLinker(const Con& , int i) {
+    return {
+        *(Impl*)this,
+        MPD( template SelectValueNode<Con>(i) )
+    };
+  }
+
+  /// Make an empty autolinker.
+  /// We'd link manually but at least we care.
+  pre::AutoLinkScope<Impl> MakeEmptyLinker(
+      pre::NodeRange src) {
+    pre::AutoLinkScope<Impl> result
+        {
+                  *(Impl*)this,   // 1-index source allowed only
+                  {src.GetValueNode(), src.GetIndexRange().beg_}
+        };
+    TurnOffAutoLinking(false);
+    return result;
+  }
 
   /// Auto link node range \a nr.
   /// The nodes of \a nr will be autolinked with \a auto_link_src_item_.
@@ -832,6 +1616,12 @@ public:
       if (auto_link_targ_items_.empty() ||
           !auto_link_targ_items_.back().TryExtendBy(nr))
         auto_link_targ_items_.push_back(nr);
+    } else {
+      // If not proper autolinking,
+      // check that we have called MakeEmptyLinker
+      // (hoping we care to link manually)
+      // or called TurnAutoLinkingOff(false)
+      assert(is_autolinking_requested_);
     }
     return nr;
   }
@@ -840,10 +1630,20 @@ public:
   bool DoingAutoLinking() const
   { return auto_link_src_item_.IsValid(); }
 
-  /// Turn off auto-linking for current conversion
-  void TurnOffAutoLinking() {
+  /// Turn off auto-linking for current conversion.
+  /// @param f_full: if it's full stop,
+  ///   otherwise we continue conversions but
+  ///   add manual links.
+  ///   This mechanism is necessary to check
+  ///   that we always care about linking.
+  ///
+  ///   So when switching to manual linking,
+  ///   call with \a f_full=false,
+  ///   e.g., from MakeEmptyLinker().
+  void TurnOffAutoLinking(bool f_full=true) {
     auto_link_src_item_.Invalidate();
     auto_link_targ_items_.clear();
+    is_autolinking_requested_ = !f_full;
   }
 
   /// Get autolink source node range
@@ -876,15 +1676,42 @@ public:
     return 0 < ModelAPI::AcceptsQuadObj();
   }
 
+  /// Whether the ModelAPI accepts nonlinear objectives
+  static bool ModelAPIAcceptsNLObj() {
+    return 0 < ModelAPI::AcceptsNLObj();
+  }
+
   /// Whether the ModelAPI accepts quadratic constraints
-  static bool ModelAPIAcceptsQC() {
+  bool ModelAPIAcceptsQC() const {
     return ModelAPIAcceptsAndRecommends(
-          (const QuadConLE*)nullptr);   // if accepts QuadConLE
+          (const QuadConLE*)nullptr)     // if accepts QuadConLE
+        && ModelAPIAcceptsAndRecommends(
+          (const QuadConEQ*)nullptr)
+        && ModelAPIAcceptsAndRecommends(
+          (const QuadConGE*)nullptr);
   }
 
   /// Whether the ModelAPI accepts nonconvex QC
   static bool ModelAPIAcceptsNonconvexQC() {
     return ModelAPI::AcceptsNonconvexQC();
+  }
+
+  /// Whether the ModelAPI recommends
+  /// logicalizing products of 2 binaries
+  static bool ModelAPIWantsLogicalProd2Bins() {
+    return ModelAPI::WantLogicalizedProd2Bin();
+  }
+
+  /// Whether the ModelAPI recommends
+  /// recognizing signpow()
+  static bool ModelAPIWantsSignpow() {
+    return ModelAPI::WantSignPow();
+  }
+
+  /// Whether the ModelAPI recommends
+  /// recognizing logistic()
+  static bool ModelAPIWantsLogistic() {
+    return ModelAPI::WantLogistic();
   }
 
   /// Ask if the solver can recognize SOCP corner cases
@@ -904,9 +1731,11 @@ public:
   /// Whether the ModelAPI accepts quadratic cones
   int ModelAPIAcceptsQuadraticCones() const {
 		return
-				std::max(
-					(int)GetConstraintAcceptance((QuadraticConeConstraint*)nullptr),
-					(int)GetConstraintAcceptance((RotatedQuadraticConeConstraint*)nullptr));
+        0 != std::max(
+          (int)GetConstraintAcceptance_DEFAULT(
+            (QuadraticConeConstraint*)nullptr),
+          (int)GetConstraintAcceptance_DEFAULT(
+            (RotatedQuadraticConeConstraint*)nullptr));
 	}
 
   /// Number of QC -> SOCP conversions
@@ -922,7 +1751,8 @@ public:
 	/// Whether the ModelAPI accepts exp cones
 	int ModelAPIAcceptsExponentialCones() {
 		return
-				(int)GetConstraintAcceptance((ExponentialConeConstraint*)nullptr);
+        (int)ModelAPIAcceptsAndRecommends(
+          (ExponentialConeConstraint*)nullptr);
 	}
 
 
@@ -932,15 +1762,41 @@ private:
     int preprocessAnything_ = 1;
     int preprocessEqualityResultBounds_ = 1;
     int preprocessEqualityBvar_ = 1;
-    int preproNestedAndOrs_ = 1;
+    int preprocessInequalityRhs_ = 1;
+    int preprocessInequalityResultBounds_ = 1;
+    int preprocessIneq2BndEq_ = 1;
+    int preprocessIneq2Related_ = 1;
+    int preprocessVarBnd_ = 3;
+
+    int preproUnnest_ = 31;
+    int preproSortUnify_  = 1;
+    int boundLogArg_ = 0;
+
+    int propCtxIneq_ = 1;
+    int propCtxBndEq_ = 1;
+    int propCtxCountNumberof_ = 7;
 
     int passQuadObj_ = ModelAPIAcceptsQuadObj();
-		int passQuadCon_ = ModelAPIAcceptsQC();
+    int passQuadCon_ = 1;
+    int passNLObj_ = ModelAPIAcceptsNLObj();
+    int useQP2Pass_ = 1;
+    double QPMultOutCard_ = ModelAPI::MultOutCardDefault();
     int passSOCPCones_ = 0;
     int passSOCP2QC_ = 0;
     int passExpCones_ = 0;
 
+    int accAll_ = -1;
+    int accExpr_ = static_cast<
+                       std::underlying_type_t<ExpressionAcceptanceLevel> >
+                   (ModelAPI::ExpressionInterfaceAcceptanceLevel())
+                   -1;               // If available, 0 or 1
+
     int relax_ = 0;
+
+    double modelfeastol_ = 1e-6;
+    double modelfeastolrel_ = 1e-6;
+
+    int mo_options_ {1};
 
     int solcheckmode_ = 1+2+512;
     bool solcheckinfeas_ = false;
@@ -951,6 +1807,9 @@ private:
     int sol_round_ = 100;
     int sol_prec_ = 100;
     int solchkoutlev_ = 0;
+
+    int nlassign_lev_ = ModelAPI::NLAssignLevelDefault();
+    int nlreif_lev_ = ModelAPI::NLReifLevelDefault();
   };
   Options options_;
 
@@ -960,8 +1819,30 @@ public:             // public for CRTP
   const std::string& graph_export_file() const
   { return options_.file_graph_export_; }
 
+  /// Whether to parse QP expressions in 2 passes
+  int IfParseQPIn2Passes() const { return options_.useQP2Pass_; }
+
+  /// Up to which QP matrix cardinality should we multiply out
+  double QPMultOutCard() const { return options_.QPMultOutCard_; }
+
   /// Whether we should relax integrality
   int relax() const { return options_.relax_; }
+
+  /// Propagate context into conditional inequalities?
+  int IfPropCtxCondIneq() const { return options_.propCtxIneq_; }
+  /// Propagate context into conditional equalities-to-bound?
+  int IfPropCtxCondEqBnd() const { return options_.propCtxBndEq_; }
+  /// Propagate context into count/numberof?
+  int IfPropCtxCountNumberof() const { return options_.propCtxCountNumberof_; }
+  /// Bound argument of logarithm?
+  bool IfBoundLogArg() const { return options_.boundLogArg_; }
+
+  /// Model checking options
+  double model_feas_tol() const { return options_.modelfeastol_; }
+  double model_feas_tol_rel() const { return options_.modelfeastolrel_; }
+
+  /// Use multiobjective options?
+  int multiobj_options() const { return options_.mo_options_; }
 
   /// Solution checking options
   int sol_check_mode() const { return options_.solcheckmode_; }
@@ -974,11 +1855,18 @@ public:             // public for CRTP
   int sol_prec() const { return options_.sol_prec_; }
   int sol_check_outlev() const { return options_.solchkoutlev_; }
 
+  /// Option *cvt:expr:nlassign*
+  int NLAssignLevel() const { return options_.nlassign_lev_; }
+  /// Option *cvt:expr:nlreif*
+  int NLReifLevel() const { return options_.nlreif_lev_; }
+  /// Implement for ConverterInfo
+  int RefCountMaxAlgebraic() const override { return NLAssignLevel(); }
 
 public:
   /// Init FlatConverter options
   void InitOptions() {
     InitOwnOptions();
+    GetModelAPI().InitStandardOptions();
     GetModelAPI().InitCustomOptions();
   }
 
@@ -1010,7 +1898,9 @@ private:
   const mp::OptionValueInfo socp_values_[3] = {
     { "0", "Do not recognize SOCP forms", 0},
     { "1", "Recognize from non-quadratic expressions only (sqrt, abs)", 1},
-    { "2", "Recognize from quadratic and non-quadratic SOCP forms", 2}
+    { "2",
+      "Recognize from quadratic and non-quadratic SOCP forms. "
+      "Helpful if the solver does not recognize non-standard forms", 2}
   };
   const mp::OptionValueInfo socp2qc_values_[3] = {
     { "0", "Do not convert", 0},
@@ -1019,49 +1909,217 @@ private:
       "in particular if the objective is quadratic", 1},
     { "2", "Always convert", 2}
   };
+  const mp::OptionValueInfo values_allexpr_acceptance_[2] = {
+      { "0", "Not accepted, all expressions will be treated as flat constraints, "
+            "or redefined", 0},
+      { "1", "Accepted. See the individual acc:... options", 1}
+  };
+
 
   void InitOwnOptions() {
     /// Should be called after adding all constraint keepers
-    FlatModel::ConsiderAcceptanceOptions(*this, GetModelAPI(), GetEnv());
+    FlatModel::ConsiderItemTypeOptions(*this, GetModelAPI(), GetEnv());
 
-    GetEnv().AddStoredOption("tech:writegraph writegraph exportgraph",
+    GetEnv().AddStoredOption("tech:writegraph cvt:writegraph writegraph exportgraph",
         "File to export conversion graph. Format: JSON Lines.",
         options_.file_graph_export_);
     GetEnv().AddOption("cvt:pre:all",
         "0/1*: Set to 0 to disable most presolve in the flat converter.",
         options_.preprocessAnything_, 0, 1);
     GetEnv().AddOption("cvt:pre:eqresult",
-        "0/1*: Preprocess reified equality comparison's boolean result bounds.",
+        "0/1*: Preprocess reified equality comparison's decidable cases.",
         options_.preprocessEqualityResultBounds_, 0, 1);
     GetEnv().AddOption("cvt:pre:eqbinary",
         "0/1*: Preprocess reified equality comparison with a binary variable.",
         options_.preprocessEqualityBvar_, 0, 1);
-    GetEnv().AddOption("cvt:pre:unnest",
-        "0/1*: Inline nested expressions, currently Ands/Ors.",
-        options_.preproNestedAndOrs_, 0, 1);
+    GetEnv().AddOption("cvt:pre:ineqresult",
+                       "0/1*: Preprocess reified inequality comparison's decidable cases.",
+                       options_.preprocessInequalityResultBounds_, 0, 1);
+    GetEnv().AddOption("cvt:pre:ineqrhs",
+                       "0/1*: Preprocess reified inequality comparison's right-hand sides "
+                       "(round for integer expression body).",
+                       options_.preprocessInequalityRhs_, 0, 1);
+    GetEnv().AddOption("cvt:pre:ineq2bndeq ineq2bndeq",
+                       "0/1*: Preprocess reified inequality expr <(=) c, where "
+                       "c <)=( lb(expr)+cvt:mip:eps, into expr == lb(expr), "
+                       "which works better on some benchmarks/solvers.",
+                       options_.preprocessIneq2BndEq_, 0, 1);
+    GetEnv().AddOption("cvt:pre:ineq2related ineq2related ineq2rel",
+                       "0/1*: Unify related reified inequalities: "
+                       "<=c, <c+cvt:mip:eps, >c, >=c+cvt:mip:eps.",
+                       options_.preprocessIneq2Related_, 0, 1);
+
+    GetEnv().AddOption("cvt:pre:vbnd vbnd",
+                       "Comparisons x (cmp) c decided by the domain of x "
+                       "reuse an existing binary instead of a new reified "
+                       "comparison. Bitwise OR of the following values:\n"
+                       "\n"
+                       "| 1 - Variable-bound constraints x >= L*b, x <= U*b "
+                       "with binary b (AMPL's encoding of "
+                       "x in {0} union interval[L, U], or the user's), "
+                       "0 <= c <= L: reuse b or its negation\n"
+                       "| 2 - Root disjunctions x <= a || x >= b (e.g., "
+                       "x == 0 || x >= L for x >= 0), a < c < b: reuse "
+                       "the comparison x >= b or its negation.\n"
+                       "\n"
+                       "Default 3.",
+                       options_.preprocessVarBnd_, 0, 3);
+
+    GetEnv().AddOption("cvt:pre:unnest cvt:unnest cvt:pre:inline cvt:inline",
+        "Inline nested expressions. Bitwise OR of the following values:\n"
+                       "\n"
+                       "|  1 - AND/FORALL and OR/EXISTS expressions\n"
+                       "|  2 - Linear subexpressions in algebraic constraints\n"
+                       "|  4 - Linear and quadratic subexpressions in algebraic constraints\n"
+                       "|  8 - MIN/MAX\n"
+                       "| 16 - Algebraic subexpressions in indicator constraints.\n"
+                       "\n"
+                       "See also option cvt:dvelim concerning only the input model. "
+                       "Default 31.",
+        options_.preproUnnest_, 0, 31);
+    GetEnv().AddOption("cvt:pre:sort cvt:sort",
+                       "0/1*: Sort and eliminate duplicates in arguments "
+                       "of AND, OR, MIN, MAX. Sort arguments of "
+                       "COUNT, ATLEAST, EXACTLY, ATMOST, NUMBEROF, ALLDIFF. "
+                       "Can be necessary for some solvers.",
+                       options_.preproSortUnify_, 0, 1);
+
+    GetEnv().AddOption("cvt:pre:ctx2ineq ctx2ineq",
+                       "0/1*: Propagate exact context into conditional inequalities, "
+                       "vs always mixed. See #267.\n"
+                       "\n"
+                       "Finer control provided by cvt:pre:ctx:cond...(le/ge) options.",
+                       options_.propCtxIneq_, 0, 1);
+    GetEnv().AddOption("cvt:pre:ctx2bndeq ctx2bndeq",
+                       "0/1*: Propagate exact context into conditional "
+                       "(dis)equalities-to-bound, vs always mixed. "
+                       "Can be affected by cvt:pre:ineq2bndeq. See #267.",
+                       options_.propCtxBndEq_, 0, 1);
+    GetEnv().AddOption("cvt:pre:ctx2count ctx2count",
+                       "DEPRECATED. Use ctx2bndeq. NEW DEFAULT.\n\n"
+                       "Propagate exact context into atleast/atmost/exactly, "
+                       "count and numberof expressions, "
+                       "vs always mixed. Bitwise OR of the following values:\n"
+                       "\n"
+                       "|  1 - atleast/atmost/exactly, count\n"
+                       "|  2 - numberof with constant reference value\n"
+                       "|  4 - numberof with variable reference value.\n"
+                       "\n"
+                       "Default 7, see #267.",
+                       options_.propCtxCountNumberof_, 0, 7);
+
+    GetEnv().AddOption("cvt:pre:boundsbest boundsbest bestbounds",
+                       "0*/1/2/3/4: Submit best-known variable bounds to the "
+                       "solver (can inhibit its presolve):\n"
+                       "\n"
+                       "|  0 - no, hard bounds only\n"
+                       "|  1 - all variables\n"
+                       "|  2 - all but the result variables of smooth "
+                       "nonlinear expressions (exp, log, pow, trigonometric "
+                       "functions, divisions, products), which keep their "
+                       "hard bounds\n"
+                       "|  3 - only those variables\n"
+                       "|  4 - all variables if the submitted model has no "
+                       "nonlinear or quadratic constraints or objectives, "
+                       "none otherwise (for solvers whose nonlinear "
+                       "relaxations are solved by a barrier method; MP2NL "
+                       "sets it for such subsolvers).\n"
+                       "\n"
+                       "Note: when a variable can be fixed, the stronger bounds "
+                       "are always submitted.",
+                       GetModel().if_submit_best_known_bounds(), 0, 4);
+
+    GetModel().if_submit_aux_int() = ModelAPI::AuxIntDefault();
+    GetEnv().AddOption("cvt:pre:auxint auxint",
+                       ModelAPI::AuxIntDefault() ?
+                       "0/1*: Submit as integer the auxiliary result variables "
+                       "whose integrality is implied by their defining constraint "
+                       "(if-then-else, min, max, abs, count, numberof, "
+                       "integer linear and quadratic functions of integer "
+                       "arguments). 0: submit them as continuous "
+                       "(MP keeps the integrality for its reformulations). "
+                       "Variables required to have their type by a submitted "
+                       "constraint, e.g., indicator binaries, are not affected."
+                       :
+                       "0*/1: Submit as integer the auxiliary result variables "
+                       "whose integrality is implied by their defining constraint "
+                       "(if-then-else, min, max, abs, count, numberof, "
+                       "integer linear and quadratic functions of integer "
+                       "arguments). Default 0: submit them as continuous "
+                       "(MP keeps the integrality for its reformulations). "
+                       "Variables required to have their type by a submitted "
+                       "constraint, e.g., indicator binaries, are not affected.",
+                       GetModel().if_submit_aux_int(), 0, 1);
+
+    GetEnv().AddOption("cvt:pre:continuous_fixed_vars continuous_fixed_vars ctg_fixed",
+                       "0/1*: Make fixed variables continuous, "
+                       "to avoid fake MIPs.",
+                       GetModel().if_make_fixed_vars_continuous(), 0, 1);
+
+    GetEnv().AddOption("cvt:pre:boundlogarg boundlogarg",
+                       "0*/1: Bound logarithm arguments to nonnegative.",
+                       options_.boundLogArg_, 0, 1);
 
     GetEnv().AddOption("cvt:quadobj passquadobj",
                        ModelAPIAcceptsQuadObj() ?
-        "0/1*: Multiply out and pass quadratic objective terms to the solver, "
-        "vs. linear approximation."
+        "0/1*: Pass quadratic objective terms to the solver. "
+        "When 0, if the solver accepts quadratic constraints, "
+        "such a constraint will be created with those, "
+        "otherwise linearly approximated. "
+        "With cvt:nlobj=0, ensures the objective is linear."
                        :
-        "0*/1: Multiply out and pass quadratic objective terms to the solver, "
-                         "vs. linear approximation.",
+        "0*/1: Pass quadratic objective terms to the solver. "
+        "When 0, if the solver accepts quadratic constraints, "
+        "such a constraint will be created with those, "
+        "otherwise linearly approximated. "
+        "With cvt:nlobj=0, ensures the objective is linear."
+                       ,
         options_.passQuadObj_, 0, 1);
     GetEnv().AddOption("cvt:quadcon passquadcon",
-                       ModelAPIAcceptsQC() ?
-        "0/1*: Multiply out and pass quadratic constraint terms to the solver, "
-        "vs. linear approximation."
-                       :
-        "0*/1: Multiply out and pass quadratic constraint terms to the solver, "
-                         "vs. linear approximation.",
-        options_.passQuadCon_, 0, 1);
+                       "0/1*: set to 0 to disable quadratic constraints. "
+                       "Synonym for acc:quad..=0. "
+                       "Setting to 0 disables out-multiplication "
+                       "of quadratic terms, then they are linearized.",
+                       options_.passQuadCon_, 0, 1);
+
+    GetEnv().AddOption("cvt:nlobj passnlobj",
+                       ModelAPIAcceptsNLObj() ?
+                           "0/1*: Pass nonlinear objective terms to the solver. "
+                           "When 0, if the solver accepts nonlinear constraints, "
+                           "such a constraint will be created with those, "
+                           "otherwise linearly approximated. "
+                           "With cvt:quadobj=0, ensures the objective is linear."
+                                                :
+                           "0*/1: Pass nonlinear objective terms to the solver. "
+                           "When 0, if the solver accepts nonlinear constraints, "
+                           "such a constraint will be created with those, "
+                           "otherwise linearly approximated. "
+                           "With cvt:quadobj=0, ensures the objective is linear."
+                       ,
+                       options_.passNLObj_, 0, 1);
+
+    GetEnv().AddOption("cvt:qp2passes cvt:qp2pass qp2passes qp2pass",
+                       "0/1*: Parse sums of QP expressions in 2 passes. "
+                       "Usually faster.",
+                       options_.useQP2Pass_, 0, 1);
+    GetEnv().AddOption("cvt:multoutcard multoutcard",
+                       fmt::format(
+                       "Up to which (estimated) QP matrix cardinality "
+                       "should a product of 2 linear expressions "
+                       "be multiplied out. Default {}.\n"
+                       "\n"
+                       "Low value can speed up model input, but prone to "
+                       "numerical issues.",
+                       ModelAPI::MultOutCardDefault()).c_str(),
+                       options_.QPMultOutCard_, 0.0, 1e20);
+
+
     GetEnv().AddOption("cvt:expcones expcones",
-                       ModelAPIAcceptsExponentialCones()>1 ?
+                       ModelAPIAcceptsExponentialCones() ?
                          "0/1*: Recognize exponential cones." :
                          "0*/1: Recognize exponential cones.",
                        options_.passExpCones_, 0, 1);
-    options_.passExpCones_ = ModelAPIAcceptsExponentialCones()>1;
+    options_.passExpCones_ = ModelAPIAcceptsExponentialCones();
     // Should be after construction
     socp_mode_text_ =
       "Second-Order Cone recognition mode:\n"
@@ -1085,9 +2143,52 @@ private:
                        socp2qc_mode_text_.c_str(),
                        options_.passSOCP2QC_, socp2qc_values_);
     options_.passSOCP2QC_ = DefaultSOCP2QCMode();
+
+    GetEnv().AddStoredOption("acc:_all",
+                             "Solver acceptance level for all "
+                             "constraints and expressions. "
+                             "Value meaning: as described in the specific "
+                             "acc:... options.\n"
+                             "\n"
+                             "Can be useful to disable all reformulations (acc:_all=2), "
+                             "or force linearization (acc:_all=0.)",
+                             options_.accAll_, 0, 4);
+
+    if constexpr (IfAcceptingNLOutput())
+      GetEnv().AddStoredOption("acc:_expr",
+                        fmt::format(
+                            "Solver acceptance level for all expressions, "
+                            "default {}:\n\n.. value-table::",
+                                   options_.accExpr_).c_str(),
+                        options_.accExpr_, values_allexpr_acceptance_);
+    else
+      GetEnv().AddStoredOption("acc:_expr", "HIDDEN", options_.accExpr_, 0, 1);
+
     GetEnv().AddOption("alg:relax relax",
         "0*/1: Whether to relax integrality of variables.",
         options_.relax_, 0, 1);
+
+    GetEnv().AddOption("obj:multi:options multiobjoptions",
+                       "0/1*: Regard multiobjective option suffixes "
+                       "which are objective suffixes beginning with option_. "
+                       "Example: suffix option_timelim; let _obj[2].option_timelim:=15;",
+                       options_.mo_options_, 0, 1);
+
+    GetEnv().AddOption("cvt:pre:feastol pre:feastol pre:eps pre:feastolabs pre:epsabs",
+                       "Absolute tolerance to check variable "
+                       "and constraint bound contraditions. "
+                       "Only warns if also pre:feastolrel is violated. "
+                       "See also sol:chk:feastol. "
+                       "Default 1e-6.",
+                       options_.modelfeastol_, 0.0, 1e100);
+    GetEnv().AddOption("cvt:pre:feastolrel pre:feastolrel pre:epsrel",
+                       "Relative tolerance to check variable "
+                       "and constraint bound contradictions. "
+                       "Only warns if also pre:feastol is violated. "
+                       "See also sol:chk:feastol. "
+                       "Default 1e-6.",
+                       options_.modelfeastolrel_, 0.0, 1e100);
+
     GetEnv().AddStoredOption(
           "sol:chk:mode solcheck checkmode chk:mode",
         "Solution checking mode. "
@@ -1112,12 +2213,18 @@ private:
                              "Default: 1+2+512.",
         options_.solcheckmode_, 0, 1023);
     GetEnv().AddOption("sol:chk:feastol sol:chk:eps chk:eps chk:feastol",
-        "Absolute tolerance to check objective values, variable "
-        "and constraint bounds. Default 1e-6.",
+        "Absolute tolerance to check objective values', variable "
+        "and constraint bounds' violations. "
+                       "Only triggers if also sol:chk:feastolrel is violated. "
+                       "See also pre:feastol. "
+                       "Default 1e-6.",
         options_.solfeastol_, 0.0, 1e100);
     GetEnv().AddOption("sol:chk:feastolrel sol:chk:epsrel chk:epsrel chk:feastolrel",
-        "Relative tolerance to check objective values, variable "
-        "and constraint bounds. Default 1e-6.",
+        "Relative tolerance to check objective values', variable "
+        "and constraint bounds' violations. "
+                       "Only triggers if also sol:chk:feastol is violated. "
+                       "See also pre:feastol. "
+                       "Default 1e-6.",
         options_.solfeastolrel_, 0.0, 1e100);
     GetEnv().AddOption("sol:chk:inttol sol:chk:inteps sol:inteps chk:inttol",
         "Solution checking tolerance for variables' integrality. "
@@ -1140,6 +2247,21 @@ private:
                        "number of significant digits.",
                        options_.sol_prec_, -1000, 1000);
 
+    GetEnv().AddOption("cvt:expr:nlassign expr:nlassign",
+                       fmt::format("Above which reference count, "
+                                   "an algebraic formula node should be assigned to a variable "
+                                   "(see acc: options). 0 means all nodes assigned. "
+                                   "Default {}.", options_.nlassign_lev_).c_str(),
+                       options_.nlassign_lev_, 0, INT_MAX);
+
+    GetEnv().AddOption("cvt:expr:nlreif expr:nlreif expr:nlreify",
+                       fmt::format("Above which reference count, "
+                                   "a logical formula node should be assigned (reified) "
+                                   " to a variable "
+                                   "(see acc: options). 0 means all nodes reified. "
+                                   "Default {}.", options_.nlreif_lev_).c_str(),
+                       options_.nlreif_lev_, 0, INT_MAX);
+
     ////////////////////// Solve result codes ////////////////////////
     GetEnv().AddSolveResults({
                                {sol::MP_SOLUTION_CHECK,
@@ -1152,8 +2274,8 @@ private:
 public:
   /// Wrapper about a specific preprocess option:
   /// checks whether \a preprocessAnything_ is on.
-  bool CanPreprocess(int f) const {
-    return 0!=options_.preprocessAnything_ && 0!=f;
+  int CanPreprocess(int f) const {
+    return options_.preprocessAnything_ ? f : 0;
   }
 
   /// Whether preprocess equality result bounds
@@ -1164,23 +2286,102 @@ public:
   bool IfPreproEqBinVar() const
   { return MPCD( CanPreprocess(options_.preprocessEqualityBvar_) ); }
 
-  /// Whether inline nested forall, exists
-  bool IfPreproNestedAndsOrs() const
-  { return MPCD( CanPreprocess(options_.preproNestedAndOrs_) ); }
+  /// Whether preprocess inequality result bounds
+  bool IfPreproIneqResBounds() const
+  { return MPCD( CanPreprocess(options_.preprocessInequalityResultBounds_) ); }
+
+  /// Whether preprocess inequality rhs
+  bool IfPreproIneqRHS() const
+  { return MPCD( CanPreprocess(options_.preprocessInequalityRhs_) ); }
+
+  /// Whether constraint preprocessing only computes the result's
+  /// bounds and type: a query on a copy of a stored constraint
+  /// (IfSubmittedVarBoundsStrongerThanInitExpr()),
+  /// which must not rewrite it into new variables or constraints.
+  bool IfPreproBoundsOnly() const { return prepro_bounds_only_; }
+
+  /// Whether preprocess inequality into ==LB/UB
+  bool IfPreproIneq2BndEq() const
+  { return MPCD( CanPreprocess(options_.preprocessIneq2BndEq_) ); }
+
+  /// Whether to unify related inequalities
+  bool IfPreproIneq2Related() const
+  { return MPCD( CanPreprocess(options_.preprocessIneq2Related_) ); }
+
+  /// Whether to decide comparisons by variable-bound constraints
+  bool IfPreproVarBnd() const
+  { return MPCD( CanPreprocess(options_.preprocessVarBnd_) ) & 1; }
+
+  /// Whether to rewrite comparisons inside domain holes
+  /// (not while flattening a hole-defining constraint)
+  bool IfPreproHoles() const {
+    return (MPCD( CanPreprocess(options_.preprocessVarBnd_) ) & 2)
+        && !n_hole_rewrite_off_;
+  }
+
+  /// Note domain hole (a, b) of x, defined by root logical
+  /// constraint \a i_lcon (see var_bnd_impl.h)
+  void NoteDomainHole(int x, double a, double b, int i_lcon)
+  { var_holes_.NoteHole(x, a, b, i_lcon); }
+
+  /// Domain holes
+  const VarDomainHoles& GetVarDomainHoles() const { return var_holes_; }
+
+  /// Scope while flattening root logical constraint \a i_lcon:
+  /// no hole rewrites inside a hole-defining one
+  class HoleDefiningScope {
+  public:
+    /// Construct
+    HoleDefiningScope(FlatConverter& cvt, int i_lcon)
+      : cvt_(cvt), f_def_(cvt.var_holes_.IsDefining(i_lcon))
+    { cvt_.n_hole_rewrite_off_ += f_def_; }
+    /// Destruct
+    ~HoleDefiningScope() { cvt_.n_hole_rewrite_off_ -= f_def_; }
+  private:
+    FlatConverter& cvt_;
+    const int f_def_;
+  };
+
+  /// Note linear row  c0*v0 + c1*v1 (in) [lo, up]  of the input model:
+  /// a variable-bound constraint if one variable is binary
+  /// (see var_bnd_impl.h)
+  void NoteVarBoundRow(double c0, int v0, double c1, int v1,
+                       double lo, double up) {
+    const auto& m = GetModel();
+    if (m.is_binary_var(v1) && !m.is_binary_var(v0))
+      var_bin_bnds_.NoteRow(v0, c0, v1, c1, lo, up);
+    else if (m.is_binary_var(v0) && !m.is_binary_var(v1))
+      var_bin_bnds_.NoteRow(v1, c1, v0, c0, lo, up);
+  }
+
+  /// Implications of variable-bound constraints
+  const VarBinaryBounds& GetVarBinaryBounds() const { return var_bin_bnds_; }
+
+  /// Whether inline nested forall, exists, lin/quad expr
+  int IfPreproUnnest() const
+  { return MPCD( CanPreprocess(options_.preproUnnest_) ); }
+
+  /// Whether sort and elim duplicates in argument lists
+  int IfPreproSortUnify() const
+  { return MPCD( CanPreprocess(options_.preproSortUnify_) ); }
 
 
   /// Whether we pass quad obj terms to the solver without linearization
   bool IfPassQuadObj() const { return options_.passQuadObj_; }
 
   /// Whether we pass quad con terms to the solver without linearization
-  bool IfPassQuadCon() const { return options_.passQuadCon_; }
+  bool IfPassQuadCon() const
+  { return options_.passQuadCon_ && ModelAPIAcceptsQC(); }
+
+  /// Whether we pass NL obj terms to the solver without linearization
+  bool IfPassNLObj() const { return options_.passNLObj_; }
 
   /// Whether to quadratize pow(..., const_pos_int).
-  /// The fact that we use the passQuadCon_ flag
+  /// The fact that we use IfPassQuadCon()
   /// is much Gurobi-biased: v9.5 does not PL-linearize Pow
   /// for negative arguments
   bool IfQuadratizePowConstPosIntExp() const
-  { return options_.passQuadCon_; }
+  { return IfPassQuadCon(); }
 
   /// Recognition mode for SOCP cones
   int IfPassSOCPCones() const { return options_.passSOCPCones_; }
@@ -1210,37 +2411,100 @@ public:
           std::move(key), std::move(msg), replace);
   }
 
+  /// Provide suffix getters and setters
+  void SetSuffixManip(SuffixGetterSetter sgs)
+  { suf_get_set_ = sgs; }
+
+
+public:
+  /// Read int suffix
+  ArrayRef<int> ReadIntSuffix(const SuffixDef<int>& sd)
+  { assert(suf_get_set_.sgi_); return suf_get_set_.sgi_(sd); }
+
+  /// Read double suffix
+  ArrayRef<double> ReadDblSuffix(const SuffixDef<double>& sd)
+  { assert(suf_get_set_.sgd_); return suf_get_set_.sgd_(sd); }
+
+  const SuffixSet& Suffixes(suf::Kind kind) {
+    { assert(suf_get_set_.ss_); return suf_get_set_.ss_(kind); }
+  }
+
+protected:
+  void CheckNumVars(pre::ModelValuesDbl& sol) {
+    auto& xx = sol.GetVarValues()();
+    if (xx.size()) {                    // solution available
+      if (xx.size() < MPCD( num_vars() )) {
+        MPCD( GetEnv() ).AddWarning(
+            "FewerVariables",
+            fmt::format("Solver reported {} variables,\n"
+                        "less than {} received.\n"
+                        "Solution might be incorrect.",
+                        xx.size(), MPCD( num_vars() )));
+        xx.resize( MPCD( num_vars() ) );
+      }
+    }
+  }
+
+  /// Recompute implicit aux vars
+  /// (those corresponding to expressions
+  ///   and/or eliminated functional constraints).
+  /// Needed for MO emulator and sol checker.
+  void RecomputeUnusedAuxVars(pre::ModelValuesDbl& sol) {
+    auto& xx = sol.GetVarValues()();
+    if (xx.size()) {                    // solution available
+      auto var_is_used = MPCD( GetVarElimFlags() );
+      var_is_used.resize(xx.size(), false);   // flags only up to the last
+      var_is_used.flip();                     // eliminated variable
+      xx = MPD( RecomputeAuxVars(xx, var_is_used, false) );  // realistic
+    }
+  }
+
 
 private:
   /// We store ModelApi in the converter for speed.
   /// Should be before constraints
   ModelAPIType modelapi_;
-  /// Conversion graph exporter file appender
-  std::unique_ptr<BasicFileAppender> graph_exporter_app_{MakeFileAppender()};
-  /// Conversion graph exporter functor
-  pre::ValuePresolver::ExporterFn graph_exporter_fn_{
-    [this](const char* s){
-      graph_exporter_app_->Append(s);
-    }
-  };
+  /// solve iteration
+  int n_solve_iter_ {0};
+  /// Suffix getters and setters
+  SuffixGetterSetter suf_get_set_;
   /// ValuePresolver: should be init before constraint keepers
   /// and links
   pre::ValuePresolver value_presolver_
   {
-    GetModel(), GetEnv(), graph_exporter_fn_,
-        [this](
-        ArrayRef<double> x,
-        const pre::ValueMapDbl& y,
-        ArrayRef<double> obj,
-        void* p_extra) -> bool {
-      return !this->options_.solcheckmode_   // not desired
-                 || MPD( CheckSolution(x, y, obj, p_extra) );
-    }
+      GetModel(), GetEnv(), (BasicLogger&)GetModel().GetFileAppender(),
+      [this](                           // Solution checker
+          ArrayRef<double> x,
+          const pre::ValueMapDbl& y,
+          ArrayRef<double> obj,
+          void* p_extra) -> bool {
+        return !this->options_.solcheckmode_   // not desired
+               || MPD( CheckSolution(x, y, obj, p_extra) );
+      },
+      [this](pre::ModelValuesDbl& sol)  // Solution pre-postsolver
+      {
+        MPD( CheckNumVars(sol) );       // XPRESS 44.01.04
+        MPD( RecomputeUnusedAuxVars(sol) );
+        MPD( ProcessMOIterationUnpostsolvedSolution(sol) );
+      }
   };
   pre::CopyLink copy_link_ { GetValuePresolver() }; // the copy links
   pre::One2ManyLink one2many_link_ { GetValuePresolver() }; // the 1-to-many links
   pre::NodeRange auto_link_src_item_;   // the source item for autolinking
   std::vector<pre::NodeRange> auto_link_targ_items_;
+  /// This is to check that we always care
+  /// to set up autolinking,
+  /// or declare it empty
+  bool is_autolinking_requested_ {false};
+
+  /// See IfPreproBoundsOnly(); set by const queries
+  mutable bool prepro_bounds_only_ {false};
+  /// Sets prepro_bounds_only_ for its lifetime
+  struct PreproBoundsOnlyScope {
+    bool& flag_;
+    PreproBoundsOnlyScope(bool& f) : flag_(f) { flag_ = true; }
+    ~PreproBoundsOnlyScope() { flag_ = false; }
+  };
 
   pre::Many2OneLink many2one_link_ { GetValuePresolver() }; // the many-to-one links
 
@@ -1250,8 +2514,14 @@ private:
   int nExpConesRecognized_ = 0;
   bool ifCvtSOCP2QC_ = 0;
 
+  SDPConverter<Impl> sdp_cvt_ { *static_cast<Impl*>(this) };
+
 	std::vector<int> refcnt_vars_;
   int constr_depth_ = 0;    // tree depth of new constraints
+  bool if_final_cvt_phase_ = false;  // see ConvertDelayedItems()
+  VarBinaryBounds var_bin_bnds_;     // see NoteVarBoundRow()
+  VarDomainHoles var_holes_;         // see NoteDomainHole()
+  int n_hole_rewrite_off_ = 0;       // see HoleDefiningScope
 
   /// AMPL item names
   std::vector<std::string>
@@ -1259,6 +2529,10 @@ private:
   con_names_,   // no SOS here, they go directly into the SOS
   obj_names_;
 
+  /// Model stats
+  FlatModelInfo::VarInfo modelinfo_flat0_vars_;
+  FlatModelInfo::ObjInfo modelinfo_flat0_objs_;
+  FlatModelInfo::ConstrTypeMapByName modelinfo_flat0_cons_;
 
 protected:
   /////////////////////// CONSTRAINT KEEPERS /////////////////////////
@@ -1270,113 +2544,180 @@ protected:
   /// 2nd parameter: solver options for this constraint,
   /// in case it is accepted by the solver natively and
   /// is convertible by us.
-  STORE_CONSTRAINT_TYPE__NO_MAP(LinConRange,
-                                "acc:linrange acc:linrng")
-  STORE_CONSTRAINT_TYPE__NO_MAP(LinConLE, "acc:linle")
-  STORE_CONSTRAINT_TYPE__NO_MAP(LinConEQ, "acc:lineq")
-  STORE_CONSTRAINT_TYPE__NO_MAP(LinConGE, "acc:linge")
-
-  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConRange,
-                                "acc:quadrange acc:quadrng")
-  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConLE, "acc:quadle")
-  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConEQ, "acc:quadeq")
-  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConGE, "acc:quadge")
-
-  /// Our own functional constraints: LFC, QFC
-  STORE_CONSTRAINT_TYPE__WITH_MAP(
-      LinearFunctionalConstraint, "acc:linfunccon")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(
-      QuadraticFunctionalConstraint, "acc:quadfunccon")
+  /// 3rd parameter: reformulation priority (double).
+  /// Can be changed in a derived class by ConstraintCvtPriority().
+  /// NOTE: The reformulation meta-graph should be acyclic #248.
 
   /// Flattened NL expressions
-  STORE_CONSTRAINT_TYPE__WITH_MAP(MaxConstraint, "acc:max")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(MinConstraint, "acc:min")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AbsConstraint, "acc:abs")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AndConstraint,
-                                  "acc:and acc:forall")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(OrConstraint,
-                                  "acc:or acc:exists")
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AbsConstraint, "acc:abs", 100)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AllDiffConstraint, "acc:alldiff", 200)
 
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConEQ, "acc:condlineq")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConLE, "acc:condlinle")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConLT, "acc:condlinlt")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConGE, "acc:condlinge")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConGT, "acc:condlingt")
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      ComplementarityQuadratic, "acc:complquad", 300)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      ComplementarityLinear, "acc:compl acc:compllin", 350)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLComplementarity, "acc:nlcompl", 360)
 
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConEQ, "acc:condquadeq")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConLE, "acc:condquadle")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConLT, "acc:condquadlt")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConGE, "acc:condquadge")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConGT, "acc:condquadgt")
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CountConstraint, "acc:count", 400)
 
-  STORE_CONSTRAINT_TYPE__WITH_MAP(NotConstraint, "acc:not")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(DivConstraint, "acc:div")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(IfThenConstraint, "acc:ifthen")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(ImplicationConstraint, "acc:impl")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AllDiffConstraint, "acc:alldiff")
+  STORE_CONSTRAINT_TYPE__WITH_MAP(DivConstraint, "acc:div", 600)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(ModConstraint, "acc:mod", 610)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(IntDivConstraint, "acc:intdiv", 620)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(FloorConstraint, "acc:floor", 630)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CeilConstraint, "acc:ceil", 632)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(RoundConstraint, "acc:round", 634)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(MulConstraint, "acc:mul", 650)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(IfThenConstraint, "acc:ifthen", 700)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(ImplicationConstraint, "acc:impl", 800)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(LogisticConstraint,
+                                  "acc:logi acc:logistic", 880)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(SignpowConstExpConstraint,
+                                  "acc:signpowc acc:signpowconstexp", 890)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(PowConstExpConstraint, "acc:powc acc:powconstexp", 900)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(PowConstraint, "acc:pow", 950) // -> exp, log
+  STORE_CONSTRAINT_TYPE__WITH_MAP(ExpConstraint, "acc:exp", 1000)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(ExpAConstraint, "acc:expa acc:expA", 1002)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(LogConstraint, "acc:log", 1004)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(LogAConstraint, "acc:loga acc:logA", 1006)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(SinConstraint, "acc:sin", 1008)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CosConstraint, "acc:cos", 1010)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(TanConstraint, "acc:tan", 1012)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AsinConstraint, "acc:asin", 1014)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AcosConstraint, "acc:acos", 1016)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AtanConstraint, "acc:atan", 1018)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(SinhConstraint, "acc:sinh", 1020)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CoshConstraint, "acc:cosh", 1022)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(TanhConstraint, "acc:tanh", 1024)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AsinhConstraint, "acc:asinh", 1026)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AcoshConstraint, "acc:acosh", 1028)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AtanhConstraint, "acc:atanh", 1030)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CallConstraint, "acc:call", 1040)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(SDPDotProdConstraint, "acc:sdpdotprod acc:sdpdot", 1045)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(MaxConstraint, "acc:max", 1100)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(MinConstraint, "acc:min", 1200)
   STORE_CONSTRAINT_TYPE__WITH_MAP(NumberofConstConstraint,
-                                  "acc:numberofconst")
+                                  "acc:numberofconst", 1300)
   STORE_CONSTRAINT_TYPE__WITH_MAP(NumberofVarConstraint,
-                                  "acc:numberofvar")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CountConstraint, "acc:count")
+                                  "acc:numberofvar", 1350)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(PLConstraint,
+      "acc:pl acc:pwl acc:piecewise", 1500)
+  STORE_CONSTRAINT_TYPE__NO_MAP(SOS1Constraint, "acc:sos1", 1600)
+  STORE_CONSTRAINT_TYPE__NO_MAP(SOS2Constraint, "acc:sos2", 1700)
 
-  STORE_CONSTRAINT_TYPE__WITH_MAP(ExpConstraint, "acc:exp")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(ExpAConstraint, "acc:expa acc:expA")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(LogConstraint, "acc:log")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(LogAConstraint, "acc:loga acc:logA")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(PowConstraint, "acc:pow")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(SinConstraint, "acc:sin")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CosConstraint, "acc:cos")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(TanConstraint, "acc:tan")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AsinConstraint, "acc:asin")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AcosConstraint, "acc:acos")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AtanConstraint, "acc:atan")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(SinhConstraint, "acc:sinh")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(CoshConstraint, "acc:cosh")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(TanhConstraint, "acc:tanh")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AsinhConstraint, "acc:asinh")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AcoshConstraint, "acc:acosh")
-  STORE_CONSTRAINT_TYPE__WITH_MAP(AtanhConstraint, "acc:atanh")
-
-  /// No maps for static constraints
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      IndicatorConstraintLinLE, "acc:indle acc:indlinle")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      IndicatorConstraintLinEQ, "acc:indeq acc:indlineq")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      IndicatorConstraintLinGE, "acc:indge acc:indlinge")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      IndicatorConstraintQuadLE, "acc:indquadle")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      IndicatorConstraintQuadEQ, "acc:indquadeq")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      IndicatorConstraintQuadGE, "acc:indquadge")
-  STORE_CONSTRAINT_TYPE__NO_MAP(PLConstraint,
-                                "acc:pl acc:pwl acc:piecewise")
-  STORE_CONSTRAINT_TYPE__NO_MAP(SOS1Constraint, "acc:sos1")
-  STORE_CONSTRAINT_TYPE__NO_MAP(SOS2Constraint, "acc:sos2")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      ComplementarityLinear, "acc:compl acc:compllin")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      ComplementarityQuadratic, "acc:complquad")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      QuadraticConeConstraint, "acc:quadcone")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      RotatedQuadraticConeConstraint, "acc:rotatedquadcone")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      PowerConeConstraint, "acc:powercone")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      ExponentialConeConstraint, "acc:expcone")
-  STORE_CONSTRAINT_TYPE__NO_MAP(
-      GeometricConeConstraint, "acc:geomcone")
   /// Store UEncConstr
   STORE_CONSTRAINT_TYPE__NO_MAP(
-      UnaryEncodingConstraint, "acc:uenc")
+      UnaryEncodingConstraint, "acc:uenc", 1800)
   /// Dummy conversion for UEncConstr
-  void Convert(const UnaryEncodingConstraint& ) { }
+  Context Convert(const UnaryEncodingConstraint& )
+  { return Context::CTX_ROOT; }
+  /// Say we can (for acc:_all=0)
+  bool IfHasCvt_impl(const UnaryEncodingConstraint* ) {
+    return true;
+  }
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConEQ, "acc:condquadeq", 1900)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConEQ, "acc:condlineq", 1950)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConLE, "acc:condquadle", 2000)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConLT, "acc:condquadlt", 2010)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConGE, "acc:condquadge", 2020)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondQuadConGT, "acc:condquadgt", 2030)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConLE, "acc:condlinle", 2050)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConLT, "acc:condlinlt", 2060)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConGE, "acc:condlinge", 2070)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(CondLinConGT, "acc:condlingt", 2080)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(NotConstraint, "acc:not", 2100)
+
+  /// Used only for expression output,
+  /// flat model keeps this in algebraic form
+  STORE_CONSTRAINT_TYPE__WITH_MAP(
+      EquivalenceConstraint, "acc:equiv acc:equivalence", 2150)
+
+  STORE_CONSTRAINT_TYPE__WITH_MAP(AndConstraint,
+                                  "acc:and acc:forall", 2200)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(OrConstraint,
+                                  "acc:or acc:exists", 2300)
+
+  /// No maps for static constra ints
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      IndicatorConstraintQuadEQ, "acc:indquadeq", 2400)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      IndicatorConstraintQuadLE, "acc:indquadle", 2410)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      IndicatorConstraintQuadGE, "acc:indquadge", 2420)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      IndicatorConstraintLinEQ, "acc:indeq acc:indlineq", 2450)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      IndicatorConstraintLinLE, "acc:indle acc:indlinle", 2460)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      IndicatorConstraintLinGE, "acc:indge acc:indlinge", 2470)
+
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      PowerConeConstraint, "acc:powercone", 3000)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      RotatedQuadraticConeConstraint, "acc:rotatedquadcone", 3001)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      QuadraticConeConstraint, "acc:quadcone", 3002)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      ExponentialConeConstraint, "acc:expcone", 3010)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      GeometricConeConstraint, "acc:geomcone", 3020)
+
+  /// Static algebraic cons
+  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConRange,  // Before LinConRange
+                                "acc:quadrange acc:quadrng", 3090)
+  STORE_CONSTRAINT_TYPE__NO_MAP(LinConRange,   // before QuadFuncCon
+                                "acc:linrange acc:linrng", 3091)
+
+  /// Our own functional constraints: LFC, QFC.
+  /// We'll also add inlining with priority 3099,
+  /// see AddConversionAction() in the constructor #266.
+  /// Inline algebraic subexpressions in algebraic
+  /// constraints and objectives.
+  /// This includes algebralized indicators.
+  STORE_CONSTRAINT_TYPE__WITH_MAP(
+      QuadraticFunctionalConstraint, "acc:quadfn acc:quadfunccon", 3100)
+  STORE_CONSTRAINT_TYPE__WITH_MAP(
+      LinearFunctionalConstraint, "acc:linfn acc:linfunccon", 3200)
+
+  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConLE, "acc:quadle", 4100)
+  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConEQ, "acc:quadeq", 4200)
+  STORE_CONSTRAINT_TYPE__NO_MAP(QuadConGE, "acc:quadge", 4300)
+
+  STORE_CONSTRAINT_TYPE__NO_MAP(LinConLE, "acc:linle", 5100)
+  STORE_CONSTRAINT_TYPE__NO_MAP(LinConEQ, "acc:lineq", 5200)
+  STORE_CONSTRAINT_TYPE__NO_MAP(LinConGE, "acc:linge", 5300)
+
+  ////////////////////// NL constraints & expressions ///////////////////////
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLConstraint, "acc:nlcon acc:nlalgcon", 10000)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLAssignEQ, "acc:nlassigneq", 10100)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLAssignLE, "acc:nlassignle", 10200)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLAssignGE, "acc:nlassignge", 10300)
+
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLLogical, "acc:nllogcon acc:nllogical", 12000)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLReifEquiv, "acc:nlreifequiv", 12100)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLReifImpl, "acc:nlreifimpl", 12200)
+  STORE_CONSTRAINT_TYPE__NO_MAP(
+      NLReifRimpl, "acc:nlreifrimpl", 12300)
 
 
-	protected:
+protected:
   ////////////////////// Default map accessors /////////////////////////
   /// Constraints without map should overload these by empty methods ///
 

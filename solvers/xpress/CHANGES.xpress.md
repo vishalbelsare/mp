@@ -2,6 +2,313 @@ Summary of recent updates to Xpress for AMPL
 ============================================
 
 
+## 20261101
+- Fix: a global (spatial branch-and-bound) solve stopped by a time,
+  work or node limit, or interrupted, was reported as *solved?*
+  (*solve_result_num* 120, "locally optimal solution") with its
+  incumbent; it is now reported as a limit (e.g. 402, "time limit,
+  feasible solution"; 4xx without a feasible solution), from
+  XPRS_NLPSTOPSTATUS (or XPRS_STOPSTATUS).
+- Fix: in a native multi-objective solve (*obj:multi=1*), the MIP gap
+  combined the first objective's value with the last pass's bound; it
+  is now the last pass's gap.
+- Fix: *mip:basis* with *sol:poolmode=2* fixed the integer variables to
+  the enumerator's last solution; they are now fixed to the pool's
+  best, the reported solution.
+- Fix: with *sol:poolmode=2* (solution enumeration), the reported
+  solution and objective were the last solution the enumerator
+  visited, not the pool's best; the MIP gap and *.bestbound* referred
+  to the enumerator's search. The primary solution is now the pool's
+  best, and the bound is valid for it.
+- Options generated from the Xpress parameter database are named after
+  the control with MP prefixes (e.g. *mip:backtrack*, *lp:autoperturb*,
+  *bar:algaftercrossover*, *slp:algorithm*) instead of *<topic>:xprs_<name>*;
+  the control name (*backtrack*) and *XPRS_<NAME>* are synonyms, and the
+  ASL driver's keywords (*treeoutlev*, *mipops*, *heurroot*, ...) are
+  accepted. The headers are regenerated from the SDK database at build
+  time when it is available, with the control types verified against
+  the SDK headers.
+- The vendor documentation is used for every option in the database;
+  wrong defaults in the driver's own texts are gone.
+- *qp:nonconvex* is deprecated: the convexity check is *qp:convexitychk*
+  (*convexitychk*, IFCHECKCONVEXITY). *tech:globalfilemax* and
+  *tech:globalfileloginterval* are synonyms of *lim:maxtreefilesize* and
+  *mip:treefileloginterval*. *bar:cachesize*, *bar:l1cache* and
+  *tech:sleeponthreadwait* are ignored by Xpress.
+- *heurdepth* now sets HEURDEPTH as in the ASL driver (it was a synonym
+  of *lim:heurdiveiterlimit*); *heurfreq* is no longer ambiguous.
+- Solution pool: *sol:pooldups* (duplicate policy) is set on the pool
+  object and works, and distinct solutions are the default (the pool
+  used to report duplicates up to the limit); new *sol:poolgap*,
+  *sol:poolgapabs* and *sol:poolmode* with the same meaning as in the
+  Gurobi and CPLEX drivers; *sol:poollimit* defaults to 10 as
+  documented; *obj:multi:ops* and *obj:multi:log* added.
+- New *tech:optionnative* (*tech:param*, *param*): any Xpress control by
+  name, "NAME=value" or "NAME=?"; *alg:readbasis* (*basisin*): starting
+  basis from a .bas file. Rows are now named in the Xpress model, so
+  basis files written with *tech:writesolution* can be read back.
+- Add separate fixed-model limits *mip:basis:timelimit* and
+  *mip:basis:iterlimit*.
+- Retain the MIP solution when a supplementary fixed solve reaches a limit.
+- Optimized input of nonlinear expressions.
+- Fixed LP basis input.
+- Fixes in IIS reporting.
+- Option *tech:writesolution* supports formats
+  .sol/.prt, .iis, .bas/.bss.
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+  - The main driver code is separated into a shared
+    library and used commonly with AMPLS API.
+
+
+## 20260515
+- Updated to Xpress 46.01.02, which includes bugfixes
+  and performance improvements. 
+- Solve result LIMIT_INF_UNB, 450 is returned in some cases
+  (previously used UNBOUNDED_NO_FEAS, 350).
+
+
+## 20260414
+- Fixed solve result reporting for (MI)NLP.
+- Mark result/argument variables of logical
+  constraints as binary, unless fixed. This proves
+  necessary for some models.
+- Changes in MP, in particular:
+  - Option *cvt:pre:boundsbest* defaults to making
+    auxiliary subexpression result variables free,
+    unless the result is constant. This allows
+    stronger nonlinear presolve.
+
+
+## 20251210
+- New option names
+  - In particular, *pre:indlin(big/small)bigm* now stand for
+    the previous *alg:indlinbigm* and *pre:indlinbigm*, resp.
+    (old names kept as synonyms).
+- Change in MP: option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- Full list of Xpress options supported.
+- New option *obj:multi:options* to control
+  whether multi-objective option suffixes
+  are used.
+
+
+## 20251021
+- Changes in MP: option *cvt:expr:nlassign*.
+
+
+## 20251015
+- Changes in MP
+- Fixed retrieval of basis after time/work
+  limit in Xpress Global.
+
+
+## 20250924
+- Submit initial guess to the local NLP solver
+  as well.
+- Fixed retrieval of duals after time limit
+  in Xpress Global.
+- Added options *tech:tunermethodread* and 
+  *tech:tunermethodwrite* to load and write
+  tuning methods from/to files.
+
+
+## 20250902
+- Fix retrieval of feasible solution after
+  time limit in Xpress Global.
+- Options *alg:nlpsolver*, *alg:localsolver*.
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options *cvt:pre:unnest*, *cvt:pre:sort*).
+  - Option *cvt:pre:boundlogarg* (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+- Fixed modeling interface for AND, OR, MIN, MAX.
+- Option *alg:numericalemphasis*.
+- Handling Ctrl-C correctly.
+
+
+## 20250806
+- Updated to Xpress 45.01.02 (9.7), which includes
+  bugfixes.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    *pre:feastolrel* both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options *cvt:compl*, *cvt:compl:eps* control
+    complementarity reformulations.
+
+
+## 20250617
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+## 20250531
+- Updated to Xpress 45.01.01 (9.6) that includes:
+  - Pre root parallel heuristics phase.
+  - New deterministic measure of algorithmic work.
+  - Performance improvements.
+- Option *lp:opttol* (*opttol*), synonym for previous
+  *lp:optimalitytolerance*.
+- Added keywords *lim:work*, *lim:prerootwork* and *mip:prerooteffort*.
+- Added value *3* to *pre:domcol*.
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250426
+- Relinked with XPRESS 44.01.04.
+- Non-linear constraints are now passed via the expression
+  API, that can improve performance.
+- Changes in MP
+  - Option *cvt:qp2pass* (default even faster parsing
+    of quadratics)
+
+
+## 20250329
+- Changes in MP:
+  - Option *cvt:multoutcard* to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+- Renamed option poolnbest to sol:poollimit.
+	Old name kept as synonym.
+
+
+## 20250308
+- Fix several option descriptions.
+- Default to natively accept nonlinear expressions
+  since they seem to perform well in v9.5.
+  Full XPRESS license required.
+
+
+## 20241227
+- Fix acceptance options for nonlinear formulas
+  (still disabled by default.)
+- Option *pre:solve_nlp*
+- Updated to Xpress 9.5 (44.01.01):
+  - Performance improvements in the Global optimization engine
+    and in the MIP solver
+  - New column-based presolve eliminations to reduce model size when free variables are present in the model instance.
+  - In models with big-M coefficients, additional tightening of coefficients is performed.  
+  - Knapsack cover inequalities are now strengthened by using superadditive lifting.
+
+
+## 20240823
+- Updated to Xpress 43.01.03
+- Added hybrid gradient algorithm (set *bar:alg* to 4)
+- Option *bar:cpuplatform* defaults to -2. To replicate the previous
+  versions behaviour, set to -1.
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+  - *obj:multi=2* forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240606
+- Fix *mip:basis* (post-solving as fixed MIP),
+	although fix + resolve from AMPL can be faster.
+- Fix reporting infeasibility with *obj:multi=1*.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240529
+- *Multi-objective emulator*
+  - All flat MP solvers support multi-objective mode (*obj:multi=1*),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+  - [BREAKING] Default intuitive handling of .objweight,
+    see option *obj:multi:weight*, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged options *report_times* and *timing*; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+  
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use the solver's
+    native PL functions or MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- Native handling of POW(x, INT).
+  - Power expressions with positive integer exponent
+    are passed natively to the solvers accepting them,
+    vs previously quadratic or linear reformulation.
+- Option *report_times*.
+- Unused *acc:* options.
+  - The constraint acceptance options *acc:...*
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
+## 20240312
+- Updated Xpress to 42.01.5
+- *Xpress Global Solver*
+  - Native implementation of most supported non-linear
+    functions. Not enabled by default.
+
+
+## 20240306
+- *Xpress Global Solver*
+  - Apply global (MI)NLP solver for non-convex
+    non-linear models.
+
+
 ## 20240115
 - *Solve result codes*
   - List codes by running (solver) -!

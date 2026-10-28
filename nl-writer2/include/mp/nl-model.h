@@ -65,8 +65,8 @@ struct NLSuffix {
 
   /// operator<
   bool operator<(const NLSuffix& s) const {
-    return std::make_pair(name_, kind_)
-        < std::make_pair(s.name_, s.kind_);
+    return std::make_pair(name_, kind_&3)
+        < std::make_pair(s.name_, s.kind_&3);
   }
 };
 
@@ -81,9 +81,10 @@ public:
   { return this->insert(suf).second; }
 
   /// Find suffix.
-  /// @return NLSuffix*, nullptr if not found.
+  /// @param k: kind (only the first 2 bits are used.)
+  /// @return NLSuffix*, nullptr iff not found.
   const NLSuffix* Find(const std::string& nm, int k) const {
-    NLSuffix tmp {nm, {}, k};
+    NLSuffix tmp {nm, {}, k&3};
     auto it = this->find(tmp);
     return (this->end()!=it) ? &*it : nullptr;
   }
@@ -91,6 +92,7 @@ public:
   /// Expose size, empty
   using Base::size;
   using Base::empty;
+  using Base::clear;
 
   /// Expose begin, end
   using Base::begin;
@@ -189,12 +191,15 @@ public:
   void SetDualWarmstart(NLW2_SparseVector_C ini_y)
   { ini_y_ = ini_y; }
 
-  /// Add suffix.
+  /// Add suffix, e.g., basis statuses.
   /// @return true iff new suffix added (vs replaced.)
   /// @note SOS constraints can be modeled as suffixes
   ///   for some AMPL solvers.
-  bool AddSuffix(NLSuffix suf)
-  { return suffixes_.Add(std::move(suf)); }
+  bool AddSuffix(NLSuffix suf) {
+    assert(
+          (size_t)SufSize(suf.kind_) == suf.values_.size());
+    return suffixes_.Add(std::move(suf));
+  }
 
   /// Information exported by WriteNL()
   struct PreprocessData {
@@ -264,6 +269,15 @@ public:
   { return ini_y_; }
   /// Suffixes
   const NLSuffixSet Suffixes() const { return suffixes_; }
+
+protected:
+  int SufSize(int kind) const {
+    switch (kind&3) {
+    case 0: return NumCols();
+    case 1: return NumRows();
+    default: return 1;         // objectives / problem
+    }
+  }
 
 private:
   const char* prob_name_ {"mp::NLModel"};

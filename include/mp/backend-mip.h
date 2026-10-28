@@ -22,8 +22,16 @@
 #ifndef MIPBACKEND_H_
 #define MIPBACKEND_H_
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <limits>
+#include <vector>
+
 #include "mp/common.h"
 #include "mp/backend-std.h"
+#include "mp/backend-plateau-state.h"
+
 
 namespace mp {
 
@@ -47,10 +55,12 @@ struct IIS {
 /// Sensitivity ranges (postsolved)
 struct SensRanges {
   std::vector<double>
-    varlblo, varlbhi, varublo, varubhi,
-    varobjlo, varobjhi,
-    conrhslo, conrhshi,                   // for rhs-constraints
-    conlblo, conlbhi, conublo, conubhi;   // for range constraints
+      varlblo, varlb, varlbhi,         // varlb/ub, conlb/ub/rhs not needed
+      varublo, varub, varubhi,
+      varobjlo, varobj, varobjhi,      // varobj is compulsory
+      conrhslo, conrhs, conrhshi,      // for rhs-constraints
+      conlblo, conlb, conlbhi,
+      conublo, conub, conubhi;         // for range constraints
 };
 
 
@@ -110,19 +120,23 @@ public:
   { MP_UNSUPPORTED("MIPBackend::SetBasis"); }
   /**
   * General LP warm start, e.g.,
-  * set primal/dual initial guesses for continuous case.
+  * set primal+dual initial guesses for continuous case.
   * The specific Backend should
   * presolve the values if needed.
+  *
+  * @note Only called when both primal and dual initial guesses
+  *   are provided. Thus, use MIPSTART for primal-only
+  *   starts (MIP, NLP).
   **/
   DEFINE_STD_FEATURE( WARMSTART )
   ALLOW_STD_FEATURE( WARMSTART, false )
   virtual void AddPrimalDualStart(Solution )
   { MP_UNSUPPORTED("MIPBackend::AddPrimalDualStart"); }
   /**
-  * MIP warm start.
+  * Primal-only (MIP / NLP) warm start.
   * Provides solution hints (dense vector),
   * as well as sparsity pattern (dense 0-1 vector),
-  * allowing partial MIP warm start.
+  * allowing partial MIP / NLP warm start.
   * Presolve the values if needed.
   **/
   DEFINE_STD_FEATURE( MIPSTART )
@@ -180,6 +194,39 @@ public:
   **/
   DEFINE_STD_FEATURE( FIX_MODEL )
   ALLOW_STD_FEATURE( FIX_MODEL, false )
+  /// Whether the driver implements the fixed-model operation by emulation.
+  virtual bool IsFixedModelEmulated() const { return false; }
+  virtual bool FixedModelReady() const { return true; }
+  virtual const char* FixedModelIterationLimitHelp() const {
+    return "Iteration limit for the fixed-model solve only. -1 (default) uses "
+           "the solver default. For emulation, 0 skips the supplementary solve.";
+  }
+  /**
+  * Stop the MIP search once the incumbent objective (and, if
+  * PLATEAU_STOP_BOUND is also enabled, the absolute/relative MIP gap)
+  * has not improved enough for mip:plateautime seconds.
+  * Implement by registering, in one override of SetupPlateauCallbacks(),
+  * the solver's native new-incumbent callback and any other native
+  * callback(s) needed to obtain the current gap, and from them call:
+  * - ReportIncumbentForPlateau(objVal) with each new incumbent
+  *   objective value;
+  * - ReportGapForPlateau(absgap, relgap) with the current absolute and
+  *   relative MIP gap, whenever available (only meaningful together
+  *   with PLATEAU_STOP_BOUND: derive both from whatever
+  *   incumbent/bound values the native API provides, e.g.
+  *   absgap=|obj-bound|, relgap=absgap/|obj|, unless the solver already
+  *   computes them, like HiGHS's mip_gap);
+  * - CheckTimeoutForPlateau() from any other periodic/polling callback
+  *   that doesn't have a fresh incumbent or gap value to report (e.g.
+  *   Gurobi's GRB_CB_POLLING), just to keep checking the shared clock.
+  * If any of these return true, terminate the native solve right there.
+  **/
+  DEFINE_STD_FEATURE( PLATEAU_STOP )
+  ALLOW_STD_FEATURE( PLATEAU_STOP, false )
+  DEFINE_STD_FEATURE ( PLATEAU_STOP_BOUND )
+  ALLOW_STD_FEATURE( PLATEAU_STOP_BOUND, false )
+  virtual void SetupPlateauCallbacks()
+  { MP_UNSUPPORTED("MIPBackend::SetupPlateauCallbacks"); }
 
 
   ////////////////////////////////////////////////////////////////////////////
@@ -196,6 +243,8 @@ public:
   using BaseBackend::ReportDblSuffix;
 
   void InputExtras() override {
+    if (!nPlateauSetups_++)
+      plateauState_.SaveOptions();        // before native MO options
     BaseBackend::InputExtras();
     InputMIPExtras();
   }
@@ -204,8 +253,10 @@ public:
     if (lazy_user_cuts())
       InputLazyUserCuts();
     InputStartValues();
-    if (priorities())
-      VarPriorities( ReadSuffix(suf_varpriority) );
+    if (priorities()) {
+      if (auto pri_array = ReadSuffix(suf_varpriority))
+        VarPriorities( pri_array );
+    }
   }
 
   virtual void InputLazyUserCuts() {
@@ -241,10 +292,11 @@ public:
     sol0.dual = this->InitialDualValues();
     bool haveInis = sol0.primal.size() && sol0.dual.size();
     if (haveInis && (
-          2==warmstart() ||
+          2<=warmstart() ||
           (1==warmstart() && !useBasis))) {
       AddPrimalDualStart(sol0);
-      useBasis = false;
+      if ( 2==warmstart() )  // Why should we submit only the warmstart?
+        useBasis = false;
       if (debug_mode()) {                 // Report received initials
         ReportSuffix(suf_testvarini, sol0.primal); // Should we check that
         ReportSuffix(suf_testconini, sol0.dual);   // Impl uses them?
@@ -289,7 +341,7 @@ public:
     if (IsMIP())
       CalculateAndReportMIPGap();
     ReportBestDualBound();
-    if (sensitivity())
+    if (sensitivity() && (!IsMIP() || FixedModelReady()))
       ReportSensitivity();
   }
 
@@ -314,63 +366,110 @@ public:
     }
   }
 
+  /// MIP gap, dual bound
+  void RecordMOPassMIPStats(MultiobjPassStats& stats) override {
+    if (IMPL_HAS_STD_FEATURE( RETURN_MIP_GAP ))
+      this->RecordMOPassValue(stats.objpass_mipgap_, MIPGap());
+    if (IMPL_HAS_STD_FEATURE( RETURN_BEST_DUAL_BOUND ))
+      this->RecordMOPassValue(stats.objpass_objbound_, BestDualBound());
+  }
+
+
   virtual void CalculateAndReportIIS() {
-    if (( this->IsProblemInfOrUnb() ||
+    if (( this->IsProblemInfeasible() ||
                this->IsProblemIndiffInfOrUnb() ) &&
         GetMIPOptions().exportIIS_) {
-      ComputeIIS();
+      try {
+        ComputeIIS();
+      } catch (const std::exception& exc) {
+        this->AddWarning("IIS_COMPUTE",   // Can add warning before SOL output
+                   std::string("Error computing IIS: ")
+                       + exc.what());
+      }
+      this->SetStatus( this->GetSolveResult() );
 
-      auto iis = GetIIS();
-
-      ReportSuffix(sufIISCon, iis.coniis);
-      ReportSuffix(sufIISVar, iis.variis);
+      if (this->IsProblemInfeasible()) {      // can be unbounded
+        auto iis = GetIIS();
+        ReportSuffix(sufIISCon, iis.coniis);
+        ReportSuffix(sufIISVar, iis.variis);
+      }
     }
   }
 
   virtual void CalculateAndReportMIPGap() {
-    std::vector<double> dbl(1);
-    if (1 & GetMIPOptions().returnMipGap_) {
-      dbl[0] = MP_DISPATCH( MIPGap() );
-      ReportSuffix(sufRelMipGapObj, dbl);
-      ReportSuffix(sufRelMipGapProb, dbl);
+    double gaprel[] = {0.0};
+    double gapabs[] = {0.0};
+    if (1 & GetMIPOptions().returnMipGap_
+        || !(GetMIPOptions().returnMipGap_ & 4)) {
+      try {
+        gaprel[0] = MP_DISPATCH( MIPGap() );
+        if (1 & GetMIPOptions().returnMipGap_) {
+          this->ReportFirstSuffixValue(sufRelMipGapObj, gaprel[0]);
+          ReportSuffix(sufRelMipGapProb, gaprel);
+        }
+      } catch (const std::exception& exc) {
+        this->AddWarning(".relmipgap", exc.what());
+      }
     }
-    if (2 & GetMIPOptions().returnMipGap_) {
-      dbl[0] = MP_DISPATCH( MIPGapAbs() );
-      ReportSuffix(sufAbsMipGapObj, dbl);
-      ReportSuffix(sufAbsMipGapProb, dbl);
+    if (2 & GetMIPOptions().returnMipGap_
+        || !(GetMIPOptions().returnMipGap_ & 4)) {
+      try {
+        gapabs[0] = MP_DISPATCH( MIPGapAbs() );
+        if (2 & GetMIPOptions().returnMipGap_) {
+          this->ReportFirstSuffixValue(sufAbsMipGapObj, gapabs[0]);
+          ReportSuffix(sufAbsMipGapProb, gapabs);
+        }
+      } catch (const std::exception& exc) {
+        this->AddWarning(".absmipgap", exc.what());
+      }
     }
     if (!(GetMIPOptions().returnMipGap_ & 4)) {
-      double absMIPGap = MP_DISPATCH(MIPGapAbs());
-      if(absMIPGap > 0. && absMIPGap < MP_DISPATCH(Infinity()))
+      if(gapabs[0] > 0. && gapabs[0] < MP_DISPATCH(Infinity()))
         BaseBackend::AddToSolverMessage(
               fmt::format("absmipgap={}, relmipgap={}",
-                          absMIPGap, MP_DISPATCH(MIPGap())));
+                          gapabs[0], gaprel[0]));
     }
   }
 
   virtual void ReportBestDualBound() {
     if (GetMIPOptions().returnBestDualBound_) {
-      std::vector<double> dbl(1, MP_DISPATCH( BestDualBound() ));
-      ReportSuffix(sufBestBoundObj, dbl);
-      ReportSuffix(sufBestBoundProb, dbl);
+      try {
+        std::vector<double> dbl(1, MP_DISPATCH( BestDualBound() ));
+        this->ReportFirstSuffixValue(sufBestBoundObj, dbl[0]);
+        ReportSuffix(sufBestBoundProb, dbl);
+      } catch (const std::exception& exc) {
+        this->AddWarning(".bestbound", exc.what());
+      }
     }
   }
 
   virtual void ReportSensitivity() {
     SensRanges sensr = GetSensRanges();
     ReportSuffix( {"senslbhi", suf::Kind::VAR}, sensr.varlbhi );
+    // ReportSuffix( {"senslb", suf::Kind::VAR}, sensr.varlb );
     ReportSuffix( {"senslblo", suf::Kind::VAR}, sensr.varlblo );
     ReportSuffix( {"sensubhi", suf::Kind::VAR}, sensr.varubhi );
+    // ReportSuffix( {"sensub", suf::Kind::VAR}, sensr.varub );
     ReportSuffix( {"sensublo", suf::Kind::VAR}, sensr.varublo );
     ReportSuffix( {"sensobjhi", suf::Kind::VAR}, sensr.varobjhi );
+    ReportSuffix( {"up", suf::Kind::VAR}, sensr.varobjhi );   // CPLEXASL
+    ReportSuffix( {"sensobj", suf::Kind::VAR}, sensr.varobj );
+    ReportSuffix( {"current", suf::Kind::VAR}, sensr.varobj );
     ReportSuffix( {"sensobjlo", suf::Kind::VAR}, sensr.varobjlo );
+    ReportSuffix( {"down", suf::Kind::VAR}, sensr.varobjlo );
     ReportSuffix( {"sensrhshi", suf::Kind::CON}, sensr.conrhshi );
+    ReportSuffix( {"up", suf::Kind::CON}, sensr.conrhshi );
+    // ReportSuffix( {"sensrhs", suf::Kind::CON}, sensr.conrhs );
     ReportSuffix( {"sensrhslo", suf::Kind::CON}, sensr.conrhslo );
+    ReportSuffix( {"down", suf::Kind::CON}, sensr.conrhslo );
     ReportSuffix( {"senslbhi", suf::Kind::CON}, sensr.conlbhi );
+    // ReportSuffix( {"senslb", suf::Kind::CON}, sensr.conlb );
     ReportSuffix( {"senslblo", suf::Kind::CON}, sensr.conlblo );
     ReportSuffix( {"sensubhi", suf::Kind::CON}, sensr.conubhi );
+    // ReportSuffix( {"sensub", suf::Kind::CON}, sensr.conub );
     ReportSuffix( {"sensublo", suf::Kind::CON}, sensr.conublo );
   }
+
 
   ////////////////////////////////////////////////////////////
   /////////////////// MIP Backend options ////////////////////
@@ -379,7 +478,7 @@ private:
   struct Options {
     int lazy_user_cuts_ = 3;
     int basis_=3;
-    int warmstart_=1;
+    int warmstart_=3;
     int importPriorities_=1;
     int rays_=3;
     int exportIIS_=0;
@@ -387,8 +486,14 @@ private:
     int returnBestDualBound_=0;
     int solnSens_=0;
     int fixModel_=0;
+    double fixedTimeLimit_ = -1;
+    int fixedIterLimit_ = -1;
   };
   Options mipStoredOptions_;
+
+  PlateauState plateauState_;
+  int nPlateauSetups_ {0};
+
 
 protected:
   const Options& GetMIPOptions() const { return mipStoredOptions_; }
@@ -437,11 +542,127 @@ protected:
           GetMIPOptions().fixModel_ : 0;
   }
 
+  double fixed_model_time_limit() const { return GetMIPOptions().fixedTimeLimit_; }
+  int fixed_model_iter_limit() const { return GetMIPOptions().fixedIterLimit_; }
+
+  double plateau_time() const {
+    return IMPL_HAS_STD_FEATURE(PLATEAU_STOP) ?
+               plateauState_.opts_.plateau_time_ : 0.0;
+  }
+
+  /// Whether the plateau stopping logic should be armed for this solve
+  bool plateau_active() const
+  { return plateau_time() > 0.0; }
+
+  int plateau_get_current_objective() const {
+    assert(n_current_pass_ >= 0);
+    return n_current_pass_;
+  }
+
+  void plateau_set_current_objective(int objn, int nobjs) {
+    // When setting the current objective in a native solve,
+    // also update the per-pass overrides from the options
+    // NOTE: check pass vs objective number for objectives with
+    // equal priority
+    // auto passes = pSetter->GetPassesWithOptions();
+
+    assert(nPlateauSetups_);    // before we reset options from dflt
+
+    n_current_pass_ = objn;
+    plateauState_.SetCurrentObjective(objn);
+    // If nobjs==-1, then we are in a MO-emulator solve, so the options
+    // are set while preparing the iteration
+    if (nobjs == -1) return;
+
+    auto pSetter = this->GetObjOptionSetter();
+    double v;
+    int iv;
+    int pass = objn;
+
+
+    static const std::unordered_map<std::string, double PlateauState::Options::*>
+        dblOptions = {
+            {"plateautime", &PlateauState::Options::plateau_time_},
+            {"plateauabstol", &PlateauState::Options::abstol_},
+            {"plateaureltol", &PlateauState::Options::reltol_},
+            {"plateauwarmup", &PlateauState::Options::warmup_time_},
+            {"plateauwarmuprelgap", &PlateauState::Options::warmup_relgap_},
+            {"plateauwarmupabsgap", &PlateauState::Options::warmup_absgap_},
+            {"plateaurelgaptol", &PlateauState::Options::relmipgap_tol_},
+            {"plateauabsgaptol", &PlateauState::Options::absmipgap_tol_}
+    };
+    static const std::unordered_map<std::string, int PlateauState::Options::*>
+        intOptions = {
+            {"plateaulog", &PlateauState::Options::log_}
+    };
+    for (const auto& [optName, member] : dblOptions) {
+      if (pSetter->GetPassOptionValueDbl(pass, optName.c_str(), v))
+        plateauState_.opts_.*member = v;
+    }
+    for (const auto& [optName, member] : intOptions)
+      if (pSetter->GetPassOptionValueInt(pass, optName.c_str(), iv)) {
+        plateauState_.opts_.*member = iv;
+      }
+  }
+
+  /// Whether to print plateau status on every callback report
+  bool plateau_log() const
+  { return 0!=plateauState_.opts_.log_; }
+
+  /// To be called by the driver's native incumbent callback with the
+  /// new incumbent objective value.
+  /// Return true if the solve should be terminated now (plateau reached).
+  bool ReportIncumbentForPlateau(double objVal) {
+    return plateauState_.ReportIncumbent(objVal);
+  }
+
+  /// To be called by the driver's native callback with the current
+  /// (relative) MIP gap. Uses mip:plateauabsgaptol and mip:plateaurelgaptol as 
+  /// tolerances for the gap value(s)
+  /// Return true if the solve should be terminated now (plateau reached).
+  bool ReportGapForPlateau(double absgap, double relgap) {
+    return plateauState_.ReportGap(absgap, relgap);
+  }
+
+  /// Can be called in auxiliary callbacks to increase the granularity
+  /// of the plateau stopping logic. Returns true if the solve should be
+  /// stopped (only checks if the time since the last sufficient improvement 
+  /// has exceeded mip:plateautime).
+  bool CheckTimeoutForPlateau() {
+	  return plateauState_.CheckTimeout();
+  }
+
+private:
+  int n_current_pass_ {-1};
+
 
 public:
   void InitStandardOptions() override {
     BaseBackend::InitStandardOptions();
     InitMIPOptions();
+  }
+
+  /// Arm the plateau-stop callback(s), if requested and supported,
+  /// alongside the standard timer/interrupter setup.
+  void SetupTimerAndInterrupter() override {
+    BaseBackend::SetupTimerAndInterrupter();
+  }
+
+  void SetupPlateau() override {
+    if (plateau_active()) {
+      SetupPlateauCallbacks();
+      if (this->GetMM().IsMOEmulationOn())
+        // Emulated MO: this pass's per-objective options are applied
+        // separately, while preparing the iteration (SetMultiObjectiveOptions()).
+        plateau_set_current_objective(0, -1);
+      else
+        // Native multiobj (or plain single-objective solve): there is
+        // no separate per-iteration setup call, so pass 0's options
+        // (if overridden) must be applied right away. Any later
+        // passes are picked up by the driver's native per-objective
+        // callback invoking plateau_set_current_objective() itself.
+        plateau_set_current_objective(0, 0);
+    }
   }
 
   using BaseBackend::AddStoredOption;
@@ -459,6 +680,15 @@ protected:
   const mp::OptionValueInfo values_01_noyes_1default_[2] = {
     {     "0", "No", 0 },
     {     "1", "Yes (default)", 1}
+  };
+
+  const mp::OptionValueInfo values_lpwarmstart_[4] = {
+      {     "-1", "Default (equivalent to 2 for PDHG, to 1 otherwise)", -1 },
+      {     "0", "Ignore any warm start information (generally).", 0 },
+      {     "1", "Use warm start information to solve the original, unpresolved problem.", 1},
+      {     "2", "If presolve is enabled, use warm start to solve the presolved problem. "
+       "Otherwise, setting 2 prioritizes start vectors (primal/dual), while "
+       "setting 1 prioritizes basis statuses.", 2 }
   };
 
   const mp::OptionValueInfo values_autonoyes_[3] = {
@@ -488,10 +718,11 @@ protected:
     {     "3", "Both (1 + 2 = default)", 3}
   };
 
-  const mp::OptionValueInfo values_warmstart_[3] = {
-    {     "0", "No", 0 },
-    {     "1", "Yes (for LP: if there is no incoming alg:basis) (default)", 1},
-    {     "2", "Yes (for LP: ignoring the incoming alg:basis, if any.)", 2}
+  const mp::OptionValueInfo values_warmstart_[4] = {
+      {     "0", "No", 0 },
+      {     "1", "Yes (for LP: if there is no incoming alg:basis)", 1},
+      {     "2", "Yes (for LP: omitting the incoming alg:basis, if any)", 2},
+      {     "3", "Yes (for LP: together with the incoming alg:basis, if any; default).", 3}
   };
 
   const mp::OptionValueInfo values_rays_[4] = {
@@ -516,8 +747,13 @@ protected:
 
     if (IMPL_HAS_STD_FEATURE( BASIS ))
       AddStoredOption("alg:basis basis",
-                      "Whether to use or return a basis:\n "
-                      "\n.. value-table::\n",
+                      "Whether to use and/or return a basis for LP models "
+                      "(variable/constraint suffixes .(s)status):\n"
+                      "\n.. value-table::\n"
+                      "\n"
+                      "See alg:start for interaction with the LP warmstart.\n"
+                      "\n"
+                      "See also mip:basis and qcp:dual (for some solvers).",
                       GetMIPOptions().basis_, values_basis_);
 
     if (IMPL_HAS_STD_FEATURE( WARMSTART ))
@@ -536,13 +772,15 @@ protected:
 
     if (IMPL_HAS_STD_FEATURE( RAYS ))
       AddStoredOption("alg:rays rays",
-                      "Whether to return suffix .unbdd if the objective is unbounded "
-                      "or suffix .dunbdd if the constraints are infeasible:\n"
+                      "Whether to return suffix .unbdd (unbounded ray) "
+                      "if the objective is unbounded "
+                      "or suffix .dunbdd (Farkas dual) if the constraints "
+                      "are infeasible:\n"
                       "\n.. value-table::\n",
                       GetMIPOptions().rays_, values_rays_);
 
     if (IMPL_HAS_STD_FEATURE( IIS ))
-      AddStoredOption("alg:iisfind iisfind iis",
+      AddStoredOption("iis:find iisfind iis alg:iisfind",
                       "Whether to find and export an IIS. "
                       "Default = 0 (don't export).",
                       GetMIPOptions().exportIIS_);
@@ -578,31 +816,113 @@ protected:
                       "Whether to return suffixes for solution sensitivities, i.e., "
                       "ranges of values for which the optimal basis remains optimal "
                       "(note that the variable and objective values can change):\n"
-                        "\n"
-                        "|  0 - No (default)\n"
-                        "|  1 - Yes:  suffixes returned on variables are\n"
-                        "|    .sensobjlo = smallest objective coefficient\n"
-                        "|    .sensobjhi = greatest objective coefficient\n"
-                        "|    .senslblo = smallest variable lower bound\n"
-                        "|    .senslbhi = greatest variable lower bound\n"
-                        "|    .sensublo = smallest variable upper bound\n"
-                        "|    .sensubhi = greatest variable upper bound;\n\n"
+                      "\n"
+                      "|  0 - No (default)\n"
+                      "|  1 - Yes:  suffixes returned on variables are\n"
+                      "|    .sensobjlo = smallest objective coefficients\n"
+                      "|    .down      = same as .sensobjlo\n"
+                      "|    .sensobj   = current objective coefficients\n"
+                      "|    .current   = same as .sensobj\n"
+                      "|    .sensobjhi = greatest objective coefficients\n"
+                      "|    .up        = same as .sensobjhi\n"
+                      "|    .senslblo  = smallest variable lower bounds\n"
+                      // "|    .senslb   = current variable lower bounds\n"
+                      "|    .senslbhi  = greatest variable lower bounds\n"
+                      "|    .sensublo  = smallest variable upper bounds\n"
+                      // "|    .sensub   = current variable upper bounds\n"
+                      "|    .sensubhi  = greatest variable upper bounds;\n\n"
                       " suffixes for all constraints are\n"
-                      "|    .senslblo = smallest constraint lower bound\n"
-                      "|    .senslbhi = greatest constraint lower bound\n"
-                      "|    .sensublo = smallest constraint upper bound\n"
-                      "|    .sensubhi = greatest constraint upper bound;\n\n"
+                      "|    .senslblo = smallest constraint lower bounds\n"
+                      // "|    .senslb   = current constraint lower bounds\n"
+                      "|    .senslbhi = greatest constraint lower bounds\n"
+                      "|    .sensublo = smallest constraint upper bounds\n"
+                      // "|    .sensub   = current constraint upper bounds\n"
+                      "|    .sensubhi = greatest constraint upper bounds;\n\n"
                       " suffixes for one-sided constraints only:\n"
-                      "|    .sensrhslo = smallest right-hand side value\n"
-                      "|    .sensrhshi = greatest right-hand side value."
+                      "|    .sensrhslo = smallest right-hand side values\n"
+                      "|    .down      = same as .sensrhslo\n"
+                      // "|    .sensrhs   = current right-hand side values\n"
+                      "|    .sensrhshi = greatest right-hand side values.\n"
+                      "|    .up        = same as .sensrhshi.\n"
+                      "\n"
+                      "The suffixes correspond to the AMPL solver model, "
+                      "command 'solexpand'. For easiest interpretation, "
+                      "disable AMPL presolve, 'option presolve 0;'"
                       ,
                     GetMIPOptions().solnSens_);
 
-    if (IMPL_HAS_STD_FEATURE( FIX_MODEL ))
+    if (IMPL_HAS_STD_FEATURE( FIX_MODEL )) {
       AddStoredOption("mip:basis fixmodel mip:fix",
-                      "Whether to compute duals / basis / sensitivity for MIP models:\n"
-                      "\n.. value-table::\n",
+                      (std::string("Whether to compute duals / basis / sensitivity for MIP models. ") +
+                      (IsFixedModelEmulated() ?
+                       "Emulated by fixing integer variables to an incumbent and solving "
+                       "a continuous model. Currently supports linear algebraic models only "
+                       "(no SOS, piecewise-linear, logical, or general constraints). " : "") +
+                      "\n\n.. value-table::\n").c_str(),
                     GetMIPOptions().fixModel_, values_01_noyes_0default_);
+      AddStoredOption("mip:basis:timelimit",
+                      "Time limit in seconds for the fixed-model solve only. "
+                      "-1 (default) uses the solver default, independently of the MIP time limit. "
+                      "For emulation, 0 skips the supplementary solve.",
+                      GetMIPOptions().fixedTimeLimit_, -1.0, DBL_MAX);
+      AddStoredOption("mip:basis:iterlimit", FixedModelIterationLimitHelp(),
+                      GetMIPOptions().fixedIterLimit_, -1, INT_MAX);
+    }
+
+    if (IMPL_HAS_STD_FEATURE( PLATEAU_STOP )) {
+      AddStoredOption("mip:plateau:time mip:plateautime plateautime",
+        "Stop the MIP search if the incumbent objective (and, if "
+        "mip:plateauabsgaptol/mip:plateaurelgaptol are set, the MIP gap) "
+        "has not improved by at least mip:plateauabstol or "
+        "mip:plateaureltol for this many seconds. Default 0 (disabled).",
+        plateauState_.opts_.plateau_time_);
+
+      AddStoredOption("mip:plateau:abstol mip:plateauabstol plateauabstol",
+        "Minimum absolute objective improvement to reset the "
+        "mip:plateautime timer. Default 0 (any improvement resets the timer).",
+        plateauState_.opts_.abstol_);
+
+      AddStoredOption("mip:plateau:reltol mip:plateaureltol plateaureltol",
+        "Minimum relative objective improvement, as a fraction of the current "
+        "value, to reset the mip:plateautime timer. Default 0.",
+        plateauState_.opts_.reltol_);
+
+      AddStoredOption("mip:plateau:warmup mip:plateauwarmup plateauwarmup",
+        "Grace period (in seconds) after the solve starts before "
+        "mip:plateautime is checked. Default 0.",
+        plateauState_.opts_.warmup_time_);
+
+      AddStoredOption("mip:plateau:log mip:plateaulog plateaulog",
+          "Whether to print the current plateau status. Default 0 (silent).",
+          plateauState_.opts_.log_);
+    }
+
+    if (IMPL_HAS_STD_FEATURE( PLATEAU_STOP_BOUND )) {
+        // Only meaningful for solvers that also report gap: an
+        // incumbent-only driver never has a real gap value to offer
+        // these checks, so they'd never do anything for it.
+        AddStoredOption("mip:plateau:warmup:relgap mip:plateauwarmuprelgap plateauwarmuprelgap",
+            "Relative MIP gap to be reached before mip:plateautime is "
+            "checked. Default 0.",
+            plateauState_.opts_.warmup_relgap_);
+
+        AddStoredOption("mip:plateau:warmup:absgap mip:plateauwarmupabsgap plateauwarmupabsgap",
+            "Absolute MIP gap to be reached before mip:plateautime is "
+            "checked. Default 0.",
+            plateauState_.opts_.warmup_absgap_);
+
+        AddStoredOption("mip:plateau:relgaptol mip:plateaurelgaptol plateaurelgaptol",
+            "If set (>0), also track the reported relative MIP gap as progress "
+            "for mip:plateautime: the plateau timer resets whenever the relative "
+            "gap shrinks by at least this amount. Default 0 (disabled).",
+            plateauState_.opts_.relmipgap_tol_);
+
+        AddStoredOption("mip:plateau:absgaptol mip:plateauabsgaptol plateauabsgaptol",
+            "If set (>0), also track the reported absolute MIP gap as progress "
+            "for mip:plateautime: the plateau timer resets whenever the absolute "
+            "gap shrinks by at least this amount. Default 0 (disabled).",
+            plateauState_.opts_.absmipgap_tol_);
+    }
   }
 
 
@@ -635,15 +955,18 @@ private:
 
   const SuffixTable iis_table =
       "\n"
-      "0	non	not in the iis\n"
-      "1	low	at lower bound\n"
-      "2	fix	fixed\n"
-      "3	upp	at upper bound\n"
-      "4	mem	member\n"
-      "5	pmem	possible member\n"
-      "6	plow	possibly at lower bound\n"
-      "7	pupp	possibly at upper bound\n"
-      "8	bug\n";
+      "0\tnon\tnot in the iis\n"
+      "1\tlow\tlower bound in the iis\n"
+      "2\tfix\tboth bounds in the iis\n"
+      "3\tupp\tupper bound in the iis\n"
+      "4\tmem\tmember\n"
+      "5\tpmem\tpossible member\n"
+      "6\tplow\tpossibly lower bound\n"
+      "7\tpupp\tpossibly upper bound\n"
+      "8\tbug\n"
+      "9\tintvar\tinteger variable\n"
+      "10\tsemi\tsemi-continuous or semi-integer variable\n"
+      ;
   const SuffixDef<int> sufIISCon = { "iis", suf::CON | suf::OUTPUT, iis_table };
   const SuffixDef<int> sufIISVar = { "iis", suf::VAR | suf::OUTPUT, iis_table };
 

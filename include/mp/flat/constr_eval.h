@@ -1,7 +1,7 @@
 #ifndef CONSTR_EVAL_H
 #define CONSTR_EVAL_H
 
-/**
+/*
   * Evaluations and violations
   * of (mainly functional) constraints.
   *
@@ -11,10 +11,12 @@
   * extra API.
   */
 
+#include <type_traits>
 #include <cmath>
 
 #include "constr_functional.h"
 #include "constr_general.h"
+#include "mp/utils-math.h"
 
 namespace mp {
 
@@ -80,6 +82,63 @@ double ComputeValue(const DivConstraint& con, const VarVec& x) {
   return 0.0==std::fabs(divs)
       ? (divt>=0.0 ? INFINITY : -INFINITY)
       : divt / divs;
+}
+
+/// Compute result of the mul constraint.
+template <class VarVec>
+double ComputeValue(const MulConstraint& con, const VarVec& x) {
+  return x[con.GetArguments()[0]] * x[con.GetArguments()[1]];
+}
+
+/// \a v snapped to the nearest integer if within the feasibility
+/// tolerance: the rounding functions jump at integers, and solver
+/// values such as 2.9999999 should evaluate as at 3.
+template <class VarInfo>
+double SnapToInteger(double v, const VarInfo& x) {
+  const auto r = std::round(v);
+  return std::fabs(v - r) <= x.feastol() ? r : v;
+}
+
+/// Compute result of the floor constraint.
+template <class VarInfo>
+double ComputeValue(const FloorConstraint& con, const VarInfo& x) {
+  return std::floor(SnapToInteger(x[con.GetArguments()[0]], x));
+}
+
+/// Compute result of the ceil constraint.
+template <class VarInfo>
+double ComputeValue(const CeilConstraint& con, const VarInfo& x) {
+  return std::ceil(SnapToInteger(x[con.GetArguments()[0]], x));
+}
+
+/// Compute result of the round constraint: ties to even, as AMPL.
+/// Values within the feasibility tolerance of a tie count as the tie.
+template <class VarInfo>
+double ComputeValue(const RoundConstraint& con, const VarInfo& x) {
+  const auto v = x[con.GetArguments()[0]];
+  const auto v2 = std::round(2.0 * v);             // nearest half-integer
+  return std::nearbyint(
+        std::fabs(2.0*v - v2) <= 2.0*x.feastol() ? v2 / 2.0 : v);
+}
+
+/// Compute result of the int div constraint: trunc(x / y)
+template <class VarInfo>
+double ComputeValue(const IntDivConstraint& con, const VarInfo& x) {
+  auto divt = x[con.GetArguments()[0]];
+  auto divs = x[con.GetArguments()[1]];
+  if (0.0==std::fabs(divs))
+    return divt>=0.0 ? INFINITY : -INFINITY;
+  return std::trunc(SnapToInteger(divt / divs, x));
+}
+
+/// Compute result of the mod constraint: x - y * (x div y)
+template <class VarInfo>
+double ComputeValue(const ModConstraint& con, const VarInfo& x) {
+  auto divt = x[con.GetArguments()[0]];
+  auto divs = x[con.GetArguments()[1]];
+  if (0.0==std::fabs(divs))
+    return INFINITY;
+  return divt - divs * std::trunc(SnapToInteger(divt / divs, x));
 }
 
 /// Compute result of the IfThen constraint.
@@ -184,7 +243,25 @@ double ComputeValue(const LogAConstraint& con, const VarVec& x) {
 template <class VarVec>
 double ComputeValue(const PowConstraint& con, const VarVec& x) {
   return std::pow(
-        x[con.GetArguments()[0]], con.GetParameters()[0]);
+      x[con.GetArguments()[0]], x[con.GetArguments()[1]]);
+}
+
+template <class VarVec>
+double ComputeValue(const PowConstExpConstraint& con, const VarVec& x) {
+  return std::pow(
+      x[con.GetArguments()[0]], con.GetParameters()[0]);
+}
+
+template <class VarVec>
+double ComputeValue(const SignpowConstExpConstraint& con, const VarVec& x) {
+  return signpow(
+      x[con.GetArguments()[0]], con.GetParameters()[0]);
+}
+
+template <class VarVec>
+double ComputeValue(const LogisticConstraint& con, const VarVec& x) {
+  return 1.0 / (1.0 +
+                    std::exp(-x[con.GetArguments()[0]]));
 }
 
 /// Compute result of the sin constraint.
@@ -275,15 +352,31 @@ double ComputeValue(
 
 
 
+/// Does the variable vector type tell idealistic vs realistic mode?
+template <class VarVec, class = void>
+struct HasIdealisticFlag : std::false_type { };
+
+/// Specialization: yes
+template <class VarVec>
+struct HasIdealisticFlag<VarVec, std::void_t<
+    decltype(std::declval<const VarVec&>().idealistic())> >
+  : std::true_type { };
+
 /// Compute result of a conditional constraint.
-/// Just return bool(viol(subcon) <= 0).
+/// For the solver's (realistic) values, a non-strict comparison
+/// holds within the feasibility tolerance; otherwise, and for
+/// strict comparisons, exactly (a tolerance would accept
+/// x < c at x == c, see ifthen_var_01 with cmp:eps=0).
 /// This is not used to compute violation.
 template <class Con, class VarVec>
 double ComputeValue(
     const ConditionalConstraint<Con>& con, const VarVec& x) {
-  auto viol = con.GetConstraint().ComputeViolation(x, true);
-  bool ccon_valid = viol.viol_<=0.0;
-  return ccon_valid;
+  constexpr bool f_strict = (2 == Con::kind() || -2 == Con::kind());
+  if constexpr (HasIdealisticFlag<VarVec>::value && !f_strict)
+    if (!x.idealistic())
+      return con.GetConstraint().ComputeViolation(x, false).viol_
+          <= x.feastol();
+  return con.GetConstraint().ComputeViolation(x, true).viol_ <= 0.0;
 }
 
 /// Compute violation of the QuadraticCone constraint.
@@ -330,6 +423,31 @@ Violation ComputeViolation(       // where ax, by >= 0
         by * std::exp(cz / by)};
 }
 
+/// Compute violation of the ExponentialCone constraint.
+template <class VarVec>        // ax >= by exp(cz / (by))
+Violation ComputeViolation(       // where ax, by >= 0
+    const PowerConeConstraint& con, const VarVec& x) {
+  // TODO
+  return {1000.0, 1.0};
+}
+
+/// Compute violation of the ExponentialCone constraint.
+template <class VarVec>        // ax >= by exp(cz / (by))
+Violation ComputeViolation(       // where ax, by >= 0
+    const GeometricConeConstraint& con, const VarVec& x) {
+  // TODO
+  return {1000.0, 1.0};
+}
+
+/// Compute violation of the ExponentialCone constraint.
+template <class VarVec>        // ax >= by exp(cz / (by))
+Violation ComputeViolation(       // where ax, by >= 0
+    const UnaryEncodingConstraint& con, const VarVec& x) {
+  // TODO
+  return {1000.0, 1.0};
+}
+
+
 /// Compute result of the PL constraint.
 template <class VarVec>
 double ComputeValue(const PLConstraint& con, const VarVec& x) {
@@ -351,15 +469,35 @@ double ComputeValue(const PLConstraint& con, const VarVec& x) {
         * (x0-plp.x_[i0-1]) / (plp.x_[i0]-plp.x_[i0-1]));
 }
 
+/// Compute result of a function call.
+template <class VarVec>
+double ComputeValue(const CallConstraint& , const VarVec& ) {
+  double result = std::numeric_limits<double>::has_quiet_NaN ?
+      std::numeric_limits<double>::quiet_NaN() : -INFINITY;
+  // @todo
+  return result;
+}
+
+
+/// Should be here,
+/// after ComputeViolation() is specialized
+/// for some constraints.
+template <class Args, class Params, class Id>
+template <class VarVec>
+Violation
+CustomStaticConstraint<Args, Params, Id>
+::ComputeViolation(const VarVec& x) const
+{ return mp::ComputeViolation(*this, x); }
+
 /// Should be here,
 /// after ComputeViolation() is specialized
 /// for some constraints.
 template <class Args, class Params,
-          class NumOrLogic, class Id>
+         class NumOrLogic, class Id>
 template <class VarVec>
 Violation
-CustomFunctionalConstraint<Args, Params, NumOrLogic, Id>
-::ComputeViolation(const VarVec& x) const
+    CustomFunctionalConstraint<Args, Params, NumOrLogic, Id>
+    ::ComputeViolation(const VarVec& x) const
 { return mp::ComputeViolation(*this, x); }
 
 

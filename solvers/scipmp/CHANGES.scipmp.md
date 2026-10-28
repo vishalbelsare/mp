@@ -2,6 +2,228 @@ Summary of recent updates to SCIP for AMPL
 ==========================================
 
 
+## 20261101
+- 64-bit SCIP parameters (e.g., *lim:nodes*, *lim:totalnodes*,
+  *lim:stallnodes*) accept values above 2^31.
+- Options aligned with SCIP 10.0.2: corrected defaults and ranges
+  (*cut:maxcutsroot* 2000, *cut:minortho*/*cut:minorthoroot* in 0..1
+  with default 0.9, *pre:immrestartfac* and *pre:restartminred* 0.05),
+  texts, and the value tables of *alg:method*/*alg:remethod*
+  (SoPlex has no barrier) and *est:method*.
+- A value rejected by SCIP now aborts with a message naming the AMPL
+  option, the value and the valid range or character set.
+- MP-standard names with the previous spellings as synonyms:
+  *mip:gap*, *mip:gapabs*, *alg:feastol*, *alg:dualfeastol*, *lim:sol*,
+  *tech:outlevnative*; synonyms *nodelim*, *sollim*, *memlim*.
+- New options: *tech:threads* (concurrent solve with that many threads),
+  *alg:concurrent* default -1 (on with *tech:threads* > 1),
+  *alg:emphasis*, *pre:solve*, *lp:scaling* (*pre:scale*),
+  *mip:symmetry*, *tech:clocktype*, *lim:iter* (per LP solve),
+  *lim:rootiter*, *lim:bestobjstop*, *lim:bestbndstop*,
+  cut family frequencies *cut:gomory*, *cut:gomorymi*, *cut:strongcg*,
+  *cut:mir*, *cut:flowcover*, *cut:cover*, *cut:clique*, *cut:zerohalf*,
+  *cut:implied*, *cut:aggregation*, *cut:oddcycle*, *cut:mcf*,
+  *cut:disjunctive*, *cut:rlt*; *tech:optionnative* (any SCIP parameter
+  inline), *tech:optionnativewrite*, *tech:writesolution*.
+- Alternative solutions: *sol:poollimit* was ignored (it set SCIP's
+  counting limit); it now caps the reported pool (default 10).
+  *sol:poolmode* (default 2) enumerates the feasible solutions of
+  integer models with SCIP's solution counting; *sol:poolgap*,
+  *sol:poolgapabs* filter the reported solutions; *ams_stub* accepted.
+- IIS computation (*iis:find*) with the SCIP 10 IIS finder; options
+  *iis:bounds*, *iis:irreducible*, *lim:iistime*, *lim:iisnodes*.
+- *tech:logfile* without *tech:outlev* now writes the full log to the
+  file with a quiet console; the console is quiet whenever the SCIP
+  verbosity is 0 (the concurrent solve printed regardless).
+- Unavailable LP duals (after SCIP presolving) are reported as absent
+  instead of zeros; SCIP's reason is shown with *tech:outlev=1*.
+- Solve results for the primal and dual bound limits (SCIP statuses
+  PRIMALLIMIT, DUALLIMIT).
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+
+
+## 20260526
+- Updated to SCIP 10.0.2 which includes bug fixes and improvements.
+
+
+## 20260414
+- Changes in MP, in particular:
+  - Option *cvt:pre:boundsbest* defaults to making
+    auxiliary subexpression result variables free,
+    unless the result is constant. This allows
+    stronger nonlinear presolve.
+
+
+## 20251210
+- Change in MP: option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+- Updated to SCIP 10.0
+
+
+## 20251021
+- Changes in MP: option *cvt:expr:nlassign*.
+
+
+## 20251015
+- Changes in MP
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options cvt:pre:unnest, cvt:pre:sort).
+  - Option cvt:pre:boundlogarg (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    pre:feastolrel both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options cvt:compl, cvt:compl:eps control
+    complementarity reformulations.
+
+
+## 20250617
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+
+## unreleased
+- Emulate *mip:basis* for linear algebraic MIPs, with separate
+  *mip:basis:timelimit* and *mip:basis:iterlimit* options.
+- Reenable native OR constraint by default
+  (requires marking all variables as integer,
+  even if fixed). See option acc:or.
+- Enable native indicator constraints and cos().
+  Options acc:ind.. and acc:cos.
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250426
+- Relinked with SCIP version 9.2.2
+- Disabled native OR constraint by default
+  - Enabled native AND constraint which seems
+    correct now
+
+
+## 20250426
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250404
+- Fixed:
+  - Option lp:threads
+  - Option lp:presolving
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+- Option sol:poollimit.
+
+
+## 20250308
+- Changes in MP.
+
+
+## 20250204
+- Updated to SCIP 9.2
+- MINLP expression trees (option acc:_expr.)
+	- Using the expression tree API, available since SCIP v8,
+		to model nonlinear expressions. Earlier the expressions
+		were submitted to the solver in a flat form equating
+		an auxiliary variable to each expression.
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240531
+- Updated to SCIP 9.0.1
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+  
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use 
+    MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
 ## 20240221
 - Updated to SCIP 9.0
 

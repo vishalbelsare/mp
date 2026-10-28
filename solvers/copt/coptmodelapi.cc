@@ -2,7 +2,9 @@
 
 namespace mp {
 
-void CoptModelAPI::InitProblemModificationPhase(const FlatModelInfo*) { }
+void CoptModelAPI::InitProblemModificationPhase(const FlatModelInfo* fi) {
+  num_lin_obj_ = fi->GetObjInfo()[0];
+}
 
 void CoptModelAPI::AddVariables(const VarArrayDef& v) {
   std::vector<char> vtypes(v.size());
@@ -14,13 +16,35 @@ void CoptModelAPI::AddVariables(const VarArrayDef& v) {
 }
 
 void CoptModelAPI::SetLinearObjective( int iobj, const LinearObjective& lo ) {
-  if (iobj<1) {
-    COPT_CCALL(COPT_SetObjSense(lp(), 
-                    obj::Type::MAX==lo.obj_sense() ? COPT_MAXIMIZE : COPT_MINIMIZE) );
+  int sense = obj::Type::MAX == lo.obj_sense() ? COPT_MAXIMIZE : COPT_MINIMIZE;
+  if (!iobj)
+    obj_sense0_ampl_ = lo.obj_sense();
+
+  if ((iobj<1) && (num_lin_obj_ <= 1)) {
+    COPT_CCALL(COPT_SetObjSense(lp(), sense ));
+    double zero_out = 0.0;
+    for (int i=NumVars(); i--; )         // Zero out linear part
+      COPT_CCALL(COPT_SetColObj(lp(), 1, &i, &zero_out));
+    COPT_CCALL( COPT_DelQuadObj(lp()) );
+    COPT_CCALL( COPT_DelNLObj(lp()) );
     COPT_CCALL(COPT_SetColObj(lp(), lo.num_terms(),
-                           lo.vars().data(), lo.coefs().data()) );
+                              lo.vars().data(), lo.coefs().data()) );
+    
   } else {
-//    TODO
+    COPT_CCALL(COPT_MultiObjSetColObj(lp(), iobj, lo.num_terms(),
+                                      lo.vars().data(), lo.coefs().data()));
+    // Always set the sense equal to that of the 1st objective,
+    // but modify weight, see #240.
+    assert(obj_sense0_ampl_ >= 0);
+    COPT_CCALL(COPT_MultiObjSetObjSense(lp(), iobj,
+                                        obj_sense0_ampl_ == obj::Type::MAX ?
+                                            COPT_MAXIMIZE : COPT_MINIMIZE));
+    // Weight: can be modified in Backend
+    COPT_CCALL(COPT_MultiObjSetObjParam(lp(), iobj, COPT_MULTIOBJ_WEIGHT,
+                                        obj_sense0_ampl_ == lo.obj_sense() ?
+                                            1.0 : -1.0));
+    // Seems necessary for MultiObjParam in 8.0.3.
+    COPT_CCALL(COPT_MultiObjSetObjConst(lp(), iobj, 0.0));
   }
 }
 
@@ -40,7 +64,7 @@ void CoptModelAPI::SetQuadraticObjective(int iobj, const QuadraticObjective& qo)
 void CoptModelAPI::AddConstraint(const LinConRange& lc) {
 	COPT_CCALL(COPT_AddRow(lp(), lc.size(),
 												 lc.pvars(), lc.pcoefs(), 0,
-												 lc.lb() < -COPT_INFINITY ? -COPT_INFINITY : lc.lb(),
+												 lc.lb() < -COPT_INFINITY ? -COPT_INFINITY: lc.lb(),
 												 lc.ub() > COPT_INFINITY ? COPT_INFINITY : lc.ub(),
 												 lc.name()));
 }
@@ -135,8 +159,321 @@ void CoptModelAPI::AddConstraint(const SOS2Constraint& sos) {
 }
 
 
+void CoptModelAPI::AddGenericCone(int conetype,
+    const int* vars,
+    const double* coeffs,
+    int dim,
+    const char* name) {
+
+    if (conetype ==COPT_EXPCONE_PRIMAL)
+    {
+        if (dim != 3)
+            throw std::runtime_error(
+                "ExponentialConeConstraint must have exactly 3 entries");
+    }
+
+    int coneType[1] = { conetype };
+    int coneBeg[1] = { 0 };
+    int coneCnt[1] = { dim };
+
+    if (std::all_of(coeffs, coeffs+dim, [](double x) { // check if all are 1.0
+        return std::abs(x - 1.0) <= 1e-12;
+        })) {
+
+		// If all coefficients are one, use the shortcut functions:
+        switch(conetype) {
+            case COPT_CONE_QUAD: // quadratic cone
+                COPT_CCALL(COPT_AddCones(lp(), 1, coneType, coneBeg, coneCnt, vars));
+                break;
+            case COPT_CONE_RQUAD: 
+                COPT_CCALL(COPT_AddCones(lp(), 1, coneType, coneBeg, coneCnt, vars));
+                break;
+            case COPT_EXPCONE_PRIMAL:
+                COPT_CCALL(COPT_AddExpCones(lp(), 1, coneType, vars));
+                break;
+            default:
+                throw std::runtime_error("Unsupported cone type");
+		}
+    }
+    // Otherwise use affine cones
+    // General affine case.
+    std::vector<int> rowMatBeg(dim);
+    std::vector<int> rowMatCount(dim, 1);
+    std::vector<double> rowMatConst(dim, 0.0);
+
+    for (int i = 0; i < dim; i++)
+        rowMatBeg[i] = i;
+
+    int ret = COPT_AddAffineCone(lp(), conetype,
+        dim,  // dimension
+        0, NULL, // unused
+        NULL, NULL, NULL, NULL, // PSD data
+        rowMatBeg.data(),
+        rowMatCount.data(),
+        vars, coeffs,
+        rowMatConst.data(),
+        name);
+    if (ret != 0) throw std::runtime_error("COPT_AddAffineCone failed");
+
+
+
+}
+
+void CoptModelAPI::AddConstraint(
+    const QuadraticConeConstraint& qc) {
+    const auto& vars = qc.GetArguments();
+    const auto& coeffs = qc.GetParameters();
+    AddGenericCone(COPT_CONE_QUAD, vars.data(), coeffs.data(),
+        static_cast<int>(vars.size()), qc.GetName());
+}
+
+
+void CoptModelAPI::AddConstraint(
+    const RotatedQuadraticConeConstraint& qc) {
+    const auto& vars = qc.GetArguments();
+    const auto& coeffs = qc.GetParameters();
+    AddGenericCone(COPT_CONE_RQUAD, vars.data(), coeffs.data(),
+        static_cast<int>(vars.size()), qc.GetName());
+}
+
+
+void CoptModelAPI::AddConstraint(const ExponentialConeConstraint& ec) {
+        const auto& vars = ec.GetArguments();
+        const auto& coeffs = ec.GetParameters();
+        AddGenericCone(COPT_EXPCONE_PRIMAL, vars.data(), coeffs.data(),
+            static_cast<int>(vars.size()), ec.GetName());
+}
+
+
+
+
 void CoptModelAPI::FinishProblemModificationPhase() {
 }
 
+/// @warning Does not insert the NL_SUM operator
+template <class MPExpr>
+void CoptModelAPI::AppendLinAndConstTerms(Expr& exp, const MPExpr& ae) {
+  double ct = GetConstTerm(ae);
+  int size = GetLinSize(ae);
+
+  if (ct)
+    exp.addConstant(ct);
+  for (int i = 0; i < size; ++i) {
+    auto linterm = GetLinTerm(ae, i);
+    auto coeff = GetLinCoef(ae, i);
+    if (coeff != 1.0) {
+      exp.addOp(COPT_NL_MULT);
+      exp.addConstant(coeff);
+    }
+    exp.addMembers(linterm);
+  }
+}
+
+NLParams CoptModelAPI::AddExpression(const NLAffineExpression& ae) {
+  NLParams exp;
+  int size =
+      bool(GetConstTerm(ae)) + GetLinSize(ae);
+
+  if (size > 1)
+  {
+    exp.addOp(COPT_NL_SUM);
+    exp.addVar(size);
+  }
+  AppendLinAndConstTerms(exp, ae);
+  return exp;
+}
+
+NLParams CoptModelAPI::AddExpression(const NLQuadExpression& qe) {
+    NLParams quad;
+    int size =
+        bool(GetConstTerm(qe)) + GetLinSize(qe) + GetQuadSize(qe);
+  
+    if (size > 1)
+    {
+        quad.addOp(COPT_NL_SUM);
+        quad.addVar(size);
+    }
+    AppendLinAndConstTerms(quad, qe);
+    for (int i = 0; i < GetQuadSize(qe); ++i) {
+        if (double coef = GetQuadCoef(qe, i)) {
+            if (1.0 != coef) {
+                quad.addOp(COPT_NL_MULT);
+                quad.addConstant(coef);
+            }
+            quad.addOp(COPT_NL_MULT);
+            quad.addMembers(GetQuadTerm1(qe, i));
+            quad.addMembers(GetQuadTerm2(qe, i));
+        }
+    }
+    return quad;
+}
+
+NLParams CoptModelAPI::AddExpression(const AbsExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ABS);
+}
+
+
+NLParams CoptModelAPI::AddExpression(const SinExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_SIN);
+}
+NLParams CoptModelAPI::AddExpression(const CosExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_COS);
+}
+NLParams CoptModelAPI::AddExpression(const TanExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_TAN);
+}
+
+
+NLParams CoptModelAPI::AddExpression(const AsinExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ASIN);
+}
+NLParams CoptModelAPI::AddExpression(const AcosExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ACOS);
+}
+NLParams CoptModelAPI::AddExpression(const AtanExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ATAN);
+}
+
+NLParams CoptModelAPI::AddExpression(const SinhExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_SINH);
+}
+NLParams CoptModelAPI::AddExpression(const CoshExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_COSH);
+}
+NLParams CoptModelAPI::AddExpression(const TanhExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_TANH);
+}
+NLParams CoptModelAPI::AddExpression(const AsinhExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ASINH);
+}
+NLParams CoptModelAPI::AddExpression(const AcoshExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ACOSH);
+}
+NLParams CoptModelAPI::AddExpression(const AtanhExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_ATANH);
+}
+
+
+void CoptModelAPI::SetNLObjective(int i, const NLObjective& nlo) {
+  const auto exp = GetExpression(nlo);
+  if (i == 0)
+  {
+    COPT_CCALL(
+        COPT_SetObjSense(lp(),
+                         obj::Type::MAX == nlo.obj_sense() ?
+                             COPT_MAXIMIZE : COPT_MINIMIZE));
+    SetQuadraticObjective(i, (const QuadraticObjective&)nlo);  // Reuse Lin+QP part
+    COPT_CCALL(COPT_SetNLObj(lp(), exp.nTokens(), exp.nTokenElements(),
+                             exp.tokens(), exp.tokenElements()));
+  }
+  else {
+    MP_RAISE("Multiple non-linear objectives not supported natively. Use multi-objective emulator by setting obj:multi=2");
+  }
+}
+
+
+
+
+void CoptModelAPI::AddConstraint(const NLConstraint& nl) {
+    auto exp = GetExpression(nl);
+    double lhs = GetLower(nl), rhs = GetUpper(nl);
+    char type;
+    double range;
+    double* prange = nullptr;
+   
+    lhs = lhs < -COPT_INFINITY ? -COPT_INFINITY : lhs;
+    rhs = rhs > COPT_INFINITY ? COPT_INFINITY : rhs;
+
+    COPT_CCALL(COPT_AddNLConstr(lp(),
+        exp.nTokens(), exp.nTokenElements(),
+        exp.tokens(), exp.tokenElements(),
+        GetLinSize(nl), GetLinVars(nl), GetLinCoefs(nl),
+                                0, lhs, rhs, 0));
+}
+/*
+* sin2 is
+c0: x3<=0.5
+c1: -inf <= ((-1 * x2) + sin(((2 * x1)))) <= 0
+c2: x3 >= sin(x1)
+o0: maximize x1+x2
+*/
+void CoptModelAPI::AddNLAssign(
+    const NLParams& exp, int var, char sense, const char* name) {
+  double c {-1.0};
+    COPT_CCALL(COPT_AddNLConstr(lp(), exp.nTokens(), exp.nTokenElements(),
+        exp.tokens(), exp.tokenElements(), 1, &var, &c,
+        sense, 0, 0, name));
+   
+
+}
+void CoptModelAPI::AddConstraint(const NLAssignEQ& neq) {
+    NLParams params;
+    params.addMembers(GetExpression(neq));
+
+    AddNLAssign(params, GetVariable(neq), COPT_EQUAL, GetName(neq));
+}
+void CoptModelAPI::AddConstraint(const NLAssignGE& nge) {
+    NLParams params;
+    params.addMembers(GetExpression(nge));
+
+    AddNLAssign(params, GetVariable(nge), COPT_LESS_EQUAL, GetName(nge));
+}
+void CoptModelAPI::AddConstraint(const NLAssignLE& nle) {
+    NLParams params;
+    params.addMembers(GetExpression(nle));
+
+    AddNLAssign(params, GetVariable(nle), COPT_GREATER_EQUAL, GetName(nle));
+}
+
+NLParams CoptModelAPI::AddExpression(const DivExpression& e) {
+    NLParams exp;
+    exp.addOp(COPT_NL_DIV);
+    exp.addMembers(GetArgExpression(e, 0));
+    exp.addMembers(GetArgExpression(e, 1));
+    return exp;
+}
+
+
+
+NLParams CoptModelAPI::AddExpression(const LogExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_LOG);
+}
+
+NLParams CoptModelAPI::AddExpression(const LogAExpression& e) {
+    NLParams exp;
+    exp.addOp(COPT_NL_DIV);
+    exp.addOp(COPT_NL_LOG);
+    auto ex = GetArgExpression(e, 0);
+    exp.addMembers(ex);
+    exp.addOp(COPT_NL_LOG);
+    auto par = GetParameter(e, 0);
+    exp.addConstant(par);
+    return exp;
+
+}
+NLParams CoptModelAPI::AddExpression(const ExpExpression& e) {
+    return CreateExpressionOneArg(e, COPT_NL_EXP);
+}
+
+NLParams CoptModelAPI::AddExpression(const ExpAExpression&e) {
+    // base ^ x = e ^ (x * ln(b)) )
+    NLParams arg;
+    arg.addOp(COPT_NL_EXP);
+    arg.addOp(COPT_NL_MULT);
+    arg.addMembers(GetArgExpression(e, 0));
+    arg.addOp(COPT_NL_LOG);
+    arg.addConstant(GetParameter(e, 0));
+    return arg;
+}
+
+
+
+NLParams CoptModelAPI::AddExpression(const PowConstExpExpression& e) {
+    NLParams arg;
+    arg.addOp(COPT_NL_POW);
+    arg.addMembers(GetArgExpression(e, 0));
+    arg.addConstant(GetParameter(e, 0));
+    return arg;
+}
 
 } // namespace mp

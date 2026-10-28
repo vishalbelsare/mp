@@ -3,12 +3,16 @@ MP library
 ============
 
 MP library is a set of solver drivers and tools recommended to create
+and use with
 new AMPL solver drivers. It provides type-safe and flexible interfaces
 suitable for linear and mixed-integer, non-linear, and
 Constraint Programming solvers. 
 
-Moreover, MP library provides
-a :ref:`lightweight NL writer <write-nl-read-sol>`.
+MP provides supporting tools, such as
+:ref:`automatic solution checker <solution-check>` (built-in to every MP solver),
+a :ref:`Model reformulation explorer <reformulation-graph>`,
+a meta-driver :ref:`MP2NL <mp2nl>`,
+and a :ref:`lightweight NL writer <write-nl-read-sol>`.
 
 MP replaces the previous
 `AMPL Solver Library`__ for solvers not requiring automatic differentiation.
@@ -64,7 +68,7 @@ User documentation
    :maxdepth: 2
    
    Modeling guide <model-guide>
-   Features guide <features-guide>
+   Feature guide <features-guide>
    Solver drivers <drivers>
 
 .. _developerDocumentation:

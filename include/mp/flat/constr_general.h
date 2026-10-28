@@ -1,7 +1,7 @@
 #ifndef CONSTRAINTS_GENERAL_H
 #define CONSTRAINTS_GENERAL_H
 
-/**
+/*
   * Static general constraints
   */
 
@@ -21,10 +21,10 @@ template <class Con>
 class IndicatorConstraint: public BasicConstraint {
 public:
   /// Constraint type name
-  static const std::string& GetTypeName() {
+  static const char* GetTypeName() {
     static std::string name
-      { "IndicatorConstraint[" + Con::GetTypeName() + ']' };
-    return name;
+        { std::string("IndicatorConstraint[") + Con::GetTypeName() + ']' };
+    return name.c_str();
   }
 
   /// Is logical?
@@ -35,11 +35,15 @@ public:
     b_(b), bv_(bv), con_(std::move(con)) { assert(check()); }
   bool check() const { return (b_>=0) && (bv_==0 || bv_==1); }
 
-  /// Getters
+  /// Get the binary var
   int get_binary_var() const { return b_; }
+  /// Get the value for b==value
   int get_binary_value() const { return bv_; }
+  /// Check if value==1
   bool is_binary_value_1() const
   { return 1==get_binary_value(); }
+
+  /// Get the implied constraint, const
   const Con& get_constraint() const { return con_; }
 
   /// Compute violation
@@ -78,11 +82,40 @@ using IndicatorConstraintQuadEQ = IndicatorConstraint<QuadConEQ>;
 /// Typedef indicator<QuadConGE>
 using IndicatorConstraintQuadGE = IndicatorConstraint<QuadConGE>;
 
+/// Write indicator without name.
+template <class Writer, class Con>
+inline void WriteModelItem(Writer& wrt, const IndicatorConstraint<Con>& ic,
+                    ItemNamer& vnam) {
+  wrt << vnam.at(ic.get_binary_var())
+      << "==" << ic.get_binary_value()
+      << " ==> (";
+  WriteModelItem(wrt, ic.get_constraint(), vnam);
+  wrt << ')';
+}
+
+/// Export indicator constraint
+template <class Con>
+inline void WriteJSON(JSONW jw,
+                      const IndicatorConstraint<Con>& ic) {
+  jw["bin_var"] = ic.get_binary_var();
+  jw["bin_val"] = ic.get_binary_value();
+  WriteJSON(jw["con"], ic.get_constraint());
+}
+
+
+/// Specialize
+template <class Con>
+inline void VisitArguments(const IndicatorConstraint<Con>& ic,
+                           std::function<void (int) > argv) {
+  argv(ic.get_binary_var());
+  VisitArguments(ic.get_constraint(), argv);
+}
+
 
 /// Unary encoding.
 /// Currently a dummy constraint just to build
 /// the reformulation graph.
-DEF_STATIC_CONSTR(UnaryEncodingConstraint, VarArray1,
+DEF_STATIC_CONSTR(UnaryEncoding, VarArray1,
                   "Unary encoding of an integer bounded variable");
 
 
@@ -127,6 +160,8 @@ public:
   int size() const { return (int)v_.size(); }
   /// Returns vector of variables, sorted by weights
   const std::vector<int>& get_vars() const { return v_; }
+  /// vars via GetArguments()
+  const std::vector<int>& GetArguments() const { return get_vars(); }
   /// Returns weights, sorted
   const std::vector<double>& get_weights() const { return w_; }
   /// SOS2 extra info
@@ -221,6 +256,31 @@ using SOS1Constraint = SOS_1or2_Constraint<1>;
 using SOS2Constraint = SOS_1or2_Constraint<2>;
 
 
+/// Write SOS without name.
+template <class Writer, int type>
+inline void WriteModelItem(Writer& wrt, const SOS_1or2_Constraint<type>& sos,
+                    ItemNamer& vnam) {
+  // Type 1/2 should be in the name.
+  wrt << sos.GetTypeName();
+  wrt << '(';
+  WriteModelItem(wrt, sos.get_vars(), vnam);
+  wrt << ", ";
+  WriteModelItemParameters(wrt, sos.get_weights());
+  auto bnds = sos.get_sum_of_vars_range();
+  wrt << "; [" << bnds.lb_ << ", " << bnds.ub_ << "]";
+  wrt << ')';
+}
+
+/// Export a SOS1, SOS2 constraint
+template <int type>
+inline void WriteJSON(JSONW jw, const SOS_1or2_Constraint<type>& sos) {
+  jw["SOS_type"] = sos.get_sos_type();
+  jw["vars"] = sos.get_vars();
+  jw["weights"] = sos.get_weights();
+  auto bnds = sos.get_sum_of_vars_range();
+  jw["sum_of_vars_range"] << bnds.lb_ << bnds.ub_;
+}
+
 ////////////////////////////////////////////////////////////////////////
 /// Complementarity constraint.
 /// \a Expr complements a variable.
@@ -232,11 +292,11 @@ public:
   using ExprType = Expr;
 
   /// Constraint type name
-  static const std::string& GetTypeName() {
+  static const char* GetTypeName() {
     static std::string name
       { std::string("ComplementarityConstraint[") +
           Expr::GetTypeName() + ']' };
-    return name;
+    return name.c_str();
   }
 
   /// Is logical?
@@ -249,7 +309,7 @@ public:
   /// Get constraint
   const ExprType& GetExpression() const { return compl_expr_; }
 
-  /// Get variable
+  /// Get the complemented variable
   int GetVariable() const { return compl_var_; }
 
   /// Compute violation
@@ -276,24 +336,52 @@ using ComplementarityLinear = ComplementarityConstraint<AffineExpr>;
 /// Typedef ComplementarityQuadRange
 using ComplementarityQuadratic = ComplementarityConstraint<QuadraticExpr>;
 
+/// Write ComplCon without name.
+template <class Writer, class Expr>
+inline void WriteModelItem(Writer& wrt,
+                    const ComplementarityConstraint<Expr>& cc,
+                    ItemNamer& vnam) {
+  wrt << vnam.at(cc.GetVariable());
+  wrt << " complements ";
+  WriteModelItem(wrt, cc.GetExpression(), vnam);
+}
+
+/// Write a ComplementarityCon
+template <class Expr>
+inline void WriteJSON(JSONW jw,
+                      const ComplementarityConstraint<Expr>& cc) {
+  WriteJSON(jw["expr"], cc.GetExpression());
+  jw["compl_var"] = cc.GetVariable();
+}
+
+
+/// Specialize
+template <class Expr>
+inline void VisitArguments(const ComplementarityConstraint<Expr>& cc,
+                           std::function<void (int) > argv) {
+  argv(cc.GetVariable());
+  VisitArguments(cc.GetExpression(), argv);
+}
+
+
 /// Quadratic cone
-DEF_STATIC_CONSTR_WITH_PRM( QuadraticConeConstraint, VarArray, DblParamArray,
+DEF_STATIC_CONSTR_WITH_PRM( QuadraticCone, VarArray, DblParamArray,
                             "Quadratic cone p1*x1 >= sqrt((p2*x2)^2 + ...)),"
                             " with factors p1..pn");
 /// Rotated quadratic cone
-DEF_STATIC_CONSTR_WITH_PRM( RotatedQuadraticConeConstraint, VarArray, DblParamArray,
+DEF_STATIC_CONSTR_WITH_PRM( RotatedQuadraticCone, VarArray, DblParamArray,
                             "Rotated quadratic cone "
                             "2 * p1*x1*p2*x2 >= (p3*x3)^2 + ...),"
                             " x1, x2 >= 0 or x1, x2 <= 0, with factors p1..pn");
 /// Exponential cone
-DEF_STATIC_CONSTR_WITH_PRM( ExponentialConeConstraint, VarArray3, DblParamArray3,
+DEF_STATIC_CONSTR_WITH_PRM( ExponentialCone, VarArray3, DblParamArray3,
                             "Exponential cone ax >= by exp(cz / (by)),"
                             " where ax, by >= 0, with factors a,b,c");
 /// Power cone
-DEF_STATIC_CONSTR_WITH_PRM( PowerConeConstraint, VarArray, DblParamArray,
+DEF_STATIC_CONSTR_WITH_PRM( PowerCone, VarArray, DblParamArray,
                             "Power cone with factors");
 /// Geometric cone
-DEF_STATIC_CONSTR_WITH_PRM( GeometricConeConstraint, VarArray, DblParamArray,
+DEF_STATIC_CONSTR_WITH_PRM( GeometricCone, VarArray, DblParamArray,
                             "Geometric with factors");
 
 } // namespace mp

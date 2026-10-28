@@ -1,12 +1,13 @@
 #ifndef CONSTRAINTS_ALGEBRAIC_H
 #define CONSTRAINTS_ALGEBRAIC_H
 
-/**
+/*
   * Static algebraic constraints
   */
 
 #include <string>
 #include <cmath>
+#include <cfloat>
 
 #include "mp/flat/constr_base.h"
 #include "mp/flat/expr_quadratic.h"
@@ -23,12 +24,12 @@ class AlgebraicConstraint :
     public BasicConstraint, public Body, public RhsOrRange {
 public:
   /// Constraint type name
-  static const std::string& GetTypeName() {
+  static const char* GetTypeName() {
     static std::string name {
       std::string("AlgebraicConstraint< ") +
       Body::GetTypeName() + ", " +
       RhsOrRange::GetTypeName() + " >" };
-    return name;
+    return name.c_str();
   }
 
   /// Is logical?
@@ -126,6 +127,8 @@ public:
   double lb() const { return lb_; }
   /// range ub()
   double ub() const { return ub_; }
+  /// Add to the range bounds
+  void add_to_rhs(double v) { lb_ += v; ub_ += v; }
   /// negate
   void negate() { auto tmp=ub_; ub_=-lb_; lb_=-tmp; }
   /// operator==
@@ -145,10 +148,18 @@ template <int kind_>
 class AlgConRhs {
   static constexpr const char* kind_str_[] =
   { "LT", "LE", "EQ", "GE", "GT" };
+  static constexpr const char* kind_cmp_[] =
+  { "<", "<=", "==", ">=", ">" };
 public:
   /// name
   static std::string GetTypeName()
   { return std::string("Rhs") + kind_str_[kind_+2]; }
+  /// Comparison name as string
+  static const char* GetCmpName()
+  { return kind_str_[kind_+2]; }
+  /// Comparison operator as string
+  static const char* GetCmpStr()
+  { return kind_cmp_[kind_+2]; }
   /// Constructor
   AlgConRhs(double r) : rhs_(r) { }
   /// Kind
@@ -226,6 +237,55 @@ using QuadConEQ = QuadConRhs< 0>;
 using QuadConGE = QuadConRhs< 1>;
 /// Quadratic constraint c'x+x`Qx >  d
 using QuadConGT = QuadConRhs< 2>;
+
+
+/// Write RangeCon without name.
+template <class Writer, class Body>
+inline void WriteModelItem(Writer& wrt,
+                    const AlgebraicConstraint<Body, AlgConRange>& algc,
+                    ItemNamer& vnam) {
+  const auto& rng = algc.GetRhsOrRange();
+  if (rng.lb() > -DBL_MAX && rng.lb() < rng.ub())
+    wrt << rng.lb() << " <= ";
+  WriteModelItem(wrt, algc.GetBody(), vnam);
+  if (rng.lb() == rng.ub())
+    wrt << " == " << rng.lb();
+  else if (rng.ub() < DBL_MAX)
+    wrt << " <= " << rng.ub();
+}
+
+/// Write RhsCon without name.
+template <class Writer, class Body, int kind>
+inline void WriteModelItem(Writer& wrt,
+                    const AlgebraicConstraint<Body, AlgConRhs<kind> >& algc,
+                    ItemNamer& vnam) {
+  const auto& rng = algc.GetRhsOrRange();
+  WriteModelItem(wrt, algc.GetBody(), vnam);
+  wrt << ' ' << rng.GetCmpStr() << ' ' << rng.rhs();
+}
+
+/// Write an algebraic constraint
+template <class Body, class RhsOrRange>
+inline void WriteJSON(JSONW jw,
+                      const AlgebraicConstraint<Body, RhsOrRange>& algc) {
+  WriteJSON(jw["body"], algc.GetBody());
+  WriteJSON(jw["rhs_or_range"], algc.GetRhsOrRange());
+}
+
+/// Write alg con range
+inline void WriteJSON(JSONW jw,
+                      const AlgConRange& acr) {
+  jw
+      << (acr.lb() < -DBL_MAX ? -DBL_MAX : acr.lb())
+      << (acr.ub() > DBL_MAX ? DBL_MAX : acr.ub());
+}
+
+/// Write alg con rhs
+template <int kind>
+inline void WriteJSON(JSONW jw,
+                      const AlgConRhs<kind>& acrhs) {
+  jw << acrhs.GetCmpName() << acrhs.rhs();
+}
 
 } // namespace mp
 

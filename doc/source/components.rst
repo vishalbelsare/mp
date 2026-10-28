@@ -22,6 +22,9 @@ The details are taken care of in the
 However, a :ref:`minimal driver setup <driver-minimal-setup>` might address the
 corresponding APIs directly, as described below.
 
+
+.. _NL-format:
+
 NL format
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -138,7 +141,7 @@ Writing NL and reading SOL files
 ------------------------------------
 
 For modeling systems and applications using AMPL solvers,
-MP provides a library to write NL and read SOL files.
+MP provides a library to write :ref:`NL <nl-format>` and read SOL files.
 The library is virtually zero-overhead: it does not store the model,
 nor does it require any intermediate objects to represent
 model information.
@@ -192,7 +195,11 @@ and tests.
     or linear models (via `~NLW2_NLFeeder_C`, `~NLW2_SOLHandler_C`)
     are supported.
 
-- **Python API** is WIP.
+- **Python API** only supports (MI)LP/(MI)QP (via `nlwpy.NLModel`),
+  see
+  `NLWPY example <https://github.com/ampl/mp/blob/develop/nl-writer2/nlwpy/test/test_solve.py>`_.
+
+  - Available on PyPI as the `nlwpy <https://pypi.org/project/nlwpy/>`_ package.
 
 
 .. _recommended-driver-logic:
@@ -327,17 +334,27 @@ Then,  the defining constraints of ``t1`` and ``t2`` are either passed to the so
 which accepts them via the :ref:`model API <flat-model-api>`, or become reformulated
 into more simple entities by :ref:`Flat Converter <flat-converters>`. If the solver
 natively accepts a nonlinear constraint, it is possible to still apply automatic
-reformulation via a solver option, for example *acc:log* for logarithm. Run the driver
-with *-=* or *-c* for a list of natively accepted constraints and options.
+reformulation via a :ref:`solver option <ampl-solver-options>`,
+for example *acc:log* for logarithm. Run the driver
+with *-=* for the list of options, or with *-c* for the
+list of supported constraints.
 
-An in-depth treatment of some automatic reformulations is given in
+
+.. _mathematical-background:
+
+Mathematical Background
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+An in-depth treatment of some automatic reformulations is given in [MILPFT]_,
 [CLModernArch]_, [SOCTransform]_, [MOI]_, and [CP2MIP]_. Customization for a new solver
 driver is sketched in :ref:`configure-automatic-model-conversions`.
 
-.. [CP2MIP] G. Belov, P. J. Stuckey, G. Tack, M. Wallace. Improved Linearization
-   of Constraint Programming Models. In: Rueher, M. (eds) Principles and Practice of
-   Constraint Programming. CP 2016. LNCS, vol 9892.
-   Springer, Cham. *https://doi.org/10.1007/978-3-319-44953-1_4*.
+.. [MILPFT] J. P. Vielma. Mixed Integer Linear Programming Formulation Techniques.
+   SIAM Review 57 (1), 2015.
+
+.. [CP2MIP] S. Brand, G. J. Duck, J. Puchinger, and P. J. Stuckey.
+   Flexible, Rule-Based Constraint Model Linearisation.
+   Practical Aspects of Declarative Languages 68—83, 2008.
 
 .. [CLModernArch] J. J. Dekker. A Modern Architecture for Constraint Modelling Languages.
    PhD thesis. Monash University, 2021.
@@ -349,7 +366,6 @@ driver is sketched in :ref:`configure-automatic-model-conversions`.
 .. [MOI] B. Legat, O. Dowson, J. D. Garcia, M. Lubin.
    MathOptInterface: A Data Structure for Mathematical Optimization Problems.
    INFORMS Journal on Computing 34 (2), 2021.
-   *https://doi.org/10.1287/ijoc.2021.1067*.
 
 
 .. _model-manager:
@@ -410,6 +426,9 @@ tools can be adapted to convert the instance for a particular solver.
 Flat model converters
 ~~~~~~~~~~~~~~~~~~~~~
 
+New: expression trees added. See :ref:`supported-constraints`,
+as well as Gurobi and SCIP drivers.
+
 `mp::FlatConverter` and `mp::MIPFlatConverter` represent and
 convert flat models (i.e., models :ref:`without expression trees <flat-solvers>`).
 Typically, a flat model
@@ -432,6 +451,10 @@ via the solver's modeling API wrapper:
 
 Flat model API
 ~~~~~~~~~~~~~~
+
+New: expression trees added. See :ref:`supported-constraints`,
+as well as Gurobi and SCIP drivers.
+
 
 `mp::BasicFlatModelAPI` is the interface via which :ref:`flat-converters` address
 the underlying solver.

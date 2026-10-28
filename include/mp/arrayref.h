@@ -101,6 +101,10 @@ namespace mp {
     /// operator[]
     const T& operator[](std::size_t i) const { return data_[i]; }
 
+    /// at_checked
+    const T& at_checked(std::size_t i) const
+    { assert(i<size()); return data_[i]; }
+
   protected:
     std::vector<T> move_or_copy() {
       if (save_.size()) {
@@ -112,7 +116,7 @@ namespace mp {
     }
 
     template <class AR>
-    void init_from_rvalue(AR&& other) {
+    void init_from_rvalue(AR&& other) noexcept {
       if (other.save_.size()) {
         save_ = std::move(other.save_);
         data_ = save_.data();

@@ -125,34 +125,48 @@ bool VisitorBackend::IsMIP() const {
 }
 
 bool VisitorBackend::IsQCP() const {
-  return getIntAttr(Solver::NCONS_TYPE, Solver::CONS_QUAD) > 0;
+  return getIntAttr(Solver::NCONS_TYPE, Solver::ConsType::CONS_QUAD) > 0;
 // return getIntAttr(VISITOR_INTATTR_QELEMS) > 0;
 }
 
 ArrayRef<double> VisitorBackend::PrimalSolution() {
   int num_vars = NumVars();
-  int error;
+  int error = 1;
   std::vector<double> x(num_vars);
+  // We should always return a solution when available,
+  // even if infeasible/suboptimal etc.
+  // User decides on it using solve_result.
   /*
   if (IsMIP()) 
     error = VISITOR_GetSolution(lp(), x.data());
   else
     error = VISITOR_GetLpSolution(lp(), x.data(), NULL, NULL, NULL);
+    */
   if (error)
     x.clear();
-    */
   return x;
 }
 
 pre::ValueMapDbl VisitorBackend::DualSolution() {
-  return {{ { CG_Linear, DualSolution_LP() } }};
+  return { {
+    { CG_Linear, DualSolution_LP() },
+    { CG_Quadratic, DualSolution_QP() } } };
 }
 
 ArrayRef<double> VisitorBackend::DualSolution_LP() {
   int num_cons = NumLinCons();
   std::vector<double> pi(num_cons);
  // int error = VISITOR_GetLpSolution(lp(), NULL, NULL, pi.data(), NULL);
-  int error = 0;
+  int error = 1;
+  if (error)
+    pi.clear();
+  return pi;
+}
+ArrayRef<double> VisitorBackend::DualSolution_QP() {
+  int num_cons = NumQPCons();
+  std::vector<double> pi(num_cons);
+  // int error = VISITOR_GetQpSolution(lp(), NULL, NULL, pi.data(), NULL);
+  int error = 1;
   if (error)
     pi.clear();
   return pi;
@@ -194,7 +208,8 @@ void VisitorBackend::Solve() {
   WindupVISITORSolve();
 }
 
-void VisitorBackend::WindupVISITORSolve() { }
+void VisitorBackend::WindupVISITORSolve() { 
+}
 
 void VisitorBackend::ReportResults() {
   ReportVISITORResults();
@@ -202,7 +217,7 @@ void VisitorBackend::ReportResults() {
 }
 
 void VisitorBackend::ReportVISITORResults() {
-  SetStatus( ConvertVISITORStatus() );
+  SetStatus( GetSolveResult() );
   AddVISITORMessages();
   if (need_multiple_solutions())
     ReportVISITORPool();
@@ -235,11 +250,12 @@ void VisitorBackend::ReportVISITORPool() {
 
 void VisitorBackend::printModelStats() {
 
-  std::map<Solver::TYPE, std::string> names;
-  names[Solver::CONS_LIN] = "Linear";
+  std::map<Solver::ConsType, std::string> names;
+    names[Solver::CONS_LIN] = "Linear";
     names[Solver::CONS_QUAD]= "Quadratic";
-    names[Solver::CONS_QUAD_CONE]= "Quadratic cones";
-    names[Solver::CONS_QUAD_CONE_ROTATED]= "Quadratic cones rotated";
+    names[Solver::CONS_QUAD_CONE]= "Cone quadratic";
+    names[Solver::CONS_QUAD_CONE_ROTATED]= "Cone rotated";
+    names[Solver::CONS_QUAD_CONE_EXP] = "Cone exponential";
     names[Solver::CONS_INDIC]= "Indicator";
     names[Solver::CONS_SOS]= "SOS";
 
@@ -260,43 +276,42 @@ void VisitorBackend::printModelStats() {
     names[Solver::CONS_TAN]= "Tan";
     names[Solver::CONS_PL] = "Piecewise linear";
 
+    AddToSolverMessage("\n\n##### Model stats #####\n");
 
-    int n = 0;
-    n = getIntAttr(Solver::NVARS_CONT);
-    if (n > 0)
-      AddToSolverMessage(fmt::format("{} continuous variables\n", n));
-    n = getIntAttr(Solver::NVARS_INT);
-    if (n > 0)
-      AddToSolverMessage(fmt::format("{} integer variables\n", n));
-
-    n = getIntAttr(Solver::NOBJS);
-    AddToSolverMessage(fmt::format("{} objective{} - {}\n", n,
-      n > 1 ? "s" : "",
-      getIntAttr(Solver::ISQOBJ) ? "quadratic" : "linear"
-      ));
+    AddToSolverMessage(fmt::format("Variables: ({})\n", getIntAttr(Solver::NVARS)));
+    AddToSolverMessage(fmt::format("  {} continuous\n", getIntAttr(Solver::NVARS_CONT)));
+    AddToSolverMessage(fmt::format("  {} integer\n", getIntAttr(Solver::NVARS_INT)));
+    AddToSolverMessage(fmt::format("  {} binary\n", getIntAttr(Solver::NVARS_BIN)));
 
 
+    AddToSolverMessage(fmt::format("\nObjectives: ({})\n", getIntAttr(Solver::NOBJS)));
+    AddToSolverMessage(fmt::format("  {} linear\n", getIntAttr(Solver::NOBJS, Solver::CONS_LIN)));
+    AddToSolverMessage(fmt::format("  {} quadratic\n", getIntAttr(Solver::NOBJS, Solver::CONS_QUAD)));
+    AddToSolverMessage(fmt::format("  {} non-linear\n", getIntAttr(Solver::NOBJS, Solver::CONS_NL)));
 
+
+    AddToSolverMessage(fmt::format("\nConstraints: ({})\n", getIntAttr(Solver::NCONS)));
     for (const auto& i : names) {
       auto n = getIntAttr(Solver::NCONS_TYPE, i.first);
       if (n == 0) continue;
-      AddToSolverMessage(fmt::format("{} {} constraints\n", n, i.second));
+      AddToSolverMessage(fmt::format("  {} {}\n", n, i.second));
     }
-
 }
 void VisitorBackend::AddVISITORMessages() {
   printModelStats();
-  AddToSolverMessage(
-          fmt::format("{} simplex iterations\n", SimplexIterations()));
+  auto si = SimplexIterations();
+  AddToSolverMessage(         // Always
+      fmt::format("{} simplex iterations\n", si));
   if (auto nbi = BarrierIterations())
     AddToSolverMessage(
           fmt::format("{} barrier iterations\n", nbi));
+  // TODO PDHG, SLP, NLP...
   if (auto nnd = NodeCount())
     AddToSolverMessage(
           fmt::format("{} branching nodes\n", nnd));
 }
 
-std::pair<int, std::string> VisitorBackend::ConvertVISITORStatus() {
+std::pair<int, std::string> VisitorBackend::GetSolveResult() {
   namespace sol = mp::sol;
   /*
    * TODO.
@@ -306,69 +321,10 @@ std::pair<int, std::string> VisitorBackend::ConvertVISITORStatus() {
      */
   if (IsMIP())
   {
-    /*
-    int optstatus = getIntAttr(COPT_INTATTR_MIPSTATUS);
-    int solstatus
-        = getIntAttr(COPT_INTATTR_HASMIPSOL)
-        | getIntAttr(COPT_INTATTR_HASFEASRELAXSOL);
-    switch (optstatus) {
-    case COPT_MIPSTATUS_OPTIMAL:
-      return { sol::SOLVED, "optimal solution" };
-    case COPT_MIPSTATUS_INFEASIBLE:
-      return { sol::INFEASIBLE, "infeasible problem" };
-    case COPT_MIPSTATUS_INF_OR_UNB:
-      return { sol::INF_OR_UNB, "infeasible or unbounded problem" };
-    case COPT_MIPSTATUS_UNBOUNDED:
-      if (solstatus)
-        return { sol::UNBOUNDED_FEAS, "unbounded problem, feasible solution" };
-      return { sol::UNBOUNDED_NO_FEAS, "unbounded problem, no solution" };
-    case COPT_MIPSTATUS_TIMEOUT:
-    case COPT_MIPSTATUS_NODELIMIT:
-    case COPT_MIPSTATUS_INTERRUPTED:
-    case COPT_MIPSTATUS_UNSTARTED:
-      if (solstatus)
-        return { sol::LIMIT_FEAS, "interrupted, feasible solution" };
-      return { sol::LIMIT_NO_FEAS, "interrupted, no solution" };
-    case COPT_MIPSTATUS_UNFINISHED:
-      return { sol::NUMERIC, "failure, numeric issues" };
-    default:
-      return { sol::UNKNOWN, "unknown" };
-    }
-    */
+  //
   }
   else {
-    /*
-    int optstatus = getIntAttr(COPT_INTATTR_LPSTATUS);
-    int solstatus
-        = getIntAttr(COPT_INTATTR_HASLPSOL)
-        | getIntAttr(COPT_INTATTR_HASFEASRELAXSOL);
-    switch (optstatus) {
-    case COPT_LPSTATUS_OPTIMAL:
-      return { sol::SOLVED, "optimal solution" };
-    case COPT_LPSTATUS_INFEASIBLE:
-      return { sol::INFEASIBLE, "infeasible problem" };
-    case COPT_LPSTATUS_UNBOUNDED:
-      if (solstatus)
-        return { sol::UNBOUNDED_FEAS, "unbounded problem, feasible solution" };
-      return { sol::UNBOUNDED_NO_FEAS, "unbounded problem, no solution" };
-    case COPT_LPSTATUS_TIMEOUT:
-    case COPT_LPSTATUS_INTERRUPTED:
-    case COPT_LPSTATUS_UNSTARTED:
-      if (solstatus)
-        return { sol::LIMIT_FEAS, "interrupted, feasible solution" };
-      return { sol::LIMIT_NO_FEAS, "interrupted, no solution" };
-    case COPT_LPSTATUS_UNFINISHED:
-      return { sol::NUMERIC, "failure, numeric issues" };
-    case COPT_LPSTATUS_IMPRECISE:
-      return { sol::UNCERTAIN, "solution is imprecise" };
-    case COPT_LPSTATUS_NUMERICAL:
-      if (solstatus)
-        return { sol::UNCERTAIN, "solution returned but error likely" };
-      return { sol::NUMERIC, "failure, numeric issues" };
-    default:
-      return { sol::UNKNOWN, "unknown" };
-    }
-    */
+  // 
   }
   return { sol::UNKNOWN, "not solved" };
 }
@@ -394,40 +350,19 @@ void VisitorBackend::FinishOptionParsing() {
     //  GRBwriteparams(GRBgetenv(model()),
     //    paramfile_write().c_str()));
   }
+  lp()->SetVerbosity(storedOptions_.verbosity_);
 }
 
 
 ////////////////////////////// OPTIONS /////////////////////////////////
 
 
-static const mp::OptionValueInfo lp_values_method[] = {
-  { "-1", "Automatic (default)", -1},
-  { "1", "Dual simplex", 1},
-  { "2", "Barrier", 2},
-  { "3", "Crossover", 3},
-  { "4", "Concurrent (simplex and barrier simultaneously)", 4},
+static const mp::OptionValueInfo verbosity_values_[] = {
+  { "0", "Only statistics", 0},  
+  { "1", "All info", 1}
 };
 
 
-static const mp::OptionValueInfo alg_values_level[] = {
-  { "-1", "Automatic (default)", -1},
-  { "0", "Off", 0},
-  { "1", "Fast", 1},
-  { "2", "Normal", 2},
-  { "3", "Aggressive", 3}
-}; 
-
-static const mp::OptionValueInfo lp_dualprices_values_[] = {
-  { "-1", "Choose automatically (default)", -1},
-  { "0", "Use Devex pricing algorithm", 0},
-  { "1", "Using dual steepest-edge pricing algorithm", 1}
-};
-
-static const mp::OptionValueInfo lp_barorder_values_[] = {
-  { "-1", "Choose automatically (default)", -1},
-  { "0", "Approximate Minimum Degree (AMD)", 0},
-  { "1", "Nested Dissection (ND)", 1}
-};
 
 void VisitorBackend::InitCustomOptions() {
 
@@ -480,6 +415,11 @@ void VisitorBackend::InitCustomOptions() {
       "name contains blanks) to be written.",
       storedOptions_.paramwrite_);
 
+  // Example of an option with possible values defined in a table. Look at other drivers 
+  // for predefined value tables (eg. values_autonoyes_, ...)
+  AddStoredOption("tech:verbosity verbosity",
+    "Set the verbosity of this run, deciding what to print to console:\n"
+    "\n.. value-table::\n", storedOptions_.verbosity_, verbosity_values_);
 
   ////////////////// CUSTOM RESULT CODES ///////////////////
   AddSolveResults( {
@@ -510,7 +450,8 @@ ArrayRef<int> VisitorBackend::VarStatii() {
   
   std::vector<int> vars(NumVars());
   /*
-  VISITOR_GetBasis(lp(), vars.data(), NULL);
+  if (!VISITOR_GetBasis(lp(), vars.data(), NULL))
+    vars.clear();         // return empty if no basis
   for (auto& s : vars) {
     switch (s) {
     case VISITOR_BASIS_BASIC:
@@ -540,7 +481,8 @@ ArrayRef<int> VisitorBackend::ConStatii() {
 
   std::vector<int> cons(NumLinCons());
   /*
-  VISITOR_GetBasis(lp(), NULL, cons.data());
+  if (!VISITOR_GetBasis(lp(), NULL, cons.data()))
+    cons.clear();          // return empty if no basis
   for (auto& s : cons) {
     switch (s) {
     case VISITOR_BASIS_BASIC:
@@ -645,7 +587,7 @@ SolutionBasis VisitorBackend::GetBasis() {
         {{{ CG_Linear, std::move(constt) }}} });
     varstt = mv.GetVarValues()();
     constt = mv.GetConValues()();
-    assert(varstt.size());
+    assert(varstt.size());         // not for constraints, can be QCP
   }
   return { std::move(varstt), std::move(constt) };
 }
@@ -664,7 +606,7 @@ void VisitorBackend::SetBasis(SolutionBasis basis) {
 
 void VisitorBackend::ComputeIIS() {
   //VISITOR_CCALL(VISITOR_ComputeIIS(lp()));
-  SetStatus(ConvertVISITORStatus());   // could be new information
+  SetStatus(GetSolveResult());   // could be new information
 }
 
 IIS VisitorBackend::GetIIS() {

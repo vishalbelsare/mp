@@ -1,6 +1,7 @@
 #include <vector>
 #include <climits>
 #include <cfloat>
+#include <stdio.h> // for fflush
 
 #include "mp/env.h"
 #include "mp/flat/model_api_base.h"
@@ -16,7 +17,7 @@ namespace {
 
 
 bool InterruptXpressmp(void* prob) {
-  //return XPRESSMP_Interrupt((xpressmp_prob*)prob);
+  XPRSinterrupt((XPRSprob)prob, XPRS_STOP_CTRLC);
   return true;
 }
 
@@ -37,6 +38,7 @@ namespace mp {
 /// @return XpressmpModelMgr
 std::unique_ptr<BasicModelManager>
 CreateXpressmpModelMgr(XpressmpCommon&, Env&, pre::BasicValuePresolver*&);
+
 
 
 XpressmpBackend::XpressmpBackend() : msp_(NULL), mse_(NULL) {
@@ -77,10 +79,114 @@ void XpressmpBackend::OpenSolver() {
 
   }
   model_fixed_ = lp();
+  XPRESSMP_CCALL(XPRS_msp_create(&msp_));
+  XPRESSMP_CCALL(XPRS_mse_create(&mse_));
+  // Distinct MIP solutions: compare the discrete variables only
+  // (the documented default; a fresh pool object keeps duplicates)
+  XPRESSMP_CCALL(XPRS_msp_setintcontrol(
+      msp_, XPRS_MSP_DUPLICATESOLUTIONSPOLICY, 3));
   copy_common_info_to_other();
 }
 
+void XpressmpBackend::ApplyNativeOptions() {
+  for (const auto& entry: storedOptions_.nativeOptions_) {
+    auto sep = entry.find_first_of("= ");
+    if (std::string::npos == sep)
+      MP_RAISE(fmt::format(
+          "tech:optionnative: expected \"NAME=value\", got \"{}\"", entry));
+    auto value = entry.substr(sep+1);
+    auto vstart = value.find_first_not_of(" ");
+    ApplyNativeOption(entry.substr(0, sep),
+                      std::string::npos == vstart ? "" : value.substr(vstart));
+  }
+}
+
+void XpressmpBackend::ApplyNativeOption(
+    const std::string& name, const std::string& value) {
+  int id = 0, type = XPRS_TYPE_NOTDEFINED;
+  if (XPRSgetcontrolinfo(lp(), name.c_str(), &id, &type)
+      || XPRS_TYPE_NOTDEFINED == type)
+    MP_RAISE(fmt::format("Unknown Xpress control \"{}\"", name));
+  bool query = ("?" == value);
+  auto bad_value = [&]() {
+    MP_RAISE(fmt::format("Invalid value \"{}\" for Xpress control \"{}\"",
+                         value, name));
+  };
+  switch (type) {
+  case XPRS_TYPE_INT:
+  case XPRS_TYPE_INT64: {
+    int v = 0;
+    if (query) GetSolverOption(id, v);
+    else {
+      std::size_t pos = 0;
+      try { v = std::stoi(value, &pos); } catch (const std::exception&) { bad_value(); }
+      if (pos != value.size()) bad_value();
+      SetSolverOption(id, v);
+    }
+    if (query) Print("{}={}\n", name, v);
+    break;
+  }
+  case XPRS_TYPE_DOUBLE: {
+    double v = 0.0;
+    if (query) GetSolverOption(id, v);
+    else {
+      std::size_t pos = 0;
+      try { v = std::stod(value, &pos); } catch (const std::exception&) { bad_value(); }
+      if (pos != value.size()) bad_value();
+      SetSolverOption(id, v);
+    }
+    if (query) Print("{}={}\n", name, v);
+    break;
+  }
+  case XPRS_TYPE_STRING: {
+    std::string v;
+    if (query) GetSolverOption(id, v);
+    else SetSolverOption(id, v = value);
+    if (query) Print("{}={}\n", name, v);
+    break;
+  }
+  default:
+    MP_RAISE(fmt::format("Xpress control \"{}\" has unsupported type {}",
+                         name, type));
+  }
+}
+
+void XpressmpBackend::ReadBasisFile() {
+  const auto& file = storedOptions_.readBasis_;
+  if (XPRSreadbasis(lp(), file.c_str(), ""))
+    MP_RAISE(fmt::format("Could not read the starting basis from \"{}\":\n{}",
+                         file, getErr()));
+}
+
+void XpressmpBackend::FinishOptionParsing() {
+  ApplyNativeOptions();
+  if (storedOptions_.nonconvex_ >= 0)        // deprecated qp:nonconvex
+    SetSolverOption(XPRS_IFCHECKCONVEXITY,
+                    2 == storedOptions_.nonconvex_ ? 0 : storedOptions_.nonconvex_);
+  bool doLog = outlev_ > 0 && outlev_ < 5;
+  set_verbose_mode(doLog);
+  if (doLog && !msgCallbackSet_)
+  {
+    msgCallbackSet_ = true;
+    XPRSaddcbmessage(lp(), xpdisplay, NULL, 0);
+  }
+
+  if (storedOptions_.logFile_.size())
+  {
+    XPRESSMP_CCALL(XPRSsetlogfile(lp(), storedOptions_.logFile_.c_str()));
+    XPRSsetintcontrol(lp(), XPRS_OUTPUTLOG, 1);        /* Chat mode */
+  }
+}
+
 void XpressmpBackend::CloseSolver() {
+  if (mse_) {
+    XPRS_mse_destroy(mse_);
+    mse_ = nullptr;
+  }
+  if (msp_) {
+    XPRS_msp_destroy(msp_);
+    msp_ = nullptr;
+  }
 
   /* Free the fixed model */
   if (lp() != nullptr && lp() != model_fixed_) {
@@ -107,50 +213,76 @@ std::string XpressmpBackend::GetSolverVersion() {
   return fmt::format("{} ({})", rbuf, vbuf);
 }
 
+int XpressmpBackend::GetGlobalFlag(const SolverOption& ) const
+{ return global_flag_; }
+
+void XpressmpBackend::SetGlobalFlag(const SolverOption& , int v) {
+  if (!v) {
+    global_flag_ = 0;
+    this->ParseSolverOptions(
+        nullptr, 0, 0,
+        "acc:abs=0 acc:acos=0 acc:acosh=0 acc:asin=0 "
+        "acc:asinh=0 acc:atan=0 acc:atanh=0 acc:cos=0 "
+        "acc:cosh=0 acc:sin=0 acc:sinh=0 acc:tan=0 acc:tanh=0 "
+        "acc:div=0 acc:exp=0 acc:expA=0 "
+        "acc:log=0 acc:logA=0 acc:powconstexp=0 acc:pow=0"        );
+  }
+}
+
 bool XpressmpBackend::IsQCP() const {
   return numQuadCons() > 0;
 }
 
 ArrayRef<double> XpressmpBackend::PrimalSolution() {
+  if (fixed_model_failed_) return mip_primal_before_fixed_;
+  if (pool_best_x_.size()) return pool_best_x_;
   int num_vars = NumVars();
   int error;
   std::vector<double> x(num_vars);
-  if (IsMIP())
-    error = XPRSgetmipsol(lp(), x.data(), NULL);
-  else
-    error = XPRSgetlpsol(lp(), x.data(), NULL, NULL, NULL);
-  if (error)
+    int solst;
+    // After XPRSoptimize():
+  error = XPRSgetsolution(lp(), &solst, x.data(), 0, num_vars-1);
+  if (error
+      || XPRS_SOLAVAILABLE_NOTFOUND==solst
+          //   Infeasible - should return:
+          // || XPRS_SOLSTATUS_INFEASIBLE==solst
+      )    // @todo keep up2date
     x.clear();
   return x;
 }
 
 pre::ValueMapDbl XpressmpBackend::DualSolution() {
-  return {{ { CG_Linear, DualSolution_LP() } }};
+  return {{ { CG_Algebraic, DualSolution_LP() } }};
 }
 
 ArrayRef<double> XpressmpBackend::DualSolution_LP() {
+  if (fixed_model_failed_) return {};
   std::vector<double> pi(NumLinCons());
-  if (!IsMIP() || need_fixed_MIP())
-  {
-    int error = XPRSgetlpsol(model_fixed_, NULL, NULL, pi.data(), NULL);
-    if (error)
-      pi.clear();
-  }
+  int solst;
+  int opttype;
+  XPRSgetintattrib(model_fixed_, XPRS_OPTIMIZETYPEUSED, &opttype);
+  // LP only? Use XPRSgetduals() after XPRSoptimize()
+  int error
+      = XPRSgetduals(model_fixed_,
+                     &solst, pi.data(), 0, NumLinCons()-1);
+  if (error)
+    pi.clear();
   return pi;
 }
 
 double XpressmpBackend::ObjectiveValue() const {
-  if (IsMIP())
-    return getDblAttr(XPRS_MIPOBJVAL);
-  else
-    return getDblAttr(XPRS_LPOBJVAL);
+  if (fixed_model_failed_ && !mip_objectives_before_fixed_.empty())
+    return mip_objectives_before_fixed_.front();
+  if (pool_best_x_.size())
+    return pool_best_obj_;
+  return getDblAttr(XPRS_OBJVAL);
 }
 
-double XpressmpBackend::NodeCount() const {
+int XpressmpBackend::NodeCount() const {
   return getIntAttr(XPRS_NODES);
 }
 
-double XpressmpBackend::SimplexIterations() const {
+int XpressmpBackend::SimplexIterations() const {
   return getIntAttr(XPRS_SIMPLEXITER);
 }
 
@@ -158,11 +290,25 @@ int XpressmpBackend::BarrierIterations() const {
   return getIntAttr(XPRS_BARITER);
 }
 
-inline bool ends_with(std::string const& value, std::string const& ending)
-{
-  if (ending.size() > value.size()) return false;
-  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+int XpressmpBackend::CrossoverIterations() const {
+  return getIntAttr(XPRS_CROSSOVERITER);
 }
+
+int XpressmpBackend::SLPIterations() const {
+  return getIntAttr(XPRS_SLPITER);
+}
+
+std::map<std::string, std::variant<int, double, std::string>>
+XpressmpBackend::SolutionStats() {
+  std::map<std::string, std::variant<int, double, std::string>> stats;
+  stats["simplex_iterations"] = SimplexIterations();
+  stats["barrier_iterations"] = BarrierIterations();
+  stats["crossover_iterations"] = CrossoverIterations();
+  stats["SLP_iterations"] = SLPIterations();
+  stats["node_count"] = NodeCount();
+  return stats;
+}
+
 void XpressmpBackend::DoWriteProblem(const std::string& name) {
   char const* wpflags = NULL;
   if (ends_with(name, ".lp"))
@@ -170,14 +316,24 @@ void XpressmpBackend::DoWriteProblem(const std::string& name) {
   else if (ends_with(name, ".mps"))
     wpflags = "";
   else
-    throw std::runtime_error(fmt::format("Expected \"writeprob=...\" to specify a filename ending in \".lp\"\n"
+    throw std::runtime_error(
+        fmt::format(
+            "Expected \"writeprob=...\" to specify a filename ending in \".lp\"\n"
       "or \".mps\"; got \"{}\".\n", name));
   XPRESSMP_CCALL(XPRSwriteprob(lp(), name.c_str(), wpflags));
 }
 
 void XpressmpBackend::DoWriteSolution(const std::string& name) {
-  char const* wpflags = "";
-  XPRESSMP_CCALL(XPRSwriteprtsol(lp(), name.c_str(), wpflags));
+  char const* wpflags = "v";  // do not add extension
+  auto CheckEnds = [&](std::string e) {
+    return ends_with(name, e);
+  };
+  if (CheckEnds("sol") || CheckEnds("prt"))
+    XPRESSMP_CCALL(XPRSwriteprtsol(lp(), name.c_str(), wpflags));
+  else if (CheckEnds("iis"))
+    XPRESSMP_CCALL(XPRSiiswrite(lp(), 1, name.c_str(), 0, "lv"));
+  else if (CheckEnds("bas") || CheckEnds("bss"))
+    XPRESSMP_CCALL(XPRSwritebasis(lp(), name.c_str(), wpflags));
 }
 
 
@@ -189,30 +345,70 @@ void XpressmpBackend::DoXPRESSTune() {
   SetSolverOption(XPRS_TUNEROUTPUTPATH, tunebase().data());
   if (tunename().size())
     SetSolverOption(XPRS_TUNERSESSIONNAME, tunename().data());
+
+  if (!tunermethodfilewrite().empty())
+      XPRESSMP_CCALL(XPRStunerwritemethod(lp(), tunermethodfilewrite().c_str()));
+
+  if (!tunermethodfileread().empty())
+      XPRESSMP_CCALL(XPRStunerreadmethod(lp(), tunermethodfileread().c_str()));
   XPRESSMP_CCALL(XPRStune(lp(), ""));
 }
 
+void XpressmpBackend::GetSolverOption(MspControl key, int& value) const {
+  XPRESSMP_CCALL(XPRS_msp_getintcontrol(msp_, int(key), &value));
+}
+void XpressmpBackend::SetSolverOption(MspControl key, int value) {
+  XPRESSMP_CCALL(XPRS_msp_setintcontrol(msp_, int(key), value));
+}
+void XpressmpBackend::GetSolverOption(MspControl key, double& value) const {
+  XPRESSMP_CCALL(XPRS_msp_getdblcontrol(msp_, int(key), &value));
+}
+void XpressmpBackend::SetSolverOption(MspControl key, double value) {
+  XPRESSMP_CCALL(XPRS_msp_setdblcontrol(msp_, int(key), value));
+}
+void XpressmpBackend::GetSolverOption(MseControl key, int& value) const {
+  XPRESSMP_CCALL(XPRS_mse_getintcontrol(mse_, int(key), &value));
+}
+void XpressmpBackend::SetSolverOption(MseControl key, int value) {
+  XPRESSMP_CCALL(XPRS_mse_setintcontrol(mse_, int(key), value));
+}
+void XpressmpBackend::GetSolverOption(MseControl key, double& value) const {
+  XPRESSMP_CCALL(XPRS_mse_getdblcontrol(mse_, int(key), &value));
+}
+void XpressmpBackend::SetSolverOption(MseControl key, double value) {
+  XPRESSMP_CCALL(XPRS_mse_setdblcontrol(mse_, int(key), value));
+}
+
 void XpressmpBackend::Solve() {
+  fixed_model_failed_ = false;
   int nsols = 10;
   if (tunebase().size())
     DoXPRESSTune();
-
+  
   auto flags = XPRESSSolveFlags();
-  if (IsMIP()) {
-    if (need_multiple_solutions() || storedOptions_.nbest_ > 1) {
-      if (storedOptions_.nbest_ == 0) {
-        storedOptions_.nbest_ = 20;
-      }
-      XPRESSMP_CCALL(XPRS_mse_opt(mse_, lp(),
-        msp_, XPRS_mse_defaulthandler, 0,
-        &storedOptions_.nbest_));
-    }
-    else
-      XPRESSMP_CCALL(XPRSmipoptimize(lp(), flags.c_str()));
-  }
-  else
-    XPRESSMP_CCALL(XPRSlpoptimize(lp(), flags.c_str()));
+  int solvest=0, solst=0;
+  pool_best_x_.clear();
+  if (IsMIP() && need_multiple_solutions() && storedOptions_.nPoolMode_) {
+    EnumerateSolutions();
+    TakePoolBestAsPrimary();
+  } else      // with sol:poolmode=0 the attached pool collects the solutions found
+    XPRESSMP_CCALL(XPRSoptimize(lp(), flags.c_str(), &solvest, &solst));
+
   WindupXPRESSMPSolve();
+}
+
+void XpressmpBackend::EnumerateSolutions() {
+  int nMaxSols = std::max(1, storedOptions_.nbest_);
+  XPRESSMP_CCALL(XPRS_mse_opt(mse_, lp(), msp_,
+                              XPRS_mse_defaulthandler, 0, &nMaxSols));
+}
+
+void XpressmpBackend::TakePoolBestAsPrimary() {
+  auto ids = PoolSolutionIdsBestFirst();
+  if (ids.size()) {
+    pool_best_x_ = getPoolSolution(ids.front());
+    pool_best_obj_ = getPoolObjective(ids.front());
+  }
 }
 
 std::string XpressmpBackend::XPRESSSolveFlags() {
@@ -243,38 +439,84 @@ void XpressmpBackend::ReportResults() {
 
 
 void XpressmpBackend::ReportXPRESSMPResults() {
-  SetStatus( ConvertXPRESSMPStatus() );
+  SetStatus( GetSolveResult() );
   AddXPRESSMPMessages();
   if (need_multiple_solutions())
     ReportXPRESSMPPool();
   if (need_fixed_MIP())
     ConsiderXpressFixedModel();
-  
 }
 
 void XpressmpBackend::ConsiderXpressFixedModel() {
   if (!IsMIP())
     return;
-
-  // Create fixed model
-  XPRSprob mdl;
-  if (XPRScreateprob(&mdl)) return;
-  if (XPRScopyprob(mdl, lp(), "FixedModel")) return;
-  if (XPRScopycontrols(mdl, lp())) return;
-  XPRSsetintcontrol(mdl, XPRS_PRESOLVE, 0);
-  if (XPRSfixmipentities(mdl, 1)) return;
-  model_fixed_ = mdl;
-
-  auto msg = DoXpressFixedModel();
+  // The native operation modifies the main model. Retain the incumbent for
+  // reporting if the supplementary solve reaches a limit.
+  mip_primal_before_fixed_ = PrimalSolution();
+  mip_objectives_before_fixed_ = GetObjectiveValues();
+  std::string msg;
+  try {
+    if (pool_best_x_.size()) {   // the problem holds the enumerator's last
+      if (!FixIntegersToPoolBest())
+        msg = "Fixing integer columns to the pool's best";
+      else {
+        if (outlev_)
+          Print("\n\n     ======= Solving the fixed MIP =======\n\n");
+        msg = DoXpressFixedModel();
+      }
+    } else if (XPRSfixmipentities(model_fixed_, 1))
+      msg = "XPRSfixmipentities()";
+    else {
+      if (outlev_)
+        Print("\n\n     ======= Solving the fixed MIP =======\n\n");
+      msg = DoXpressFixedModel();
+    }
+  } catch (const std::exception& e) {
+    msg = e.what();
+  }
   if (!msg.empty()) {
-    AddToSolverMessage(msg +
-      " failed in DoXpressFixedModel().");
-    XPRSdestroyprob(model_fixed_);
-    model_fixed_ = lp();
+    fixed_model_failed_ = true;
+    AddToSolverMessage(msg + " failed in DoXpressFixedModel().\n");
   }
 }
+bool XpressmpBackend::FixIntegersToPoolBest() {
+  const int n = (int)pool_best_x_.size();
+  std::vector<char> types(n);
+  if (XPRSgetcoltype(model_fixed_, types.data(), 0, n-1))
+    return false;
+  std::vector<int> cols;
+  std::vector<char> bndtypes;
+  std::vector<double> vals;
+  for (int j=0; j<n; ++j) {
+    if ('C' != types[j]) {
+      cols.push_back(j);
+      bndtypes.push_back('B');
+      vals.push_back(std::round(pool_best_x_[j]));
+    }
+  }
+  return !XPRSchgbounds(model_fixed_, (int)cols.size(),
+                        cols.data(), bndtypes.data(), vals.data());
+}
+
 std::string XpressmpBackend::DoXpressFixedModel()
 {
+  double old_time_limit;
+  int old_iteration_limit, old_barrier_limit;
+  XPRESSMP_CCALL(XPRSgetdblcontrol(model_fixed_, XPRS_TIMELIMIT, &old_time_limit));
+  XPRESSMP_CCALL(XPRSgetintcontrol(model_fixed_, XPRS_LPITERLIMIT, &old_iteration_limit));
+  XPRESSMP_CCALL(XPRSgetintcontrol(model_fixed_, XPRS_BARITERLIMIT, &old_barrier_limit));
+  auto restore_limits = [&](void*) {
+    XPRSsetdblcontrol(model_fixed_, XPRS_TIMELIMIT, old_time_limit);
+    XPRSsetintcontrol(model_fixed_, XPRS_LPITERLIMIT, old_iteration_limit);
+    XPRSsetintcontrol(model_fixed_, XPRS_BARITERLIMIT, old_barrier_limit);
+  };
+  std::unique_ptr<void, decltype(restore_limits)> limits_guard(model_fixed_, restore_limits);
+  XPRESSMP_CCALL(XPRSsetdblcontrol(model_fixed_, XPRS_TIMELIMIT,
+      fixed_model_time_limit() < 0 ? 1e20 : fixed_model_time_limit()));
+  XPRESSMP_CCALL(XPRSsetintcontrol(model_fixed_, XPRS_LPITERLIMIT,
+      fixed_model_iter_limit() < 0 ? INT_MAX : fixed_model_iter_limit()));
+  XPRESSMP_CCALL(XPRSsetintcontrol(model_fixed_, XPRS_BARITERLIMIT,
+      fixed_model_iter_limit() < 0 ? INT_MAX : fixed_model_iter_limit()));
   if (XPRSlpoptimize(model_fixed_, ""))
     return "optimize()";
   int status;
@@ -301,7 +543,7 @@ std::string XpressmpBackend::DoXpressFixedModel()
   if (!XPRSgetintattrib(model_fixed_, XPRS_SIMPLEXITER, &f)) {
     if (f)
       AddToSolverMessage(fmt::format(
-        "Fixed MIP for mip:basis: {} simplex iteration{}",
+        "Fixed MIP for mip:basis: {} simplex iteration{}\n",
         f, "s"[f == 1.]));
   }
   return {};
@@ -321,46 +563,129 @@ std::string XpressmpBackend::DoXpressFixedModel()
     XPRS_msp_getdblattribprobsol(msp_, lp(), id, &j, XPRS_MSP_SOLPRB_OBJ, &obj);
     return obj;
   }
+  std::vector<int> XpressmpBackend::PoolSolutionIdsBestFirst() {
+    int nPool = 0;
+    XPRESSMP_CCALL(XPRS_msp_getintattrib(msp_, XPRS_MSP_SOLUTIONS, &nPool));
+    std::vector<int> ids(nPool);
+    int nReturned = 0, nSols = 0;
+    if (nPool) {
+      bool ascending = getDblAttr(XPRS_OBJSENSE) >= 0;    // minimization
+      XPRESSMP_CCALL(XPRS_msp_getsollist(msp_, lp(), XPRS_MSP_SOLPRB_OBJ,
+                                         ascending, 1, nPool,
+                                         ids.data(), &nReturned, &nSols));
+    }
+    ids.resize(nReturned);
+    return ids;
+  }
+
+  bool XpressmpBackend::IsWithinPoolGap(double obj, double best) const {
+    double worsening = (obj - best) * (getDblAttr(XPRS_OBJSENSE) >= 0 ? 1 : -1);
+    return worsening <= storedOptions_.poolGapAbs_
+        && worsening <= storedOptions_.poolGap_ * std::fabs(best);
+  }
+
+  /// Report the pool solutions, best first, within the pool gaps
+  /// and up to sol:poollimit of them
   void XpressmpBackend::ReportXPRESSMPPool() {
     if (!IsMIP())
       return;
-    int iPoolSolution = -1;
-    int nPool;
-    XPRS_msp_getintattrib(msp_, XPRS_MSP_SOLUTIONS, &nPool);
-    auto sid = std::vector<int>(nPool);
-    int nret, nsols;
-    XPRS_msp_getsollist(msp_, 0, 0, 0, 1, nPool, sid.data(),
-      &nret, &nsols);
-    nPool = nret;
-    int id;
-    for (int i = 0; i < nPool; i++) {
-      id = sid[i];
+    auto ids = PoolSolutionIdsBestFirst();
+    int nReported = 0;
+    for (int id: ids) {
+      double obj = getPoolObjective(id);
+      if (nReported >= std::max(1, storedOptions_.nbest_)
+          || !IsWithinPoolGap(obj, getPoolObjective(ids.front())))
+        break;
       auto mv = GetValuePresolver().PostsolveSolution({
             getPoolSolution(id) });
       ReportIntermediateSolution(
-        { mv.GetVarValues()(), mv.GetConValues()(),
-          { getPoolObjective(id) } });   // not when multiobj
+        { mv.GetVarValues()(), mv.GetConValues()(), { obj } });   // not when multiobj
+      ++nReported;
     }
   }
 
 
   void XpressmpBackend::AddXPRESSMPMessages() {
-    if(auto iter = SimplexIterations())
-      AddToSolverMessage(
+    auto iter = SimplexIterations();    // Always
+    AddToSolverMessage(
         fmt::format("{} simplex iterations\n",iter));
     if (auto nbi = BarrierIterations())
       AddToSolverMessage(
-        fmt::format("{} barrier iterations\n", nbi));
+          fmt::format("{} barrier iterations\n", nbi));
+    if (auto nci = CrossoverIterations())
+      AddToSolverMessage(
+          fmt::format("{} crossover iterations\n", nci));
+    if (auto nslpi = SLPIterations())
+      AddToSolverMessage(
+          fmt::format("{} SLP iterations\n", nslpi));
     if (auto nnd = NodeCount())
       AddToSolverMessage(
         fmt::format("{} branching nodes\n", nnd));
   }
 
-  std::pair<int, std::string> XpressmpBackend::ConvertXPRESSMPStatus() {
+  std::pair<int, std::string> XpressmpBackend::GetSolveResult() {
+    auto opttype = getIntAttr(XPRS_OPTIMIZETYPEUSED);
+
+    // Catch some specific codes
+    switch (opttype) {
+    case XPRS_OPTIMIZETYPE_NONE:
+      return GetSolveResult_General();
+    case XPRS_OPTIMIZETYPE_LP:
+      return GetSolveResult_LP();
+    case XPRS_OPTIMIZETYPE_MIP:
+      return GetSolveResult_MIP();
+    case XPRS_OPTIMIZETYPE_LOCAL:
+    case XPRS_OPTIMIZETYPE_GLOBAL:
+      return GetSolveResult_NLP();    // Same codes?
+    default:
+      return { sol::FAILURE, "failure, unknown OPTIMIZETYPE code" };
+    }
+
+    return { sol::UNKNOWN, "not solved" };
+  }
+
+  std::pair<int, std::string> XpressmpBackend::GetSolveResult_LP() {
     namespace sol = mp::sol;
     auto solstatus = getIntAttr(XPRS_SOLSTATUS);
     bool fFeasible = (XPRS_SOLSTATUS_FEASIBLE==solstatus);
-    if (IsMIP())    // TODO also XPRS_NLPSTATUS
+
+    {
+      auto status = getIntAttr(XPRS_LPSTATUS);
+      switch (status) {
+      case XPRS_LP_OPTIMAL:
+        return { sol::SOLVED, "optimal solution" };
+      case XPRS_LP_INFEAS:
+        return { sol::INFEASIBLE, "infeasible problem" };
+      case XPRS_LP_UNBOUNDED:
+        if (fFeasible)
+          return { sol::UNBOUNDED_FEAS,
+                  "unbounded problem, feasible solution returned" };
+        return { sol::LIMIT_INF_UNB,
+                "unbounded or infeasible, "
+                "switch off dual presolve or run IIS Finder" };
+      case XPRS_LP_CUTOFF:
+        return { sol::UNCERTAIN, "objective cutoff" };
+      case XPRS_LP_CUTOFF_IN_DUAL:
+        return { sol::UNCERTAIN, "objective cutoff in dual" };
+      case XPRS_LP_UNSOLVED:
+        return { sol::NUMERIC, "numerical issues" };
+      case XPRS_LP_UNSTARTED:
+        return { sol::UNKNOWN, "LP unstarted" };
+      case XPRS_LP_NONCONVEX:
+        return { sol::FAILURE, "problem is nonconvex, consider using FICO Xpress Global" };
+      case XPRS_LP_UNFINISHED:
+      default:
+        return GetSolveResult_General();
+      }
+    }
+    return { sol::UNKNOWN, "unknown LP status" };
+  }
+
+  std::pair<int, std::string> XpressmpBackend::GetSolveResult_MIP() {
+    namespace sol = mp::sol;
+    auto solstatus = getIntAttr(XPRS_SOLSTATUS);
+    bool fFeasible = (XPRS_SOLSTATUS_FEASIBLE==solstatus);
+
     {
       auto status = getIntAttr(XPRS_MIPSTATUS);
       switch (status) {
@@ -373,60 +698,175 @@ std::string XpressmpBackend::DoXpressFixedModel()
       case XPRS_MIP_UNBOUNDED:
         if (fFeasible)
           return { sol::UNBOUNDED_FEAS,
-                "unbounded problem, feasible solution returned" };
-        return { sol::UNBOUNDED_NO_FEAS,
-              "unbounded problem, no solution returned" };
+                  "unbounded problem, feasible solution returned" };
+        return { sol::LIMIT_INF_UNB,
+                "unbounded or infeasible, "
+                "switch off dual presolve or run IIS Finder" };
       case XPRS_MIP_LP_NOT_OPTIMAL:
       case XPRS_MIP_NO_SOL_FOUND:
       case XPRS_MIP_LP_OPTIMAL:
-        return { sol::LIMIT_NO_FEAS, "interrupted, no solution" };
-      }
-    }
-    else {
-      auto status = getIntAttr(XPRS_LPSTATUS);
-      switch (status) {
-      case XPRS_LP_OPTIMAL:
-        return { sol::SOLVED, "optimal solution" };
-      case XPRS_LP_INFEAS:
-        return { sol::INFEASIBLE, "infeasible problem" };
-      case XPRS_LP_UNBOUNDED:
-        if (fFeasible)
-          return { sol::UNBOUNDED_FEAS,
-                "unbounded problem, feasible solution returned" };
-        return { sol::UNBOUNDED_NO_FEAS,
-              "unbounded problem, no solution returned" };
-      case XPRS_LP_CUTOFF:
-        return { sol::UNCERTAIN, "objective cutoff" };
-      case XPRS_LP_CUTOFF_IN_DUAL:
-        return { sol::UNCERTAIN, "objective cutoff in dual" };
-      case XPRS_LP_UNFINISHED:
-        if (fFeasible)
-          return { sol::LIMIT_FEAS, "unfinished, feasible solution" };
-        return { sol::LIMIT_NO_FEAS, "unfinished, no solution" };
-      case XPRS_LP_UNSOLVED:
-        return { sol::NUMERIC, "numerical issues" };
-      case XPRS_LP_UNSTARTED:
-        return { sol::UNKNOWN, "unstarted" };
-      case XPRS_LP_NONCONVEX:
-        return { sol::FAILURE, "problem is nonconvex, consider using FICO Xpress Global" };
       default:
-        return { sol::UNKNOWN, "unknown" };
+        return GetSolveResult_General();
       }
     }
-    return { sol::UNKNOWN, "not solved" };
+    return { sol::UNKNOWN, "unknown MIP status" };
   }
 
-  void XpressmpBackend::CreateSolutionPoolEnvironment() {
-    // Solution pool must be created in all cases we specify a stub
-    XPRESSMP_CCALL(XPRS_msp_create(&msp_));
-    XPRESSMP_CCALL(XPRS_msp_probattach(msp_, lp()));
+  std::pair<int, std::string> XpressmpBackend::GetSolveResult_NLP() {
+    namespace sol = mp::sol;
+    // auto solstatus = getIntAttr(XPRS_SOLSTATUS);
+    // bool fFeasible = (XPRS_SOLSTATUS_FEASIBLE==solstatus);
 
-    // Create solutions enumerator only if explicitly needed
-    if (storedOptions_.nbest_ >= 0) {
-      XPRESSMP_CCALL(XPRS_mse_create(&mse_));
-      if (outlev_ > 0)
-        XPRESSMP_CCALL(XPRS_mse_addcbmsghandler(mse_, xp_mse_display, NULL, 0));
+    {
+      auto status = getIntAttr(XPRS_NLPSTATUS);
+      auto solstatus = getIntAttr(XPRS_NLPSOLSTATUS);
+      // should work for UNBOUNDED (@todo also other problem types):
+      bool fFeasible = (XPRS_NLPSOLSTATUS_NONE!=solstatus);
+      std::string msg_duals =
+          (XPRS_NLPSOLSTATUS_SOLUTION_NODUALS==solstatus ||
+                        XPRS_NLPSOLSTATUS_GLOBALLYOPTIMAL_NODUALS==solstatus)
+                                  ? ", no duals" : ", with duals";
+
+      // A global (spatial B&B) solve stopped by a limit reports
+      // NLPSTATUS_LOCALLY_OPTIMAL for its incumbent: report the limit.
+      auto stopstatus = getIntAttr(XPRS_NLPSTOPSTATUS);
+      if (XPRS_STOP_NONE == stopstatus)
+        stopstatus = getIntAttr(XPRS_STOPSTATUS);
+      if (XPRS_NLPSTATUS_LOCALLY_OPTIMAL == status ||
+          XPRS_NLPSTATUS_UNFINISHED == status) {
+        switch (stopstatus) {
+        case XPRS_STOP_TIMELIMIT:
+          return fFeasible
+              ? std::make_pair((int)sol::LIMIT_FEAS_TIME,
+                               "time limit, feasible solution" + msg_duals)
+              : std::make_pair((int)sol::LIMIT_NO_FEAS_TIME,
+                               std::string("time limit, without a feasible solution"));
+        case XPRS_STOP_WORKLIMIT:
+          return fFeasible
+              ? std::make_pair((int)sol::LIMIT_FEAS_WORK,
+                               "work limit, feasible solution" + msg_duals)
+              : std::make_pair((int)sol::LIMIT_NO_FEAS_WORK,
+                               std::string("work limit, without a feasible solution"));
+        case XPRS_STOP_NODELIMIT:
+          return fFeasible
+              ? std::make_pair((int)sol::LIMIT_FEAS_NODES,
+                               "node limit, feasible solution" + msg_duals)
+              : std::make_pair((int)sol::LIMIT_NO_FEAS_NODES,
+                               std::string("node limit, without a feasible solution"));
+        case XPRS_STOP_CTRLC:
+        case XPRS_STOP_USER:
+          return fFeasible
+              ? std::make_pair((int)sol::LIMIT_FEAS_INTERRUPT,
+                               "interrupted, feasible solution" + msg_duals)
+              : std::make_pair((int)sol::LIMIT_NO_FEAS_INTERRUPT,
+                               std::string("interrupted, without a feasible solution"));
+        default:
+          break;
+        }
+      }
+
+      switch (status) {
+      case XPRS_NLPSTATUS_LOCALLY_OPTIMAL:
+        return { sol::OPTIMAL_LOCALLY,
+                "locally optimal solution" + msg_duals };
+      case XPRS_NLPSTATUS_OPTIMAL:
+        return { sol::SOLVED, "optimal solution" + msg_duals };
+      case XPRS_NLPSTATUS_LOCALLY_INFEASIBLE:
+        return { sol::INFEASIBLE_LOCALLY, "locally infeasible" };
+      case XPRS_NLPSTATUS_INFEASIBLE:
+        return { sol::INFEASIBLE, "infeasible problem" };
+      case XPRS_NLPSTATUS_UNBOUNDED:
+        if (fFeasible)
+          return { sol::UNBOUNDED_FEAS,
+              "unbounded problem, feasible solution returned" +
+                  msg_duals
+          };
+        return { sol::LIMIT_INF_UNB,
+                "unbounded or infeasible, "
+                "switch off dual presolve or run IIS Finder" };
+      case XPRS_NLPSTATUS_UNFINISHED:
+      case XSLP_NLPSTATUS_UNSOLVED:
+      default:
+        return GetSolveResult_General();
+      }
     }
+    return GetSolveResult_General();
+  }
+
+  std::pair<int, std::string> XpressmpBackend::GetSolveResult_General() {
+    namespace sol = mp::sol;
+    auto solvestatus = getIntAttr(XPRS_SOLVESTATUS);
+    auto solstatus = getIntAttr(XPRS_SOLSTATUS);
+    auto stopstatus = getIntAttr(XPRS_STOPSTATUS);
+    bool fFeasible = (XPRS_SOLSTATUS_FEASIBLE==solstatus);
+
+    switch (solstatus) {
+    case XPRS_SOLSTATUS_OPTIMAL:
+      return { sol::SOLVED, "optimal solution" };
+    case XPRS_SOLSTATUS_FEASIBLE:
+      switch (stopstatus) {
+      case XPRS_STOP_TIMELIMIT:
+        return { sol::LIMIT_FEAS_TIME, "time limit, feasible solution" };
+      case XPRS_STOP_WORKLIMIT:
+        return { sol::LIMIT_FEAS_WORK, "work limit, feasible solution" };
+      case XPRS_STOP_CTRLC:
+      case XPRS_STOP_USER:
+        return { sol::LIMIT_FEAS_INTERRUPT, "interrupted, feasible solution" };
+      case XPRS_STOP_NODELIMIT:
+        return { sol::LIMIT_FEAS_NODES, "node limit, feasible solution" };
+      case XPRS_STOP_ITERLIMIT:
+        return{ sol::LIMIT_FEAS_ITER, "iteration limit, feasible solution" };
+      case XPRS_STOP_MIPGAP:
+        return{ sol::LIMIT_FEAS_GAP, "MIP gap reached, feasible solution" };
+      case XPRS_STOP_SOLLIMIT:
+        return { sol::LIMIT_FEAS_NUMSOLS, "solution limit" };
+      case XPRS_STOP_MEMORYERROR:
+        return { sol::LIMIT_FEAS_SOFTMEM, "memory limit, feasible solution" };
+      case XPRS_STOP_NUMERICALERROR:
+        return { sol::UNCERTAIN, "numerical error, solution candidate returned" };
+      default:
+        return { sol::LIMIT_FEAS, "limit, feasible solution" };
+      }
+    case XPRS_SOLSTATUS_INFEASIBLE:
+      return { sol::INFEASIBLE, "infeasible problem" };
+    case XPRS_SOLSTATUS_UNBOUNDED:
+      if (fFeasible)
+        return { sol::UNBOUNDED_FEAS,
+                "unbounded problem, feasible solution returned" };
+      return { sol::LIMIT_INF_UNB,
+              "unbounded or infeasible, "
+              "switch off dual presolve or run IIS Finder" };
+    case XPRS_SOLSTATUS_NOTFOUND:
+      if (XPRS_SOLVESTATUS_FAILED==solvestatus)
+        return { sol::FAILURE, "failure, no solution" };
+      switch (stopstatus) {
+      case XPRS_STOP_TIMELIMIT:
+        return { sol::LIMIT_NO_FEAS_TIME, "time limit, without a feasible solution" };
+      case XPRS_STOP_WORKLIMIT:
+        return { sol::LIMIT_NO_FEAS_WORK, "work limit, without a feasible solution" };
+      case XPRS_STOP_CTRLC:
+      case XPRS_STOP_USER:
+        return { sol::LIMIT_NO_FEAS_INTERRUPT, "interrupted, without a feasible solution" };
+      case XPRS_STOP_NODELIMIT:
+        return { sol::LIMIT_NO_FEAS_NODES, "node limit, without a feasible solution" };
+      case XPRS_STOP_ITERLIMIT:
+        return{ sol::LIMIT_NO_FEAS_ITER, "iteration limit, without a feasible solution" };
+      case XPRS_STOP_MEMORYERROR:
+        return { sol::LIMIT_NO_FEAS_SOFTMEM, "memory limit, without a feasible solution" };
+      case XPRS_STOP_NUMERICALERROR:
+        return { sol::UNCERTAIN, "numerical error" };
+      default:
+        return { sol::LIMIT_NO_FEAS, "limit, without a feasible solution" };
+      }
+    }
+    return { sol::UNKNOWN, "unknown status" };
+  }
+
+
+  void XpressmpBackend::CreateSolutionPoolEnvironment() {
+    XPRESSMP_CCALL(XPRS_msp_probattach(msp_, lp()));
+    if (outlev_ > 0)
+      XPRESSMP_CCALL(XPRS_mse_addcbmsghandler(mse_, xp_mse_display, NULL, 0));
 
     //SetSolverOption(XPRS_HEURSTRATEGY, 0);
     SetSolverOption(XPRS_MIPDUALREDUCTIONS, 2);
@@ -456,28 +896,15 @@ std::string XpressmpBackend::DoXpressFixedModel()
     InputXPRESSExtras();
   }
   void XpressmpBackend::InputXPRESSExtras() {
-
-
-    bool doLog = outlev_ > 0 && outlev_ < 5;
-    set_verbose_mode(doLog);
-    if (doLog && !msgCallbackSet_)
-    {
-      msgCallbackSet_ = true;
-      XPRSaddcbmessage(lp(), xpdisplay, NULL, 0);
-    }
-
-    if (storedOptions_.logFile_.size())
-    {
-      XPRESSMP_CCALL(XPRSsetlogfile(lp(), storedOptions_.logFile_.c_str()));
-      XPRSsetintcontrol(lp(), XPRS_OUTPUTLOG, 1);        /* Chat mode */
-    }
-
     if (need_multiple_solutions())
       CreateSolutionPoolEnvironment();
+    if (!storedOptions_.readBasis_.empty())
+      ReadBasisFile();
   }
 
   ArrayRef<double> XpressmpBackend::GetObjectiveValues()
   {
+    if (fixed_model_failed_) return mip_objectives_before_fixed_;
     int n = NumObjs();
     if (n==0)
       return { };
@@ -486,7 +913,10 @@ std::string XpressmpBackend::DoXpressFixedModel()
     std::vector<double> objs(n,
       std::numeric_limits<double>::quiet_NaN());
     for (int i = 0; i < n; i++)
-      XPRESSMP_CCALL(XPRScalcobjn(lp(), i, NULL, &objs[i]));
+      if (XPRScalcobjn(lp(), i,
+                       pool_best_x_.size() ? pool_best_x_.data() : NULL,
+                       &objs[i]))
+        return {};
     return objs;
   }
   
@@ -521,10 +951,32 @@ std::string XpressmpBackend::DoXpressFixedModel()
     { "1", "No", 1},
     { "2", "Honor presolveops bit 3 (2^3 = 8)", 2}
   };
-  static const mp::OptionValueInfo presolve_values_[] = {
-    { "0", "No", 0},
-    { "1", "Yes, removing redundant bounds (default)", 1},
-    { "2", "Yes, retaining redundant bounds", 2}
+
+  static const mp::OptionValueInfo nlp_presolve_values_[] = {
+      { "0", "No", 0},
+      { "1", "Yes (default)", 1},
+      { "2", "Low memory presolve. Original problem is not restored "
+            "by postsolve and dual solution may not be completely "
+            "postsolved.", 2}
+  };
+
+  static const mp::OptionValueInfo nlp_solver_values_[] = {
+      { "-1", "If the license allows and there are no user functions "
+             "or multistart jobs, FICO Xpress Global will be called, "
+             "otherwise a local solver (default)", -1},
+      { "1", "The algorithm selected by alg:localsolver will be used to "
+            "find a locally optimal solution", 1},
+      { "2", "FICO Xpress Global will be used to find a globally "
+            "optimal solution.", 2}
+  };
+
+  static const mp::OptionValueInfo nlp_localsolver_values_[] = {
+      { "-1", "Automatic selection, based on model characteristics "
+             "and solver availability (default)", -1 },
+      { "0", "Use Xpress-SLP (always available)", 0},
+      { "1", "Use Knitro if available", 1},
+      { "2", "Use Xpress-Optimizer if possible (convex quadratic "
+            "problems only).", 2}
   };
 
   static const mp::OptionValueInfo presolveops_values_[] = {
@@ -542,10 +994,19 @@ std::string XpressmpBackend::DoXpressFixedModel()
     { "2048 = 2^11", "No advanced IP reductions", XPRS_PRESOLVEOPS_NOADVANCEDIPREDUCTIONS},
     { "4096 = 2^12", "No eliminations on integers", 12},
     { "16384 = 2^14", "Linearly dependant row removal", XPRS_PRESOLVEOPS_LINEARLYDEPENDANTROWREMOVAL},
-    { "32768 = 2^15", "No integer variable and SOS detection", XPRS_PRESOLVEOPS_NOINTEGERVARIABLEANDSOSDETECTION},
+      { "32768 = 2^15", "No integer variable and SOS detection", XPRS_PRESOLVEOPS_NOINTEGERVARIABLEANDSOSDETECTION},
+      { "65536 = 2^16", "No implied bounds", XPRS_PRESOLVEOPS_NOIMPLIEDBOUNDS},
+      { "131072 = 2^17", "No clique presolve", XPRS_PRESOLVEOPS_NOCLIQUEPRESOLVE},
+      { "262144 = 2^18", "No mod2 presolve", XPRS_PRESOLVEOPS_NOMOD2REDUCTIONS},
     { "536870912 = 2^29", "No dual reduction on globals", XPRS_PRESOLVEOPS_NODUALREDONGLOBALS},
   };
 
+  static const mp::OptionValueInfo values_pool_mode[] = {
+    { "0", "Just collect the solutions found during the normal solve", 0},
+    { "1", "Same as 2", 1},
+    { "2", "Seek \"poollimit\" best solutions (default); "
+           "the solutions reported are limited by poolgap and poolgapabs", 2}
+  };
   static const mp::OptionValueInfo pooldups_values_[] = {
     { "0", "Retain all duplicates", 0},
     { "1", "Discard exact matches", 1},
@@ -555,381 +1016,52 @@ std::string XpressmpBackend::DoXpressFixedModel()
     " variables (default)", 3}
   };
 
-  static const mp::OptionValueInfo values_method[] = {
-    { "1", "Automatic choice (default)", 1},
-    { "2", "Dual simplex", 2},
-    { "3", "Primal simplex", 3},
-    { "4", "Netwon Barrier", 4}
-  };
-
-  static const mp::OptionValueInfo values_baralg[] = {
-    { "-1", "Automatic choice (default)", -1},
-    { "1", "Infeasible-start barrier algorithm", 1},
-    { "2", "Homogeneous self-dual barrier algorithm", 2},
-    { "3", "Start with 2 and maybe switch to 1 while solving", 3}
-  };
-
-  static const mp::OptionValueInfo values_barstart[] = {
-    { "-1", "Use incoming solution for warm start", -1},
-    { "0",  "Automatic choice (default)", 0},
-    { "1", "Heuristics based on magnitudes of matrix entries", 1},
-    { "2", "Use pseudoinverse of constraint matrix", 2},
-    { "3", "Unit starting point for homogeneous self - dual "
-          "barrier algorithm.", 3}
-  };
-
-  static const mp::OptionValueInfo values_barcholeskyalg[] = {
-    {"-1", "Automatic choice (default)", -1},
-    {"1", "manual matrix blocking", 1},
-    {"2", "manual blocking: single-pass (multi-pass if not set)", 2},
-    {"4", "nonseparable QP relaxation", 4},
-    {"8", "manual corrector weight (honor \"16\" bit)", 8},
-    {"16", "manual corrector weight \"on\"", 16},
-    {"32", "manual refinement", 32},
-    {"64", "use preconditioned conjugate gradients", 64},
-    {"128", "refine with QMR (quasi-minimal residual)", 128},
-    {"256", "perform refinement on the augmented system", 256},
-    {"512", "force highest accuracy in refinement", 512}
-
-  };
-  static const mp::OptionValueInfo values_barcrash[] = {
-    { "0", "No crash", 0},
-    { "1-6", "Available strategies", 2}
-  };
-
-  static const mp::OptionValueInfo values_barkernel[] = {
-    { ">= +1.0", "More emphasis on centrality (default 1.0)", 0},
-    { "<= -1.0", "Each iteration, adaptively select a value "
-    "from [+1, -barkernel]", 2}
-  };
 
 
-  static const mp::OptionValueInfo values_barobjperturb[] = {
-    { "n > 0", "automatic decison, scale n", 1},
-    { "n = 0", "turn off perturbation", 0},
-    { "n < 0", "force perturbation by abs(n)", -1}
-  };
 
-  static const mp::OptionValueInfo values_barobjscale[] = {
-    {"-1", "Automatic choice (default)", -1},
-    {"0", "Scale by the geometric mean of the objective coefficients", 0},
-    {"> 0", "Scale so the argest objective coefficient in absolute "
-            "value is <= barobjscale.", 1}
-  };
 
-  static const mp::OptionValueInfo values_barorder[] = {
-    { "0", "automatic choice(default)", 0},
-    { "1", "minimum degree", 1},
-    { "2", "minimum local fill", 2},
-    { "3", "nested dissection",3}
-  };
 
-  static const mp::OptionValueInfo values_baroutput[] = {
-    { "0", "no output", 0},
-    { "1", "each iteration (default)", 1} 
-  };
 
-  static const mp::OptionValueInfo barpresolve_desc[] = {
-    { "0", "use standard presolve (default)", 0},
-    { "1", "use more effort", 1},
-    {"2", "do full matrix eliminations for size reduction", 2}
-  };
 
-  static const mp::OptionValueInfo values_barrefiter[] = {
-    { "0", "default", 0},
-    { "n > 0", "perform n refinement iterations", 1}
-  };
 
-  static const mp::OptionValueInfo values_barregularize[] = {
-    {"1", "use \"standard\" regularization", 1},
-    {"2", "use \"reduced\" regularization: less perturbation than \"standard\" regularization", 2},
-    {"4", "keep dependent rows in the KKT system",4},
-    {"8", "keep degenerate rows in the KKT system", 8}
- };
-  static const mp::OptionValueInfo values_bigmmethod[] = {
-    { "0", "phase I / II", 0},
-    { "1", "bigM method (default)", 1}
-  };
 
-  static const mp::OptionValueInfo values_branchchoice[] = {
-    {"0", "explore branch with min.estimate first(default)", 0},
-    {"1", "explore branch with max.estimate first", 1},
-    {"2", "if an incumbent solution exists, first explore "
-          "the branch satisfied by the incumbent; "
-          "otherwise use choice 0 (min.est.first).", 2},
-    {"3", "(default) explore the first branch that moves the "
-          "branching variable away from its value at the "
-          "root node; if the branching entity is not a "
-          "simple variable, assume branchchoice=0.", 3}
-  };
 
-  static const mp::OptionValueInfo values_branchdisj[] = {
-    {"-1", "automatic choice (default)", 0},
-    {"0", "disabled", 0},
-    {"1", "cautious strategy : create branches only for "
-        "general integers with a wide range", 1},
-    {"2", "moderate strategy", 2},
-    {"3", "aggressive strategy : create disjunctive branches "
-    "for both binaryand integer variables", 3}
-  };
 
-  static const mp::OptionValueInfo values_clamping[] = {
-    {"-1", "Determined automatically", -1},
-    {"0", "Adjust primal solution to always be within primal bounds (default)", 0},
-    {"1", "Adjust primal slack values to always be within constraint bounds", 1},
-    {"2", "Adjust dual solution to always be within the dual bounds implied by the slacks", 2},
-    {"3", "Adjust reduced costs to always be within dual bounds implied by the primal solution", 3}
-  };
 
-  static const mp::OptionValueInfo values_cpuplatform[] = {
-  {"-2", "Highest supported [Generic, SSE2, AVX or AVX2]", -2},
-  {"-1", "Highest supported solve path consistent code [Generic, SSE2 or AVX] (default)", -1},
-  {"0", "Use generic code compatible with all CPUs", 0},
-  {"1", "Use SSE2", 1},
-  {"2", "Use AVX", 2},
-  {"3", "Use AVX2", 3}
-  };
 
-  static const mp::OptionValueInfo values_cputime[] = {
-    {"-1", "disable the timer", -1},
-    {"0", "use elapsed time (default)", 0},
-    {"1", "use process time", 1}
-  };
 
-  static const mp::OptionValueInfo values_crash[] = {
-    {"0", "none", 0},
-    {"1", "one-pass search for singletons", 1},
-    {"2", "multi-pass search for singletons", 2},
-    {"3", "multi-pass search including slacks", 3},
-    {"4", "at most 10 passes, only considering slacks at the end", 4},
-    {"n>10", " like 4, but at most n-10 passes", 5},
-    {"0 (dual)", "perform standard crash.", 0},
-    {"1 (dual)", "perform additional numerical checks during crash", 1},
-    {"2 (dual)", "extend the set of column candidates for crash", 2},
-    {"3 (dual)", "extend the set of row candidates for crash", 3},
-    {"4 (dual)", "force crash", 4}
-  };
 
-  static const mp::OptionValueInfo values_barcrossover[] = {
-  {"-1", "automatic choice (default)", -1},
-  { "0", "none: return an interior solution", 0},
-  { "1", "primal crossover first", 1},
-  { "2", "dual crossover first", 2}
-  };
 
-  static const mp::OptionValueInfo values_barcrossoverops[] = {
- { "1", "return the barrier solution (rather than the last intermediate solution) when crossover stop early", 1},
- { "2", "skip the second crossover stage", 2},
- { "4", "skip pivots that are \"less numerically reliable\"", 4},
- { "8", "do a slower but more numerically stable crossover", 8},
-  };
 
-  static const mp::OptionValueInfo values_cutselect[] = {
-    {"32", "clique cuts", 32},
-    {"64", "mixed - integer founding(MIR) cuts", 64},
-    {"128", "lifted cover cuts", 128},
-    {"2048", "flow path cuts", 2048},
-    {"4096", "implication cuts", 4096},
-    {"8192", "automatic lift - and -project strategy", 8192},
-    {"16384", "disable cutting from cut rows", 16384},
-    {"32768", "lifted GUB cover cuts", 32768},
-    {"65536", "zero - half cuts", 65536},
-    {"131072", "indicator - constraint cuts", 131072},
-    {"-1", "all available cuts(default)", -1}
-  };
-  static const mp::OptionValueInfo values_cutstrategy[] = {
-    {"-1", "automatic (default)", -1},
-    {"0", "no cuts", 0},
-    {"1", "conservative strategy", 1},
-    {"2", "moderate strategy", 2},
-    {"3", "aggressive strategy", 3}
-  };
 
-  static const mp::OptionValueInfo values_deterministic[] = {
-    {"0", "no", 0},
-    {"1", "yes", 1},
-    {"2", "yes, with opportunistic root LP solve", 1},
-  };
 
-  static const mp::OptionValueInfo values_feasibilityjump[] = {
-  {"-1", "automatic", 0},
-  {"0", "off", 0},
-  {"1", "run on models with all integer variables", 1},
-  {"2", "run if all non-integer variables have bounds [0, 1]", 2},
-  {"3", "run if all non-integer variables have integer bounds", 3}
-  };
 
-  static const mp::OptionValueInfo values_lpdualgradient[] = {
-   {"-1", "automatic (default)", -1},
-   {"0", "devex", 0},
-   {"1", "steepest edge", 1},
-   {"2", "direct steepest edge", 2},
-   {"3", "sparse devex", 3}
-  };
+  
 
-  static const mp::OptionValueInfo values_lpdualize[] = {
- {"-1", "automatic (default)", -1},
- {"0", "solve the primal problem", 0},
- {"1", "solve the dual problem", 1}
-  };
-  static const mp::OptionValueInfo values_lpdualstrategy[] = {
-    {"1", "switch to primal when dual infeasible", 1},
-    {"2", "stop the solve instead of switching to primal", 2},
-    {"4", "use aggressive cut-off in MIP search", 4},
-    {"8", "use dual simplex to remove cost perturbations", 8},
-    {"16", "aggressive dual pivoting", 16},
-    {"32", "keep using dual simplex even when numerically unstable", 32}
-  };
+
+
+
 #define xstr(a) stringify(a)
 #define stringify(a) #a
 
-  static const mp::OptionValueInfo values_feasibilitypump[] = {
-    {xstr(XPRS_FEASIBILITYPUMP_AUTOMATIC), "automatic (default)", XPRS_FEASIBILITYPUMP_AUTOMATIC},
-    {xstr(XPRS_FEASIBILITYPUMP_NEVER), "turned off", },
-    {xstr(XPRS_FEASIBILITYPUMP_ALWAYS), "always run", 2},
-    {xstr(XPRS_FEASIBILITYPUMP_LASTRESORT), "run if other heuristics have failed to find an integer solution", 4}
-  };
-  static const mp::OptionValueInfo values_heurdivesoftrounding[] = {
-    {"-1", "automatic (default)", -1},
-    {"0", "do not use soft rounding", 0},
-    {"1", "cautious use", 1},
-    {"2", "aggressing use", 2}
-  };
 
-  static const mp::OptionValueInfo values_heurdivespeed[] = {
-    {"-2", "automatic bias toward quality", -2},
-    {"-1", "automatic bias toward speed (default)", -1},
-    {"0", "emphasize quality", 0},
-    {"1-3", "intermediate emphasis", 1},
-    {"4", "emphasize speed", 4}
-  };
 
-  static const mp::OptionValueInfo values_heurdivestrategy[] = {
-   {"-1", "automatic selection (default)", -1},
-   {"0", "disable heuristics", 0},
-   {"1-18", "available pre-set strategies for rounding infeasible global entities", 1},
-  };
 
-    static const mp::OptionValueInfo values_heuremphasis[] = {
-            {"-1", "default strategy (default)", -1},
-            {"0", "disable heuristics", 0},
-            {"1", "focus on reducing the gap early", 1},
-            {"2", "extremely aggressive heuristics", 2},
-    };
 
-    static const mp::OptionValueInfo values_heursearchfreq[] = {
-            {"-1", "automatic (default)", -1},
-            {"0", "disabled in the tree", 0},
-            {"n>0", "number of nodes between each run", 1}
-    };
 
-    static const mp::OptionValueInfo values_heursearchrootcutfreq[] = {
-            {"-1", "automatic (default)", -1},
-            {"0", "disabled during cutting", 0},
-            {"n>0", "number cutting rounds between each run", 1}
-    };
 
-    static const mp::OptionValueInfo values_heursearchrootcutselect[] = {
-            {"1", "local search with a large neighborhood. Potentially slow but is good for finding solutions that differs significantly from the incumbent", 1},
-            {"2", "local search with a small neighborhood centered around a node LP solution", 2},
-            {"4", "local search with a small neighborhood centered around an integer solution. This heuristic will often provide smaller, incremental improvements to an incumbent solution", 4},
-            {"8", "local search with a neighborhood set up through the combination of multiple integer solutions.", 8},
-            {"32", "local search without an objective function", 32},
-            {"64", "local search with an auxiliary objective function", 64}
-    };
 
-    static const mp::OptionValueInfo values_heurthreads[] = {
-            {"-1", "determined from \"threads\" keyword", -1},
-            {"0", "no separate threads (default)", 0},
-            {"n>0", "use n threads", 1}
-    };
 
-    static const mp::OptionValueInfo values_historycosts[] = {
-            {"-1", "automatic (default)", -1},
-            {"0", "no update", 0},
-            {"1","initialize using only regular branches from the root to the current node", 1},
-            {"2", "same as 1, but initialize with strong branching results as well", 2},
-            {"3", "initialize using any regular branching or strong branching information from all nodes solves before the current node", 3}
-    };
 
-    static const mp::OptionValueInfo values_keepbasis[] = {
-            {"0", "ignore previous basis", 0},
-            {"1", "use previous basis (default)", 1},
-            {"2", "use previous basis only if the number of basic variables == number of constraints", 2}
-    };
 
-    static const mp::OptionValueInfo values_keepnrows[] = {
-            {"-1", "delete N type rows from the matrix (default)", -1},
-            {"0", "delete elements from N type rows leaving empty N type rows in the matrix", 0},
-            {"1","keep N type rows", 1}
-    };
 
-    static const mp::OptionValueInfo values_localchoice[] = {
-            {"1", "never backtrack from the first child unless it is dropped "
-                  "(i.e., is infeasible or cut off) (default)", 1},
-            {"2", "always solve both child nodes before deciding which child to continue with", 2},
-            {"3", "automatically determined", 2},
-    };
 
-    static const mp::OptionValueInfo values_mipconcurrentnodes[] = {
-           {"-1", "automatic (default)", -1},
-           {"n > 0", "number of nodes to complete", 1}
-    };
 
-    static const mp::OptionValueInfo values_mipconcurrentsolves[] = {
-       {"-1", "enabled, the number of concurrent solves "
-				  "depends on mipthreads", -1},
-       {"0", "disabled (default)", 0},
-       {"1", "disabled (default)", 1},
-      {"n > 1", "number of concurrent solves = n", 2},
-    };
 
-    static const mp::OptionValueInfo values_mipdualreductions[] = {
-      {"0", "none", 0},
-      {"1", "all (default)", 1},
-      {"2", "restrict dual reductions to continuous variables", 2},
-    };
 
-  static const mp::OptionValueInfo values_mipkappafreq[] = {
-  {"0", "never (default)", 0},
-  {"1", "every node", 1},
-  {"n > 1", "once per node at level n of the branch-and-bound tree", 2} };
 
-  static const mp::OptionValueInfo values_qsimplexops[] = {
-    { "1", "traditional primal first phase (default)", 1},
-    { "2", "force Big M primal first phase", 2},
-    { "4", "force traditional dual first phase", 4},
-    { "8", "force BigM dual first phase", 8},
-    { "16", "always use artificial bounds in dual", 16},
-    { "32", "use original problem basis only when warmstarting the KKT", 32},
-    { "64", "skip the primal bound flips for ranged primals (might cause "
-    "more trouble than good if the bounds are very large)", 64},
-    { "128", "also do the single pivot crash", 128},
-    { "256", "do not apply aggressive perturbation in dual", 256}
-};
 
-  static const mp::OptionValueInfo values_mippresolve[] = {
-  { "1", "reduced-cost fixing at each node", 1},
-  { "2", "primal reductions will be performed at each node", 2},
-  { "8", "allow changing continuous-variable bounds", 8},
-  { "16", "allow dual reductions", 16},
-  { "32", "allow global tightening of the problem", 32},
-  { "64", "use objective function", 64},
-  { "128", "allow restarting", 128},
-  { "256", "allow use of symmetry", 256}
-  };
 
-  static const mp::OptionValueInfo values_miprampup[] = {
-   {"-1", "automatic choice (default)", -1},
-   {"0", "no: use as many tasks as possible", 0},
-   {"1", "yes, until finished with initial dives", 1}
-  };
-  static const mp::OptionValueInfo values_miprestart[] = {
-   {"-1", "automatic choice (default)", -1},
-   {"0", "disable in-tree restarts", 0},
-   {"1", "normal aggressiveness", 1},
-   {"2", "higher aggressiveness", 2},
-  };
 
   static const mp::OptionValueInfo values_miqcpalg[]{
     {"-1", "automatic (default)", -1},
@@ -979,19 +1111,13 @@ std::string XpressmpBackend::DoXpressFixedModel()
  };
 
   static const mp::OptionValueInfo values_predomcol[]{
-{"-1","automatic (default)", -1},
-{"0", "disable", 0},
-{"1", "cautious", 1},
-{"2", "aggressive: all candidate will be checked", 2}
+    {"-1","automatic (default)", -1},
+    {"0", "disable", 0},
+    {"1", "cautious", 1},
+    {"2", "aggressive: all candidate will be checked", 2},
+    {"3", "includes 1 and 2 but also looks for more generic column domination", 3}
   };
 
-  static const mp::OptionValueInfo values_predomrow[] = {
- {"-1", "automatic choice (default)", -1},
- {"0", "disabled", 0},
- {"1", "cautious", 1},
- {"2", "medium", 2},
- {"3", "aggressive", 3}
-  };
 
   static const mp::OptionValueInfo values_preduprow[]{
     {"-1","automatic (default)", -1},
@@ -1015,88 +1141,16 @@ std::string XpressmpBackend::DoXpressFixedModel()
     {"3", "steepest edge with initial weights", 3}
   };
 
-  const mp::OptionValueInfo values_yesnoinverted_defaultyes[] = {
-  {     "0", "yes (default)", 0 },
-  {     "1", "no", 1}
-  };
-  const mp::OptionValueInfo values_yesnoinverted_defaultno[] = {
-  {     "0", "yes", 0 },
-  {     "1", "no (default)", 1}
-  };
 
-  const mp::OptionValueInfo values_pwlnonconvextransformation[] = {
-    {"-1", "automatic (default)", -1},
-    {     "0", "use a formulation based on SOS2-constraints", 0 },
-    {     "1", "use a formulation based on binary variables", 1}
-  };
 
-  const mp::OptionValueInfo values_qcrootalg[] = {
-  {"-1", "automatic (default)", -1},
-  {     "0", "use barrier", 0 },
-  {     "1", "use dual simplex on outer approximation", 1}
-  };
 
-  const mp::OptionValueInfo values_refineops[] = {
- { "1", "refine optimal LP solutions", 1},
-    { "2", "refine MIP solutions", 2},
-    { "8", "refine each node of the search tree", 8},
-    { "16", "refine non-global solutions", 16},
-    { "32", "apply the iterative refiner to refine the solution", 32},
-    { "64", "use higher precision in the iterative refinement", 64},
-    { "128", "iterative refiner will use the primal simplex algorithm", 128},
-    { "256", "iterative refiner will use the dual simplex algorithm", 256},
 
-    { "512", "refine MIP solutions such that rounding them keeps the problem "
-    "feasible when reoptimized", 512},
-    { "1024", "ttempt to refine MIP solutions such that rounding them keeps the "
-    "problem feasible when reoptimized, but accept integers solutions even if "
-    "refinement fails", 1024},
-  };
 
-  const mp::OptionValueInfo values_sbbest[] = {
-{"-1", "automatic (default)", -1},
-{"0", "disable strong branching", 0 },
-{"n > 1", "perform strong branching on up to n entities at each node", 1}
-  };
-  const mp::OptionValueInfo values_sbestimate[] = {
-{"-1", "automatic (default)", -1},
-{"1-6", "different variants of local pseudo costs.", 1}
-  };
 
-  const mp::OptionValueInfo values_sbselect[] = {
-    {"-2", "automatic - low effort (default)", -2},
-    {"-1", "automatic - high effort", -1},
-    {"n > 0", "include max(n, sbbest) candidates", 1},
-  };
-  const mp::OptionValueInfo values_scaling[] = {
-    {"1", "row scaling", 1},
-    {"2", "column scaling", 2},
-    {"4", "row scaling again", 4},
-    {"8", "maximum", 8},
-    {"16", "Curtis-Red", 16},
-    {"32", "0->geometric mean, 1->maximum element", 32},
-    {"64", "no special handling for BigM rows", 64},
-    {"128", "scale objective function for the simplex method", 128},
-    {"256", "exclude the quadratic part of constraints when calculating scaling factors", 256},
-    {"512", "scale before presolve", 512},
-    {"1024", "do not scale constraints up", 1024},
-    {"2048", "do not scale variables down", 2048},
-    {"4096", "do not apply automatic global objective scaling", 4096},
-    {"8192", "RHS scaling", 8192},
-    {"16384", "disable aggressive quadratic scaling", 16384},
-    {"32768", "explicit linear slack scaling", 32768}
-  };
 
-  const mp::OptionValueInfo values_siftpresolveops[] = {
-    {"-1", "use the  \"presolveops\" setting specified for the original problem", -1},
-    {">=0", "use the value (see \"presolveops\" for its semantic)", 0}
-  };
 
-  const mp::OptionValueInfo values_siftswitch[] = {
-    {"-1", "dual simplex", -1},
-    {"0", "barrier", 0},
-    {">0", "use the barrier algorithm while the number of dual infeasibilities is larger than this value, otherwise use dual simplex", 1}
-  };
+
+
 
   const mp::OptionValueInfo values_sleeponthreadwait[] = {
    {"-1", "automatically determined", -1},
@@ -1104,71 +1158,42 @@ std::string XpressmpBackend::DoXpressFixedModel()
    {">0", "yes (sleep, might add overhead)", 1}
   };
 
-  const mp::OptionValueInfo values_symmetry[] = {
-    {"0", "no simmetry detection", 0},
-    {"1", "conservative effort", 1},
-    {"2", "intensive effort", 2}
-  };
-  const mp::OptionValueInfo values_symselect[] = {
-    {"0", "search the whole matrix (otherwise the 0, 1 and -1 coefficients only)", 0},
-    {"1", "search all entities(otherwise binaries only)", 1} };
 
-  const mp::OptionValueInfo values_tunerhistory[] = {
-    {"0", "Discard any previous result", 0},
-    {"1", "Append new results but do not reuse them", 1},
-    {"2", "Reuse and append new results", 2}
-  };
-
-  const mp::OptionValueInfo values_tunermethod[] = {
-      {"- 1", "automatic choice(default)", -1},
-      {"0", "default LP tuner", 0},
-      {"1", "default MIP tuner", 1},
-      {"2", "more elaborate MIP tuner", 2},
-      {"3", "root - focused MIP tuner", 3},
-      {"4", "tree - focused MIP tuner", 4},
-      {"5", "simple MIP tuner", 5},
-      {"6", "default SLP tuner", 6},
-      {"7", "default MISLP tuner", 7},
-      {"8", "MIP tuner using primal heuristics", 8}
-  };
-  const mp::OptionValueInfo values_tunertarget[] = {
-    {"- 1", "automatic choice(default)",-1},
-    {"0", "solution time, then integrality gap", 0},
-      {"1", "solution time, then best bound",1},
-       {"2", "solution time, then best integer solution",2},
-       {"3", "the \"primal dual integral\", whatever that is",3},
-       {"4", "just solution time (default for LPs)",4},
-       {"5", "just objective value" ,5},
-       {"6", "validation number (probably not relevant)",6},
-       {"7", "gap only" , 7},
-       {"8", "best bound only" , 8},
-       {"9", "best integer solution only" , 9},
-       {"10", "best primal integral - only for individual instances" , 10}
-  }; 
+ 
   
-  const mp::OptionValueInfo values_varselection[] = {
-    {"- 1", "automatic choice(default)", -1},
-    {"1", "minimum of the 'up' and 'down' pseudo - costs", 1},
-    {"2", "'up' pseudo - cost + 'down' pseudo - cost", 2},
-    {"3", "maximum of the 'up' and 'down' pseudo - costs plus twice their minimum", 3},
-    {"4", "maximum of the 'up' and 'down' pseudo - costs", 4},
-    {"5", "the 'down' pseudo - cost", 5},
-    {"6", "the 'up' pseudo - cost", 6},
-    {"7", "weighted combination of the 'up' and 'down' pseudo costs", 7},
-    {"8", "product of 'up' and 'down' pseudo costs", 8}
-  };
 
-  
+/// @note The AddSolverOptions()
+///   are complemented by those from
+///   optprm.h and nlprm.h,
+///   obtained from optimizerparams.xml and nonlinearparams.xml
+///   using parse-xpress-options
+///   (see BUILD_XPRESS_OPTION_PARSER).
+///
+/// @note Might add prefix XPRS_ to the params of optimizerparams.xml
+///   as the last argument of parse_xpress_options.
+///
+/// @note Run the parser as follows:
+///   bin/parse-xpress-options ../../solver-libraries/xpress/46.01.01/xml/nonlinearparams.xml ../mp/solvers/xpress/nlprm.h Nonlinear
+///   bin/parse-xpress-options ../../solver-libraries/xpress/46.01.01/xml/optimizerparams.xml ../mp/solvers/xpress/optprm.h Optimizer XPRS
+///
+/// @note Option names are synonymized,
+///   descriptions are replaced.
 void XpressmpBackend::InitCustomOptions() {
 
   set_option_header(
       "XPRESS Optimizer Options for AMPL\n"
-      "--------------------------------------------\n"
+      "---------------------------------\n"
       "\n"
       "To set these options, assign a string specifying their values to the "
       "AMPL option ``xpress_options``. For example::\n"
       "\n"
       "  ampl: option xpress_options 'mipgap=1e-6';\n");
+
+  AddToOptionDescription(
+      "tech:writesolution",
+      "Supported name extensions: "
+      "``.sol/.prt``, ``.iss``, ``.bas/.bss``.");
+
 
   // ****************************
   // General
@@ -1178,87 +1203,83 @@ void XpressmpBackend::InitCustomOptions() {
     "\n.. value-table::\n",
     outlev_, values_outlev);
 
-  AddSolverOption("tech:cputime cputime",
-    "How time should be measured when timings are reported in the log and when checking against time limits :\n"
-    "\n.. value-table::\n",
-    XPRS_CPUTIME, values_cputime, 0);
+  AddSolverOption("tech:cputime",
+    "",
+    XPRS_CPUTIME, INT_MIN, INT_MAX);
 
-  AddSolverOption("tech:threads threads",
-    "The default number of threads used during optimization.;"
-    "default - 1 ==> automatic choice.",
+  AddSolverOption("tech:threads",
+    "",
     XPRS_THREADS, -1, INT_MAX);
 
-  AddSolverOption("tech:backgroundthreads backgroundmaxthreads backgroundthreads",
-    "Limits the number of threads that Xpress will use for jobs in the background;"
-    "default - 1 ==> automatic choice.",
+  AddSolverOption("tech:backgroundthreads backgroundthreads",
+    "",
     XPRS_BACKGROUNDMAXTHREADS, -1, INT_MAX);
 
-  AddSolverOption("tech:backgroundselect backgroundselect",
-    "Select which tasks to run in background jobs;"
-    "default - 1 ==> automatic choice. Set to 0 to not to run any task in the background or "
-    "to 1 to run the feasibility jump heuristic in the background.",
+  AddSolverOption("tech:backgroundselect",
+    "",
     XPRS_BACKGROUNDSELECT, -1, 1);
   
-  AddSolverOption("lim:time timelim timelimit",
-    "Limit on solve time (in seconds; default: no limit). ",
+  AddSolverOption("lim:time timelim",
+    "",
     XPRS_TIMELIMIT, 0.0, Infinity());
 
-  AddSolverOption("lim:soltime soltimelim soltimelimit",
-    "Limit on solve time (in seconds; default: no limit) to be applied only "
-    "after a solution has been found.",
+
+  AddSolverOption("lim:prerootwork prerootworklim",
+    "",
+    XPRS_PREROOTWORKLIMIT, -DBL_MAX, DBL_MAX);
+  
+    AddSolverOption("lim:prerooteffort mip:prerooteffort",
+      "",
+      XPRS_PREROOTEFFORT, -DBL_MAX, DBL_MAX);
+
+  AddSolverOption("lim:work worklim",
+    "",
+    XPRS_WORKLIMIT, 0.0, DBL_MAX);
+
+
+  AddSolverOption("lim:soltime soltimelim",
+    "",
     XPRS_SOLTIMELIMIT, 0.0, Infinity());
 
   AddSolverOption("tech:sleeponthreadwait sleeponthreadwait",
-    "Whether threads should sleep while awaiting work:\n"
-    "\n.. value-table::\n",
+    "Deprecated: ignored by the current Xpress library.",
     XPRS_SLEEPONTHREADWAIT, values_sleeponthreadwait,  -1);
 
-    AddSolverOption("lim:iter lpiterlimit iterlim",
-        "The maximum number of iterations that will be performed "
-        "by primal simplex or dual simplex before the optimization "
-        "process terminates. For MIP problems, this is the maximum "
-        "total number of iterations over all nodes.",
-        XPRS_LPITERLIMIT, 2147483645, INT_MAX);
+  AddSolverOption("lim:iter iterlim",
+    "",
+    XPRS_LPITERLIMIT, 2147483645, INT_MAX);
 
-    AddSolverOption("lim:lprefineiter lprefineiterlimit",
-                    "This specifies the simplex iteration limit the solution "
-                    "refiner can spend in attempting to increase the accuracy "
-                    "of an LP solution; default=-1 (automatic).",
-                    XPRS_LPREFINEITERLIMIT, -1, INT_MAX);
+    AddSolverOption("lim:lprefineiter",
+      "",
+      XPRS_LPREFINEITERLIMIT, -1, INT_MAX);
 
-    AddSolverOption("lim:maxcuttime maxcuttime",
-                    "The maximum amount of time allowed for generation of cutting planes and reoptimization;"
-                    "default=0 (no time limit)",
-                    XPRS_MAXCUTTIME, 0.0, Infinity());
+    AddSolverOption("lim:maxcuttime",
+      "",
+      XPRS_MAXCUTTIME, 0.0, Infinity());
 
-    AddSolverOption("tech:globalfilemax globalfilemax",
-    "Maximum megabytes for temporary files storing the global search "
-    "tree: a new file is started if globalfilemax megabytes would be exceeded.",
-    XPRS_MAXGLOBALFILESIZE, 0, INT_MAX);
+  AddSolverOption("lim:maxtreefilesize globalfilemax tech:globalfilemax",
+    "",
+    XPRS_MAXTREEFILESIZE, INT_MIN, INT_MAX);
 
-  AddSolverOption("tech:globalfileloginterval globalfileloginterval",
-    "Seconds between additions to the logfile about, additions "
-		"to the \"global file\", a temporary file written during a "
-		"global search. Default = 60.",
-    XPRS_GLOBALFILELOGINTERVAL, 1, INT_MAX);
+  AddSolverOption("mip:treefileloginterval globalfileloginterval tech:globalfileloginterval",
+    "",
+    XPRS_TREEFILELOGINTERVAL, INT_MIN, INT_MAX);
 
   AddStoredOption("tech:logfile logfile",
     "Log file name; default=no file", storedOptions_.logFile_);
 
-  AddSolverOption("lim:mem memlimit maxmemoryhard",
-                  "Hard limit (integer number of MB) on memory allocated, "
-                  "causing early termination if exceeded; default = 0 (no limit)",
-                  XPRS_MAXMEMORYHARD, 0, INT_MAX);
+  AddSolverOption("lim:mem memlimit",
+    "",
+    XPRS_MAXMEMORYHARD, 0, INT_MAX);
 
-    AddSolverOption("lim:softmem softmemlimit maxmemorysoft",
-                    "Soft limit (integer number of MB) on memory allocated; "
-                    "default = 0 (no limit)",
-                    XPRS_MAXMEMORYSOFT, 0, INT_MAX);
+    AddSolverOption("lim:softmem softmemlimit",
+      "",
+      XPRS_MAXMEMORYSOFT, 0, INT_MAX);
   // ****************************
   // Solution pool params
   // ****************************
   AddStoredOption("sol:pooldualred pooldualred",
-    "Whether to suppress removal of dominated solutions(via "
+		"Whether to suppress removal of dominated solutions (via "
       "\"dual reductions\") when poolstub is specified:\n"
     "\n.. value-table::\n",
     storedOptions_.pooldualred_, pool_values_);
@@ -1269,60 +1290,62 @@ void XpressmpBackend::InitCustomOptions() {
     "\n.. value-table::\n",
     storedOptions_.pooldupcol_, pool_values_);
 
-  AddSolverOption("sol:pooldups poold/ups",
-    "How poolstub should handle duplicate solutions:\n"
-    "\n.. value-table::\nRounding of discrete variables is affected by"
-    "poolmiptol and poolfeastol",
-    XPRS_MSP_DUPLICATESOLUTIONSPOLICY, pooldups_values_, 3);
+  AddSolverOption("sol:pooldups pooldups",
+    "How the solution pool handles duplicate solutions:\n"
+    "\n.. value-table::\n",
+    MspControl{XPRS_MSP_DUPLICATESOLUTIONSPOLICY}, pooldups_values_, 3);
 
   AddOptionSynonyms_Inline_Front("ams_stub", "sol:stub");
 
-  AddSolverOption("sol:poolfeastol poolfeastol",
-    "Zero tolerance for discrete variables in the solution "
-    "pool (default 1e-6)",
-    XPRS_MSP_SOL_FEASTOL, 0, 1);
-
-  AddSolverOption("sol:poolmiptol poolmiptol",
-    "Error (nonintegrality) allowed in discrete variables "
-    "in the solution pool (default 5e-6)",
-    XPRS_MSP_SOL_MIPTOL, 0, 1);
-
-  AddStoredOption("sol:poolnbest poolnbest poollimit",
-    "Whether the solution pool (see poolstub) should contain "
-    "inferior solutions.  When poolnbest = n > 1, the "
-    "solution pool is allowed to keep the n best solutions.",
+  AddStoredOption("sol:poollimit ams_limit poollimit poolnbest solnlimit",
+    "Limit on the number of alternative MIP solutions kept in the "
+    "solution pool (see sol:stub, sol:count). Default 10.",
     storedOptions_.nbest_);
 
-    AddSolverOption("lim:mipsol maxmipsol",
-                    "Limit on the number of MIP solutions to be found (default no limit).",
-                    XPRS_MAXMIPSOL, 0, INT_MAX);
+  AddStoredOption("sol:poolmode ams_mode poolmode",
+    "Search mode for MIP solutions when sol:stub/sol:count are specified "
+    "to request finding several alternative solutions:\n"
+    "\n.. value-table::\n",
+    storedOptions_.nPoolMode_, values_pool_mode);
 
-    AddSolverOption("lim:nodes nodelim nodelimit maxnode",
-                    "Maximum MIP nodes to explore (default: 2147483647).",
-                    XPRS_MAXNODE, 2147483647, INT_MAX);
+  AddStoredOption("sol:poolgap ams_eps poolgap",
+    "Relative tolerance for reporting alternate MIP solutions "
+    "(default: no limit): a solution is reported if its objective "
+    "is within poolgap * |best objective| of the best one.",
+    storedOptions_.poolGap_);
 
-    AddSolverOption("lim:stalltime maxstalltime",
-                    "Maximum time in seconds that the MIP Optimizer will continue to search "
-                    "for improving solution after finding a new incumbent, default=0 (no limit)",
-                    XPRS_MAXSTALLTIME, 0.0, Infinity());
+  AddStoredOption("sol:poolgapabs ams_epsabs poolgapabs",
+    "Absolute tolerance for reporting alternate MIP solutions "
+    "(default: no limit).",
+    storedOptions_.poolGapAbs_);
+
+    AddSolverOption("lim:mipsol",
+      "",
+      XPRS_MAXMIPSOL, 0, INT_MAX);
+
+    AddSolverOption("lim:nodes nodelim nodelimit",
+      "",
+      XPRS_MAXNODE, 2147483647, INT_MAX);
+
+    AddSolverOption("lim:stalltime",
+      "",
+      XPRS_MAXSTALLTIME, 0.0, Infinity());
   // ****************************
   // Generic algorithm controls
   // ****************************
-  AddSolverOption("alg:method method lpmethod defaultalg",
-    "Which algorithm to use for non-MIP problems "
-    "or for node relaxations of MIP problems, "
-    "unless barrier/primal/dual/network specified:\n"
-    "\n.. value-table::\n", XPRS_DEFAULTALG, values_method, -1);
+  AddSolverOption("alg:method method lpmethod",
+    "",
+    XPRS_DEFAULTALG, INT_MIN, INT_MAX);
 
   AddStoredOption("alg:barrier barrier",
                   "Solve (MIP node) LPs by barrier method.",
                   storedOptions_.fBarrier_);
 
-  AddStoredOption("alg:primal primal",
+	AddStoredOption("alg:primal alg:primalopt primal primalopt",
                   "Solve (MIP node) LPs by primal simplex method.",
                   storedOptions_.fPrimal_);
 
-  AddStoredOption("alg:dual dual",
+	AddStoredOption("alg:dual alg:dualopt dual dualopt",
                   "Solve (MIP node) LPs by dual simplex method.",
                   storedOptions_.fDual_);
 
@@ -1331,1070 +1354,875 @@ void XpressmpBackend::InitCustomOptions() {
                   "by network simplex method.",
                   storedOptions_.fNetwork_);
 
-  AddSolverOption("alg:clamping clamping",
-    "Control adjustements of the returned solution values "
-     "such that they are always within bounds:\n"
-    "\n.. value-table::\n", XPRS_CLAMPING, values_clamping,0);
+  AddSolverOption("alg:clamping",
+    "",
+    XPRS_CLAMPING, INT_MIN, INT_MAX);
 
-  AddSolverOption("alg:feastol feastol",
-    "Primal feasibility tolerance (default 1e-6).",
+  AddSolverOption("alg:feastol",
+    "",
     XPRS_FEASTOL, 0.0, DBL_MAX);
 
-  AddSolverOption("alg:feastolperturb feastolperturb",
-    "How much a feasible primal basic solution is allowed to "
-    "be perturbed when performing basis changes.  The tolerance "
-    "specified by \"alg:feastol\" is always considered as an upper "
-    "limit for the perturbations; default = 1.0E-06",
+  AddSolverOption("alg:feastolperturb",
+    "",
     XPRS_FEASTOLPERTURB, 0.0, DBL_MAX);
 
-  AddSolverOption("alg:feastoltarget feastoltarget",
-    "Specifies the target feasibility tolerance for the solution refiner. "
-    "Default = 0 (use the value of \"alg:feastol\")",
+  AddSolverOption("alg:feastoltarget",
+    "",
     XPRS_FEASTOLTARGET, 0.0, DBL_MAX);
 
-    AddSolverOption("alg:indlinbigm indlinbigm",
-                    "Largest \"big M\" value to use in converting indicator "
-                    "constraints to regular constraints, default = 1e5",
-                    XPRS_INDLINBIGM, 0.0, DBL_MAX);
+    AddSolverOption("pre:indlinsmallbigm alg:indlinbigm",
+      "",
+      XPRS_INDLINBIGM, 0.0, DBL_MAX);
 
-    AddSolverOption("alg:lpfolding lpfolding",
-                    "Simplex and barrier: whether to fold an LP problem before solving it:"
+    AddSolverOption("lp:folding alg:lpfolding",
+      "",
+      XPRS_LPFOLDING, INT_MIN, INT_MAX);
+
+    AddSolverOption("iis:max iismax",
+      "",
+      XPRS_MAXIIS, -1, INT_MAX);
+    AddSolverOption("iis:log",
+      "",
+      XPRS_IISLOG, -1, INT_MAX);
+    AddSolverOption("iis:ops",
+      "",
+      XPRS_IISOPS, -1, INT_MAX);
+
+    AddSolverOption("alg:zerotol",
+      "",
+      XPRS_MATRIXTOL, 0.0, DBL_MAX);
+
+    AddSolverOption("lp:pivtol pivtol",
+      "",
+      XPRS_MARKOWITZTOL, 0.0, DBL_MAX);
+
+    AddSolverOption("alg:cutoff cutoff",
+      "",
+      XPRS_MIPABSCUTOFF, MinusInfinity(), Infinity());
+
+    AddSolverOption("alg:addcutoff addcutoff",
+      "",
+      XPRS_MIPADDCUTOFF, -1e-10, DBL_MAX);
+
+    AddSolverOption("alg:relcutoff relcutoff",
+      "",
+      XPRS_MIPRELCUTOFF, 1e-4, Infinity());
+
+    AddSolverOption("tech:seed seed alg:randomseed",
+      "",
+      XPRS_RANDOMSEED, -INT_MAX, INT_MAX);
+
+    AddSolverOption("alg:refactor",
+      "",
+      XPRS_REFACTOR, INT_MIN, INT_MAX);
+
+    AddSolverOption("alg:refineops",
+      "",
+      XPRS_REFINEOPS, INT_MIN, INT_MAX);
+
+    AddSolverOption("alg:resourcestrategy",
+      "",
+      XPRS_RESOURCESTRATEGY, INT_MIN, INT_MAX);
+
+    AddIntOption("alg:global global",
+                 "0/1*: Allow global solving. Passing 0 should linearize "
+                 "all expressions requiring Xpress Global.",
+                 &XpressmpBackend::GetGlobalFlag, &XpressmpBackend::SetGlobalFlag);
+
+    AddSolverOption("alg:nlpsolver nlpsolver nlp:solver",
+                    "Controls whether to call FICO Xpress Global or one "
+                    "of the local solvers:\n"
                     "\n.. value-table::\n",
-                    XPRS_LPFOLDING, values_autonoyes_, -1);
+                    XPRS_NLPSOLVER, nlp_solver_values_, -1);
 
-    AddSolverOption("alg:maxiis maxiis",
-                    "Maximum number of IIS to find; default=-1 (no limit)",
-                    XPRS_MAXIIS, -1, INT_MAX);
+    AddSolverOption("alg:localsolver localsolver nlp:localsolver",
+                    "Selects the library to use for local solves:\n"
+                    "\n.. value-table::\n"
+                    "\n"
+                    "When solving problems to global optimality (see alg:nlpsolver), "
+                    "alg:localsolver is used to decide which local solver to call "
+                    "for reoptimizing NLP-infeasible solutions heuristically.",
+                    XPRS_LOCALSOLVER, nlp_localsolver_values_, -1);
 
-    AddSolverOption("alg:zerotol matrixtol",
-                    "The zero tolerance on matrix elements. If the value of a matrix element is less "
-                    "than or equal to this in absolute value, it is treated as zero, default=1e-9.",
-                    XPRS_MATRIXTOL, 0.0, DBL_MAX);
-
-AddSolverOption("lp:pivtol pivtol markowitztol",
-                "Markowitz pivot tolerance (default = 0.01)",
-                XPRS_MARKOWITZTOL, 0.0, DBL_MAX);
-
-AddSolverOption("alg:cutoff cutoff",
-  "If the optimal objective value is worse than cutoff, "
-  "report \"objective cutoff\" and do not return a solution. "
-  "Default: 1.0E+40 for minimizing, -1.0E+40 for maximizing.",
-  XPRS_MIPABSCUTOFF, MinusInfinity(), Infinity());
-
-AddSolverOption("alg:addcutoff addcutoff mipaddcutoff",
-  "Amount to add to the objective function of the best integer\n\
-		solution found to give the new MIP cutoff; default -1e-5.",
-  XPRS_MIPADDCUTOFF, -1e-10, DBL_MAX);
-
-AddSolverOption("alg:relcutoff relcutoff miprelcutoff",
-  "If the optimal objective value is (relatively) worse than relcutoff, "
-  "report \"objective cutoff\" and do not return a solution. "
-  "Default: 1.0E-4.",
-  XPRS_MIPRELCUTOFF, 1e-4, Infinity());
-
-AddSolverOption("alg:randomseed randomseed",
-  "Sets the initial seed to use for the pseudo-random number generator in the "
-  "Optimizer; default=1",
-  XPRS_RANDOMSEED, -INT_MAX,  INT_MAX);
-
-AddSolverOption("alg:refactor refactor",
-  "Whether the optimization should restart using the current representation of the "
-  "factorization in memory:\n"
-  "\n.. value-table::\n",
-  XPRS_REFACTOR, values_autonoyes_, -1);
-
-AddSolverOption("alg:refineops refineops",
-  "Bit vector: specifies wmhen the solution refiner should be executed to "
-  "reduce solution infeasibilities. "
-  "The refiner will attempt to satisfy the target tolerances for all original linear "
-  "constraints before presolve or scaling has been applied:\n"
-  "\n.. value-table::\n",
-  XPRS_REFINEOPS, values_refineops, 19);
-
-AddSolverOption("alg:resourcestrategy resourcestrategy",
-  "Wether to allow nondeterministic decisions to cope with "
-		"low memory (affected by maxmemory and maxmemoryhard):\n"
-  "\n.. value-table::\n",
-  XPRS_RESOURCESTRATEGY, values_01_noyes_0default_, 0);
-
-//endalg
+    //endalg
     // ****************************
-  // PRESOLVER
-  // ****************************
-  AddSolverOption("pre:solve presolve",
-    "Whether to use Xpress' presolve:\n"
-    "\n.. value-table::\n",
-    XPRS_PRESOLVE, presolve_values_, 1);
+    // PRESOLVER
+    // ****************************
+    AddSolverOption("pre:solve",
+      "",
+      XPRS_PRESOLVE, INT_MIN, INT_MAX);
 
-  AddSolverOption("pre:ops presolveops",
-    "Reductions to use in XPRESS's presolve, sum of:\n"
-    "\n.. value-table::\n(default 511 = bits 0-8 set)",
-    XPRS_PRESOLVEOPS, presolveops_values_, 511);
+    AddSolverOption("pre:solve_nlp presolve_nlp presolve_slp",
+      "",
+      XSLP_PRESOLVE, nlp_presolve_values_, 1);
 
-  AddSolverOption("pre:maxscalefactor maxscalefactor",
-  "Maximum log2 factor that can be applied during scaling, must be >=0 and <=64; default=64.",
-  XPRS_MAXSCALEFACTOR, 0, 64);
+    AddSolverOption("pre:ops",
+      "",
+      XPRS_PRESOLVEOPS, presolveops_values_, 511);
 
-  AddSolverOption("pre:configuration preconfiguration",
-    "Whether to reformulate binary rows with very few coefficients:\n"
-    "\n.. value-table::\n",
-    XPRS_PRESOLVE, values_01_noyes_1default_, 1);
+    AddSolverOption("pre:maxscalefactor",
+      "",
+      XPRS_MAXSCALEFACTOR, 0, 64);
 
-  AddSolverOption("pre:elimfillin elimfillin",
-    "Maximum fillins allowed for a presolve elimination; default = 10",
-    XPRS_ELIMFILLIN, 0, INT_MAX);
+    AddSolverOption("pre:configuration",
+      "",
+      XPRS_PRECONFIGURATION, INT_MIN, INT_MAX);
 
-  AddSolverOption("pre:elimtol elimtol",
-    "The Markowitz tolerance for the elimination phase of the presolve; default=0.001",
-    XPRS_ELIMTOL, 0.0, DBL_MAX);
+    AddSolverOption("pre:elimfillin",
+      "",
+      XPRS_ELIMFILLIN, 0, INT_MAX);
 
-  AddSolverOption("pre:genconsdualreductions genconsdualreductions",
-    "Whether dual reductions should be applied to reduce the number "
-    "of columns and rows added when transforming general constraints to MIP structs:\n"
-    "\n.. value-table::\n",
-    XPRS_GENCONSDUALREDUCTIONS, values_01_noyes_1default_, 1);
+    AddSolverOption("pre:elimtol",
+      "",
+      XPRS_ELIMTOL, 0.0, DBL_MAX);
 
-    AddSolverOption("pre:indlinbigm indprelinbigm",
-            "Largest \"big M\" value to use in converting indicator "
-            "constraints to regular constraints during XPRESS "
-            "presolve; default = 100.0",
-            XPRS_INDPRELINBIGM, 0.0, DBL_MAX);
+    AddSolverOption("pre:genconsdualreductions",
+      "",
+      XPRS_GENCONSDUALREDUCTIONS, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:maximpliedbound maximpliedbound",
-                "When preprocessing MIP problems, only use computed bounds "
-                "at most maximpliedbound (default 1e8) in absolute value",
-                XPRS_MAXIMPLIEDBOUND, 0.0, DBL_MAX);
+    AddSolverOption("pre:indlinbigbigm",
+      "",
+      XPRS_INDPRELINBIGM, 0.0, DBL_MAX);
+
+    AddSolverOption("pre:maximpliedbound",
+      "",
+      XPRS_MAXIMPLIEDBOUND, 0.0, DBL_MAX);
 
 
-    AddSolverOption("pre:objscalefactor objscalefactor",
-      "Power of 2 (default 0) by which the objective is scaled. "
-      "Nonzero objscalfactor values override automatic global "
-      "objective scaling",
+    AddSolverOption("pre:objscalefactor",
+      "",
       XPRS_OBJSCALEFACTOR, 0, INT_MAX);
 
-    AddSolverOption("pre:basisred prebasisred",
-      "Determines if a lattice basis reduction algorithm should be "
-      "attempted as part of presolve:\n"
-      "\n.. value-table::\n",
-      XPRS_PREBASISRED, values_autonoyes_, -1);
+    AddSolverOption("pre:basisred",
+      "",
+      XPRS_PREBASISRED, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:bndredcone prebndredcone",
-      "Determines if second order cone constraints should be used for "
-      "inferring bound reductions on variables when solving a MIP:\n"
-      "\n.. value-table::\n", 
-      XPRS_PREBNDREDCONE, values_autonoyes_, -1);
+    AddSolverOption("pre:bndredcone",
+      "",
+      XPRS_PREBNDREDCONE, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:bndredquad prebndredquad",
-      "Determines if convex quadratic contraints should be used for "
-      "inferring bound reductions on variables when solving a MIP",
-      XPRS_PREBNDREDQUAD, values_autonoyes_, -1);
+    AddSolverOption("pre:bndredquad",
+      "",
+      XPRS_PREBNDREDQUAD, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:cliquestrategy precliquestrategy",
-      "Determines how much effort to spend on clique covers "
-      "in presolve; default=-1.",
+    AddSolverOption("pre:cliquestrategy",
+      "",
       XPRS_PRECLIQUESTRATEGY, -1, INT_MAX);
 
-    AddSolverOption("pre:coefelim precoefelim",
-      "Specifies whether the optimizer should attempt to "
-      "recombine constraints:\n"
-      "\n.. value-table::\n",
-      XPRS_PRECOEFELIM, values_precoefelim, 2);
+    AddSolverOption("pre:coefelim",
+      "",
+      XPRS_PRECOEFELIM, INT_MIN, INT_MAX);
     
-    AddSolverOption("pre:components precomponents",
-      "Determines whether small independent components should "
-      "be detected and solved as individual subproblems during root "
-      "node processing:\n"
-      "\n.. value-table::\n",
-      XPRS_PRECOMPONENTS, values_autonoyes_, -1);
+    AddSolverOption("pre:components",
+      "",
+      XPRS_PRECOMPONENTS, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:componentseffort precomponentseffort",
-      "adjusts the overall effort for the independent component "
-      "presolver; default = 1.0.",
+    AddSolverOption("pre:componentseffort",
+      "",
       XPRS_PRECOMPONENTSEFFORT, 0.0, DBL_MAX);
 
-    AddSolverOption("pre:convertseparable preconvertseparable",
-      "Reformulate problem with non-diagonal quadratic objective "
-      "and/or constraints as diagonal quadratic or second-order conic "
-      "constraints:\n"
-      "\n.. value-table::\n",
-      XPRS_PRECONVERTSEPARABLE, values_preconvertseparable, -1);
+    AddSolverOption("pre:convertseparable",
+      "",
+      XPRS_PRECONVERTSEPARABLE, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:domcol predomcol",
-      "Whether presolve should remove variables when solving MIP problems:\n"
-      "\n.. value-table::\n",
-      XPRS_PREDOMCOL, values_predomcol, -1);
+    AddSolverOption("pre:domcol",
+      "",
+      XPRS_PREDOMCOL, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:domrow predomrow",
-      "Whether presolve should remove constraints when solving MIP problems:\n"
-      "\n.. value-table::\n",
-      XPRS_PREDOMROW, values_predomrow, -1);
+    AddSolverOption("pre:domrow",
+      "",
+      XPRS_PREDOMROW, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:duprow preduprow",
-      "How presolve should deal with duplicate rows in MIP problems:\n"
-      "\n.. value-table::\n",
-      XPRS_PREDUPROW, values_preduprow, -1);
+    AddSolverOption("pre:duprow",
+      "",
+      XPRS_PREDUPROW, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:elimquad preelimquad",
-      "Allows for elimination of quadratic variables via doubleton rows:\n"
-      "\n.. value-table::\n",
-      XPRS_PREELIMQUAD, values_autonoyes_, -1);
+    AddSolverOption("pre:elimquad",
+      "",
+      XPRS_PREELIMQUAD, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:folding prefolding",
-      "Determines if a folding procedure should be used to aggregate "
-      "continuous columns in an equitable partition:\n"
-      "\n.. value-table::\n",
-      XPRS_PREFOLDING, values_autonoyes_, -1);
+    AddSolverOption("pre:folding",
+      "",
+      XPRS_PREFOLDING, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:implications preimplications",
-      "Determines whether to use implication structures to remove redundant rows:\n"
-      "\n.. value-table::\n",
-      XPRS_PREIMPLICATIONS, values_autonoyes_, -1);
+    AddSolverOption("pre:implications",
+      "",
+      XPRS_PREIMPLICATIONS, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:lindep prelindep",
-      "Determines whether to check for and remove linearly dependent equality constraints when presolving a problem:\n"
-      "\n.. value-table::\n",
-      XPRS_PRELINDEP, values_autonoyes_, -1);
+    AddSolverOption("pre:lindep",
+      "",
+      XPRS_PRELINDEP, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:objcutdetect preobjcutdetect",
-      "MIP: Determines whether to check for constraints that are "
-      "parallel or near parallel to a linear objective function, "
-      "and which can safely be removed:\n"
-      "\n.. value-table::\n",
-      XPRS_PREOBJCUTDETECT, values_01_noyes_1default_, 1);
+    AddSolverOption("pre:objcutdetect",
+      "",
+      XPRS_PREOBJCUTDETECT, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:permute prepermute",
-      "Bit vector: specifies whether to randomly permute rows, columns "
-      "and global information when starting the presolve (default 0):\n"
-      "\n.. value-table::\n",
-      XPRS_PREPERMUTE, values_prepermute, 0);
+    AddSolverOption("pre:permute",
+      "",
+      XPRS_PREPERMUTE, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:permuteseed prepermuteseed",
-      "Sets the seed for the pseudo-random number generator for permuting; "
-      "default=0",
+    AddSolverOption("tech:permseed permseed pre:permuteseed permuteseed",
+      "",
       XPRS_PREPERMUTESEED, -INT_MAX, INT_MAX);
 
-    AddSolverOption("pre:probing preprobing",
-      "Amount of probing to perform on binary variables during presolve. "
-      "This is done by fixing a binary to each of its values in turn and analyzing "
-      "the implications:\n"
-      "\n.. value-table::\n",
-      XPRS_PREPROBING, values_predomrow, -1);
+    AddSolverOption("pre:probing",
+      "",
+      XPRS_PREPROBING, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:protectdual preprotectdual",
-      "Specifies whether the presolver should protect a given dual solution "
-      "by maintaining the same level of dual feasibility:"
-      "\n.. value-table::\n",
-      XPRS_PREPROTECTDUAL, values_01_noyes_0default_, 1);
+    AddSolverOption("pre:protectdual",
+      "",
+      XPRS_PREPROTECTDUAL, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:maxgrow presolvemaxgrow",
-      "Limit on how much the number of non-zero coefficients "
-      "is allowed to grow during presolve, specified as a ratio of the "
-      "number of non-zero coefficients in the original problem; default=0.1",
+    AddSolverOption("pre:maxgrow",
+      "",
       XPRS_PRESOLVEMAXGROW, 0.0, DBL_MAX);
 
-    AddSolverOption("pre:passes presolvepasses",
-      "Number of reduction rounds to be performed in presolve; "
-      "default=1.",
+    AddSolverOption("pre:passes",
+      "",
       XPRS_PRESOLVEPASSES, 0, INT_MAX);
 
-    AddSolverOption("pre:pwldualreductions pwldualreductions",
-      "Whether dual reductions should be applied to reduce the number "
-      "of columns, rows and SOS-constraints added when transforming piecewise "
-      "linear objectives and constraints to MIP structs:\n"
-      "\n.. value-table::\n",
-      XPRS_PWLDUALREDUCTIONS, values_01_noyes_1default_, 1);
+    AddSolverOption("pre:pwldualreductions",
+      "",
+      XPRS_PWLDUALREDUCTIONS, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:pwlnonconvextransformation pwlnonconvextransformation",
-      "Reformulation method for piecewise linear constraints at the "
-      "beginning of the search:\n"
-      "\n.. value-table::\n",
-      XPRS_PWLNONCONVEXTRANSFORMATION, values_pwlnonconvextransformation, -1);
+    AddSolverOption("pre:pwlnonconvextransformation",
+      "",
+      XPRS_PWLNONCONVEXTRANSFORMATION, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:rootpresolve rootpresolve",
-      "Whether to presolve after root cutting and heuristics:\n"
-      "\n.. value-table::\n",
-      XPRS_ROOTPRESOLVE, values_autonoyes_, -1);
+    AddSolverOption("pre:rootpresolve",
+      "",
+      XPRS_ROOTPRESOLVE, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:scaling scaling",
-      "Bit vector determining how to scale the constraint matrix before optimizing:\n"
-      "\n.. value-table::\n",
-      XPRS_SCALING, values_scaling, -1);
+    AddSolverOption("pre:scaling",
+      "",
+      XPRS_SCALING, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:trace trace",
-      "Display the infeasibility diagnosis during presolve:\n"
-      "\n.. value-table::\n",
-      XPRS_TRACE, values_01_noyes_0default_, 0);
+    AddSolverOption("pre:trace",
+      "",
+      XPRS_TRACE, INT_MIN, INT_MAX);
 
-    AddSolverOption("pre:sosreftol sosreftol",
-      "Minimum relative gap between the ordering values of elements in a special "
-      "ordered set; default=1e-6.",
+    AddSolverOption("pre:sosreftol",
+      "",
       XPRS_SOSREFTOL, 1e-6, Infinity());
 
     //endpre
   // ****************************
   // BARRIER ALGORITHM CONTROLS
   // ****************************
-  AddSolverOption("bar:alg baralg", "Which barrier algorithm to use ",
-    XPRS_BARALG, values_baralg, -1);
+  AddSolverOption("bar:alg",
+    "",
+    XPRS_BARALG, INT_MIN, INT_MAX);
 
   AddSolverOption("bar:cachesize cachesize",
-    "Newton Barrier: L2 or L3 (see notes) cache size in kB (kilobytes) of the CPU (default -1). "
-    "On Intel (or compatible) platforms a value of -1 may be used to determine the cache size automatically.",
+    "Deprecated: ignored by the current Xpress library.",
     XPRS_CACHESIZE, -1, INT_MAX);
 
     AddSolverOption("bar:l1cache l1cache",
-                    "Newton barrier: L1 cache size in kB (kilo bytes) of the CPU. On Intel (or compatible) "
-                    "platforms a value of -1 may be used to determine the cache size automatically.",
+    "Deprecated: ignored by the current Xpress library.",
                     XPRS_L1CACHE, -1, INT_MAX);
 
-  AddSolverOption("bar:corespercpu corespercpu",
-    "Newton Barrier: number of cores to assume per cpu. Barrier cache = cachesize/corespercpu. "
-    " Default -1 = automatic. ",
+  AddSolverOption("bar:corespercpu",
+    "",
     XPRS_CORESPERCPU, -1, INT_MAX);
 
-  AddSolverOption("bar:cores barcores",
-    "If positive, number of CPU cores to assume present when "
-    "using the barrier algorithm.  Default = -1, which means "
-    "automatic choice", XPRS_BARCORES, -1, INT_MAX);
+  AddSolverOption("bar:cores",
+    "",
+    XPRS_BARCORES, -1, INT_MAX);
 
-  AddSolverOption("bar:choleskyalg choleskyalg",
-    "Type of Cholesky factorization used for barrier, sum of:\n:",
-    XPRS_CHOLESKYALG, values_barcholeskyalg, -1);
+  AddSolverOption("bar:choleskyalg",
+    "",
+    XPRS_CHOLESKYALG, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:choleskytol choleskytol",
-    "Zero tolerance for Cholesky pivots in the\n\
-		Newton Barrier algorithm; default = 1e-15",
+  AddSolverOption("bar:choleskytol",
+    "",
     XPRS_CHOLESKYTOL, 1e-15, DBL_MAX);
 
-  AddSolverOption("bar:cpuplatform cpuplatform",
-    "Which instruction are allowed to the Newton barrier method:\n:",
-    XPRS_CPUPLATFORM, values_cpuplatform, -1);
+  AddSolverOption("bar:cpuplatform",
+    "",
+    XPRS_CPUPLATFORM, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:crash barcrash",
-    "Choice of crash procedure for crossover, higher number "
-    "means more aggressive procedure:",
-    XPRS_BARCRASH, values_barcrash, 4);
+  AddSolverOption("bar:crash",
+    "",
+    XPRS_BARCRASH, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:crossover crossover",
-    "How to transform a barrier solution to a basic one:\n"
-    "\n.. value-table::\n", XPRS_CROSSOVER, values_barcrossover, -1);
+  AddSolverOption("bar:crossover",
+    "",
+    XPRS_CROSSOVER, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:crossoverops crossoverops",
-    "Bit vector affecting crossover after the barrier "
-    "algorithm; sum of:\n"
-    "\n.. value-table::\n", XPRS_CROSSOVEROPS, values_barcrossoverops, -1);
+  AddSolverOption("bar:crossoverops",
+    "",
+    XPRS_CROSSOVEROPS, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:crossoverthreads crossoverthreads",
-    "Limit on threads used during crossover; default -1 (determined by "
-    "bar:threads).", XPRS_CROSSOVERTHREADS, -1, INT_MAX);
+  AddSolverOption("bar:crossoverthreads",
+    "",
+    XPRS_CROSSOVERTHREADS, -1, INT_MAX);
 
   AddSolverOption("lim:crossoveriter bar:crossoveriterlim crossoveriterlim crossoveritlim",
-    "Limit on crossover iterations after the barrier "
-    "algorithm; default = 2147483645", XPRS_CROSSOVERITERLIMIT, 1, INT_MAX);
+    "",
+    XPRS_CROSSOVERITERLIMIT, 1, INT_MAX);
 
-  AddSolverOption("bar:crossovertol crossovertol crossoveraccuracytol",
-    "Tolerance (default 1e-6) for deciding whether to adjust the "
-    "relative pivot tolerance during crossover when a new basis "
-    "factorization is necessary.  Errors in the recalculated "
-    "basic solution above this tolerance cause the pivot "
-    "tolerance to be adjusted.",
+  AddSolverOption("bar:crossovertol crossovertol",
+    "",
     XPRS_CROSSOVERACCURACYTOL, 0.0, DBL_MAX);
 
-  AddSolverOption("bar:densecollimit densecollimit",
-    "Number of nonzeros above which a column is treated as dense "
-    "in the barrier algorithm's Cholesky factorization. Default=0 (automatic).",
+  AddSolverOption("bar:densecollimit",
+    "",
     XPRS_DENSECOLLIMIT, 0, INT_MAX);
 
-  AddSolverOption("bar:dualstop bardualstop",
-    "Barrier method convergence tolerance on "
-    "dual infeasibilities; default = 0 (automatic choice)",
+  AddSolverOption("bar:dualstop",
+    "",
     XPRS_BARDUALSTOP, 0.0, DBL_MAX);
 
-  AddSolverOption("bar:gapstop bargapstop",
-    "Barrier method convergence tolerance on the relative"
-    " duality gap; default = 0", XPRS_BARGAPSTOP, 0.0, DBL_MAX);
+  AddSolverOption("bar:hgextrapolate",
+    "",
+    XPRS_BARHGEXTRAPOLATE, 0.0, 1.0);
 
-  AddSolverOption("bar:gap bargaptarget", // todo DEFAULT?
-    "Barrier algorithm target tolerance for the relative duality"
-    " gap.If not satisfied and no further progress is possible"
-    " but barstopgap is satisfied, then the current solution is"
-    " considered optimal.", XPRS_BARGAPTARGET, 0.0, DBL_MAX);
+  AddSolverOption("bar:hgmaxrestarts",
+    "",
+    XPRS_BARHGMAXRESTARTS, 0, INT_MAX);
 
-  AddSolverOption("bar:indeflimit barindeflimit",
-    "Maximum indefinite factorizations to allow in the barrier "
-    "algorithm for solving a QP: stop when the limit is hit "
-    "default = 15", XPRS_BARINDEFLIMIT, 0, INT_MAX);
+  AddSolverOption("bar:hgops",
+    "",
+    XPRS_BARHGOPS, INT_MIN, INT_MAX);
+
+  AddSolverOption("bar:gapstop",
+    "",
+    XPRS_BARGAPSTOP, 0.0, DBL_MAX);
+
+  AddSolverOption("bar:gap",
+    "",
+    XPRS_BARGAPTARGET, 0.0, DBL_MAX);
+
+  AddSolverOption("bar:indeflimit",
+    "",
+    XPRS_BARINDEFLIMIT, 0, INT_MAX);
 
   AddSolverOption("lim:bariter bar:iterlim bariterlim",
-    "Limit on the number of barrier iterations (default 500).",
+    "",
     XPRS_BARITERLIMIT, 1, INT_MAX);
 
-  AddSolverOption("bar:start barstart",
-    "Choice of starting point for barrier method:\n"
-    "\n.. value-table::\n",
-    XPRS_BARSTART, values_barstart, 0);
+  AddSolverOption("bar:start",
+    "",
+    XPRS_BARSTART, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:kernel barkernel",
-    "How the barrier algorithm weights centrality:\n"
-    "\n.. value-table::\n",
-    XPRS_BARKERNEL, values_barkernel, 1.0);
+  AddSolverOption("bar:kernel",
+    "",
+    XPRS_BARKERNEL, -DBL_MAX, DBL_MAX);
 
-  AddSolverOption("bar:objperturb barobjperturb",
-    "Defines how the barrier perturbs the objective (default "
-    "1e-6); values > 0 let the optimizer decide if to perturb the "
-    "objective, values < 0 force the perturbation:\n"
-    "\n.. value-table::\n",
-    XPRS_BAROBJPERTURB, values_barobjperturb, 1e-6);
+  AddSolverOption("bar:objperturb",
+    "",
+    XPRS_BAROBJPERTURB, -DBL_MAX, DBL_MAX);
 
-  AddSolverOption("bar:objscale barobjscale",
-    "How the barrier algorithm scales the objective; when the objective "
-    "is quadratic, the quadratic diagonal is used in determining the scale:\n"
-    "\n.. value-table::\n",
-    XPRS_BAROBJSCALE, values_barobjscale, -1);
+  AddSolverOption("bar:objscale",
+    "",
+    XPRS_BAROBJSCALE, -DBL_MAX, DBL_MAX);
 
-  AddSolverOption("bar:order barorder",
-    "Cholesky factorization pivot order for barrier algorithm:\n"
-    "\n.. value-table::\n",
-    XPRS_BARORDER, values_barorder, 0);
+  AddSolverOption("bar:order",
+    "",
+    XPRS_BARORDER, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:orderthreads barorderthreads",
-    "Number of threads to use when choosing a pivot order for "
-    "Cholesky factorization; default 0 (automatic choice).",
+  AddSolverOption("bar:orderthreads",
+    "",
     XPRS_BARORDERTHREADS, 0, INT_MAX);
 
-  AddSolverOption("bar:output baroutput",
-    "Amount of output for the barrier method:\n"
-    "\n.. value-table::\n",
-    XPRS_BAROUTPUT, values_baroutput, 0);
+  AddSolverOption("bar:output",
+    "",
+    XPRS_BAROUTPUT, INT_MIN, INT_MAX);
 
   AddSolverOption("bar:presolve barpresolve",
-    "Level of barrier-specific presolve effort:\n"
-    "\n.. value-table::\n",
-    XPRS_BARPRESOLVEOPS, values_baroutput, 0);
+    "",
+    XPRS_BARPRESOLVEOPS, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:primalstop barprimalstop",
-    "Barrier method convergence tolerance on "
-    "primal infeasibilities; default = 0 (automatic choice)",
+  AddSolverOption("bar:primalstop",
+    "",
     XPRS_BARPRIMALSTOP, 0.0, DBL_MAX);
 
-  AddSolverOption("bar:refiter barrefiter",
-    "Maximum number of refinement iterations, helpful when the "
-    "the solution is near to the optimum using barrier or crossover:\n"
-    "\n.. value-table::\n",
-    XPRS_BARREFITER, values_barrefiter, 0);
+  AddSolverOption("bar:refiter",
+    "",
+    XPRS_BARREFITER, INT_MIN, INT_MAX);
 
   AddSolverOption("bar:regularize barreg barrregularize",
-    "Regularization to use with \"barrier. Default=-1 (automatic choice), "
-    "else sum of:\n"
-    "\n.. value-table::\n",
-    XPRS_BARREGULARIZE, values_barregularize, -1);
+    "",
+    XPRS_BARREGULARIZE, INT_MIN, INT_MAX);
 
-  AddSolverOption("bar:stepstop barstepstop",
-    "Barrier method convergence tolerance: stop when "
-		"step size <= barstepstop; default = 1e-10", XPRS_BARSTEPSTOP, 1e-10, DBL_MAX);
+  AddSolverOption("bar:stepstop",
+    "",
+    XPRS_BARSTEPSTOP, 1e-10, DBL_MAX);
 
-  AddSolverOption("bar:threads threads",
-    "number of threads used in the Newton Barrier algorithm;\n\
-		default = -1 (determined by \"threads\")", XPRS_BARTHREADS, -1, INT_MAX);
+  AddSolverOption("bar:threads",
+    "",
+    XPRS_BARTHREADS, -1, INT_MAX);
   //endbarrier
   // ****************************
   // SIMPLEX RELATED
   // ****************************
-  AddSolverOption("lp:bigmmethod bigmmethod",
-    "Simplex: This specifies whether to use the \"Big M\" method, or the standard phase I "
-    "(achieving feasibility) and phase II (achieving optimality). "
-    "the \"Big M\" method, the objective coefficients of the variables are considered during "
-    "the feasibility phase, possibly leading to an initial feasible basis which is closer to "
-    "optimal. The side-effects involve possible round-off errors.\n"
-    "\n.. value-table::\n",
-    XPRS_BIGMMETHOD, values_bigmmethod, 1);
+  AddSolverOption("lp:bigmmethod",
+    "",
+    XPRS_BIGMMETHOD, INT_MIN, INT_MAX);
 
-  AddSolverOption("lp:bigm bigm bigmpenalty",
-    "Infeasibility penalty to be used if \"BigM\" method is used; default = 1024",
+  AddSolverOption("lp:bigm bigmpenalty",
+    "",
     XPRS_BIGM, 1024.0, DBL_MAX);
 
-  AddSolverOption("lp:crash crash",
-    "Simplex: This determines the type of crash used when the algorithm begins."
-    "For primal simplex, the choices are listed below; for dual simplex the choices "
-    "follow and are interpreted a bit-vector:\n"
-    "\n.. value-table::\n",
-    XPRS_CRASH, values_crash, 2);
+  AddSolverOption("lp:crash",
+    "",
+    XPRS_CRASH, INT_MIN, INT_MAX);
 
-  AddSolverOption("lp:dualgradient dualgradient",
-    "dual simplex pricing strategy:\n"
-    "\n.. value-table::\n",
-    XPRS_CRASH, values_lpdualgradient, -1);
+  AddSolverOption("lp:dualgradient",
+    "",
+    XPRS_DUALGRADIENT, INT_MIN, INT_MAX);
 
-  AddSolverOption("lp:dualize dualize",
-    "Whether to convert the primal problem to its dual and solve "
-    "the converted problem:\n"
-    "\n.. value-table::\n",
-    XPRS_DUALIZE, values_lpdualize, -1);
+  AddSolverOption("lp:dualize",
+    "",
+    XPRS_DUALIZE, INT_MIN, INT_MAX);
 
-  AddSolverOption("lp:dualstrategy dualstrategy",
-    "Bit vector controlling the dual simplex strategy (default 1):\n"
-    "\n.. value-table::\n",
-    XPRS_DUALSTRATEGY, values_lpdualstrategy, 1);
+  AddSolverOption("lp:dualstrategy",
+    "",
+    XPRS_DUALSTRATEGY, INT_MIN, INT_MAX);
 
-  AddSolverOption("lp:dualthreads dualthreads ",
-    "Limit on threads used by parallel dual simplex; default -1 (determined by "
-    "tech:threads).", XPRS_DUALTHREADS, -1, INT_MAX);
+  AddSolverOption("lp:dualthreads",
+    "",
+    XPRS_DUALTHREADS, -1, INT_MAX);
 
-  AddSolverOption("lp:dualizeops dualizeops",
-    "When solving the dual problem after deriving it from the "
-    "primal, whether to use primal simplex if dual simplex was "
-    "specified and vice versa:\n"
-    "\n.. value-table::\n",
-    XPRS_DUALIZEOPS, values_01_noyes_1default_, 1);
+  AddSolverOption("lp:dualizeops",
+    "",
+    XPRS_DUALIZEOPS, INT_MIN, INT_MAX);
 
-  AddSolverOption("lp:dualperturb dualperturb",
-    "Factor by which the problem will be perturbed prior "
-    "to optimization by dual simplex. Default -1 (automatic); note that "
-    "a value of 0 implies no perturbation",
+  AddSolverOption("lp:dualperturb",
+    "",
     XPRS_DUALPERTURB, -1.0, DBL_MAX);
 
-  AddSolverOption("lp:etatol etatol",
-    "Zero tolerance on eta elements, elements of eta vectors whose "
-    "absolute value is smaller than etatol are taken to be zero.",
+  AddSolverOption("lp:etatol",
+    "",
     XPRS_ETATOL, 0.0, DBL_MAX);
 
-  AddSolverOption("lp:dualforceparallel forceparalleldual dualforceparallel",
-    "Specifies whether the dual simplex solver should always use the "
-    "parallel simplex algorithm",
-    XPRS_FORCEPARALLELDUAL, values_01_noyes_0default_, 0);
+  AddSolverOption("lp:dualforceparallel dualforceparallel",
+    "",
+    XPRS_FORCEPARALLELDUAL, INT_MIN, INT_MAX);
 
 
 
-    AddSolverOption("lp:invertfreq invertfreq",
-                    "Maximum simplex iterations before refactoring the basis; "
-                    "default -1 (automatic)",
-                    XPRS_INVERTFREQ, -1, INT_MAX);
+    AddSolverOption("lp:invertfreq",
+      "",
+      XPRS_INVERTFREQ, -1, INT_MAX);
 
-    AddSolverOption("lp:invertmin invertmin",
-                    "Minimum simplex iterations before refactoring the basis; "
-                    "default = 3",
-                    XPRS_INVERTMIN, 3, INT_MAX);
+    AddSolverOption("lp:invertmin",
+      "",
+      XPRS_INVERTMIN, 3, INT_MAX);
 
-    AddSolverOption("lp:keepbasis keepbasis",
-                    "Basis choice for the next LP iteration:\n"
-                    "\n.. value-table::\n",
-                    XPRS_KEEPBASIS, values_keepbasis, 1);
+    AddSolverOption("lp:keepbasis",
+      "",
+      XPRS_KEEPBASIS, INT_MIN, INT_MAX);
 
-    AddSolverOption("lp:keepnrows keepnrows",
-                    "Status for nonbinding rows:\n"
-                    "\n.. value-table::\n",
-                    XPRS_KEEPNROWS, values_keepnrows, 1);
+    AddSolverOption("lp:keepnrows",
+      "",
+      XPRS_KEEPNROWS, INT_MIN, INT_MAX);
 
-    AddSolverOption("lp:log lplog",
-                    "Frequency of printing simplex iteration log; default = 100."
-                    "Values n < 0 display detailed outputs every -n iterations.",
-                    XPRS_LPLOG, -INT_MAX, INT_MAX);
+    AddSolverOption("lp:log",
+      "",
+      XPRS_LPLOG, -INT_MAX, INT_MAX);
 
-    AddSolverOption("lp:netstalllimit netstalllimit",
-      "Limit the number of degenerate pivots of the network "
-      "simplex algorithmm before switching to primal or dual:\n"
-      "\n.. value-table::\n",
-      XPRS_NETSTALLLIMIT, values_netstalllimit, -1);
+    AddSolverOption("lp:netstalllimit",
+      "",
+      XPRS_NETSTALLLIMIT, INT_MIN, INT_MAX);
 
    
-    AddSolverOption("lp:optimalitytol optimalitytol",
-      "This is the zero tolerance for reduced costs. On each "
-      "iteration, the simplex method searches for a variable to enter "
-      "the basis which has a negative reduced cost. The candidates are "
-      "only those variables which have reduced costs less than the "
-      "negative value of optimalitytol; default=1e-6",
+    AddSolverOption("lp:opttol lp:optimalitytol opttol",
+      "",
       XPRS_OPTIMALITYTOL, 0.0, DBL_MAX);
 
 
-    AddSolverOption("lp:optimalitytoltarget optimalitytoltarget",
-      "Target optimality tolerance for the solution refiner; default=0 "
-      "(use the value specified by lp:optimalitytol)",
+    AddSolverOption("lp:optimalitytoltarget",
+      "",
       XPRS_OPTIMALITYTOLTARGET, 0.0, DBL_MAX);
 
-    AddSolverOption("lp:penalty penalty",
-      "Minimum absolute penalty variable coefficient; "
-	    "default = automatic choice",
+    AddSolverOption("lp:penalty",
+      "",
       XPRS_PENALTY, 0.0, DBL_MAX);
 
-    AddSolverOption("lp:pricingalg pricingalg",
-      "Primal simplex pricing method:\n"
-      "\n.. value-table::\n",
-      XPRS_PRICINGALG, values_pricingalg, 0);
+    AddSolverOption("lp:pricingalg",
+      "",
+      XPRS_PRICINGALG, INT_MIN, INT_MAX);
 
-    AddSolverOption("lp:primalunshift primalunshift",
-      "Whether the primal alg. calls the dual to unshift:\n"
-      "\n.. value-table::\n",
-      XPRS_PRICINGALG, values_01_noyes_1default_, 0);
+    AddSolverOption("lp:primalunshift",
+      "",
+      XPRS_PRIMALUNSHIFT, INT_MIN, INT_MAX);
 
-    AddSolverOption("lp:relpivottol relpivottol",
-      "Relative pivot tolerance; default = 1e-6",
+    AddSolverOption("lp:relpivottol",
+      "",
       XPRS_RELPIVOTTOL, 0.0, Infinity());
 
-    AddSolverOption("lp:sifting sifting",
-      "When using dual simplex, whether to enable sifting, "
-		"which can speed up the solve when there are many more "
-		"variables than constraints:\n"
-      "\n.. value-table::\n",
-      XPRS_SIFTING, values_autonoyes_, -1);
+    AddSolverOption("lp:sifting",
+      "",
+      XPRS_SIFTING, INT_MIN, INT_MAX);
 
-    AddSolverOption("lp:siftpasses siftpasses",
-      "Determines how quickly we allow to grow the worker problems "
-      "during the sifting algorithm; default 4.",
+    AddSolverOption("lp:siftpasses",
+      "",
       XPRS_SIFTPASSES, 1, INT_MAX);
 
-    AddSolverOption("lp:siftpresolveops siftpresolveops",
-      "Presolve operations for solving the subproblems during sifting:\n"
-      "\n.. value-table::\n",
-      XPRS_SIFTPRESOLVEOPS, values_siftpresolveops, -1);
+    AddSolverOption("lp:siftpresolveops",
+      "",
+      XPRS_SIFTPRESOLVEOPS, INT_MIN, INT_MAX);
 
-    AddSolverOption("lp:siftswitch siftswitch",
-      "Determines which algorithm to use for solving the subproblems during sifting:\n"
-      "\n.. value-table::\n",
-      XPRS_SIFTSWITCH, values_siftswitch, -1);
+    AddSolverOption("lp:siftswitch",
+      "",
+      XPRS_SIFTSWITCH, INT_MIN, INT_MAX);
 
 
     // endlp
   // MIP
   // ****************************
-  AddSolverOption("mip:branchchoice branchchoice",
-    "Control the choice of branching when solving a MIP problem:\n"
-    "\n.. value-table::\n",
-    XPRS_BRANCHCHOICE, values_branchchoice, 3);
+  AddSolverOption("mip:branchchoice",
+    "",
+    XPRS_BRANCHCHOICE, INT_MIN, INT_MAX);
 
-  AddSolverOption("mip:branchdisj branchdisj",
-    "Whether to branch on general split disjunctions while solving MIPs:\n"
-    "\n.. value-table::\n",
-    XPRS_BRANCHDISJ, values_branchdisj, -1);
+  AddSolverOption("mip:branchdisj",
+    "",
+    XPRS_BRANCHDISJ, INT_MIN, INT_MAX);
 
-  AddSolverOption("mip:branchstructural branchstructural branchstruct",
-    "Whether to search for special structure during branch and bound:\n"
-    "\n.. value-table::\n",
-    XPRS_BRANCHSTRUCTURAL, values_autonoyes_, -1);
+  AddSolverOption("mip:branchstructural branchstruct",
+    "",
+    XPRS_BRANCHSTRUCTURAL, INT_MIN, INT_MAX);
 
-  AddSolverOption("mip:breadthfirst breadthfirst",
-    "Number of MIP nodes included in best-first search before switching to local-first search; "
-    "default=11.", XPRS_BREADTHFIRST, 11, INT_MAX);
+  AddSolverOption("mip:breadthfirst",
+    "",
+    XPRS_BREADTHFIRST, 11, INT_MAX);
   
-  AddSolverOption("mip:deterministic deterministic",
-    "Whether a MIP search should be deterministic:\n", 
-    XPRS_DETERMINISTIC, values_deterministic, 1);
+  AddSolverOption("mip:deterministic",
+    "",
+    XPRS_DETERMINISTIC, INT_MIN, INT_MAX);
 
-  AddSolverOption("mip:feasibilityjump feasibilityjump",
-    "Decides whether to run the Feasibility Jump heuristic at the top "
-    "node during branch-and-bound:\n"
-    "\n.. value-table::\n", XPRS_FEASIBILITYJUMP,
-    values_feasibilityjump, -1);
+  AddSolverOption("mip:feasibilityjump",
+    "",
+    XPRS_FEASIBILITYJUMP, INT_MIN, INT_MAX);
 
-  AddSolverOption("mip:feasibilitypump feasibilitypump",
-    "Decides whether to run the Feasibility Pump heuristic at the top "
-    "node during branch-and-bound:\n"
-    "\n.. value-table::\n", XPRS_FEASIBILITYPUMP,
-    values_feasibilitypump, -1);
+  AddSolverOption("mip:feasibilitypump",
+    "",
+    XPRS_FEASIBILITYPUMP, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heurbeforelp heurbeforelp",
-    "Whether primal heuristics should be run before the initial LP relaxation has been solved:\n"
-    "\n.. value-table::\n",
-    XPRS_HEURBEFORELP, values_autonoyes_, -1);
+    AddSolverOption("mip:heurbeforelp",
+      "",
+      XPRS_HEURBEFORELP, INT_MIN, INT_MAX);
 
-    AddSolverOption("lim:heurdiveiterlimit heurdepth mip:heurdiveiterlimit",
-      "Simplex iteration limit for reoptimizing during the diving heuristic; "
-      "default = -1 (automatic selection); a value of 0 implies no iteration limit",
-      XPRS_HEURDIVEITERLIMIT, -INT_MAX, INT_MAX);
+    AddSolverOption("lim:heurdiveiterlimit mip:heurdiveiterlimit",
+      "",
+      XPRS_HEURDIVEITERLIMIT, -DBL_MAX, DBL_MAX);
 
 
-    AddSolverOption("mip:heurshiftprop heurshiftprop",
-      "Determines whether the Shift-and-propagate primal heuristic should be executed "
-      "immediately after presolve:\n"
-      "\n.. value-table::\n",
-      XPRS_HEURSHIFTPROP, values_autonoyes_, -1);
+    AddSolverOption("mip:heurshiftprop",
+      "",
+      XPRS_HEURSHIFTPROP, INT_MIN, INT_MAX);
       
-    AddSolverOption("mip:heurdiverandomize hdive_rand heurdiverandomize",
-      "The level of randomization to apply in the diving heuristic; values "
-      "range from 0.0=none to 1.0=full.",
+    AddSolverOption("mip:heurdiverandomize hdive_rand",
+      "",
       XPRS_HEURDIVERANDOMIZE, 0.0, 1.0);
 
-    AddSolverOption("mip:heurdivesoftrounding hdive_rounding heurdivesoftrounding",
-      "Whether to use soft rounding in the MIP diving heuristic "
-      "(to push variables to their bounds via the objective rather "
-      "than fixing them):\n"
-      "\n.. value-table::\n",
-      XPRS_HEURDIVESOFTROUNDING, values_heurdivesoftrounding, -1);
+    AddSolverOption("mip:heurdivesoftrounding hdive_rounding",
+      "",
+      XPRS_HEURDIVESOFTROUNDING, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heurdivespeedup hdive_speed heurdivespeedup",
-      "Controls tradeoff between speed and solution quality in the diving heuristic:"
-      "\n.. value-table::\n",
-      XPRS_HEURDIVESPEEDUP, values_heurdivespeed, -1);
+    AddSolverOption("mip:heurdivespeedup hdive_speed",
+      "",
+      XPRS_HEURDIVESPEEDUP, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heurdivestrategy hdive_strategy heurdivestrategy",
-      "Chooses the strategy for the diving heuristic:\n"
-      "\n.. value-table::\n",
-      XPRS_HEURDIVESTRATEGY, values_heurdivestrategy, -1);
+    AddSolverOption("mip:heurdivestrategy hdive_strategy",
+      "",
+      XPRS_HEURDIVESTRATEGY, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heuremphasis heuremphasis",
-                    "Chooses the strategy for the diving heuristic:\n"
-                    "\n.. value-table::\n",
-                    XPRS_HEUREMPHASIS, values_heuremphasis, -1);
+    AddSolverOption("mip:heuremphasis",
+      "",
+      XPRS_HEUREMPHASIS, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heurforcespecialobj heurforcespecobj heurforcespecialobj" ,
-                    "Whether to use special objective heuristics on large problems and even if an incumbant exists:\n"
-                    "\n.. value-table::\n",XPRS_HEURFORCESPECIALOBJ, values_01_noyes_0default_, 0);
+    AddSolverOption("alg:numericalemphasis alg:numericfocus numericfocus numfocus numericemphasis",
+      "",
+      XPRS_NUMERICALEMPHASIS, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heurfreq heurfreq",
-                    "During branch and bound, heuristics are applied at nodes whose depth "
-                    "from the root is zero modulo \"heurfreq\"; default -1 (automatic).",
-                    XPRS_HEURFREQ, -1, INT_MAX);
+    AddSolverOption("mip:heurforcespecialobj heurforcespecobj",
+      "",
+      XPRS_HEURFORCESPECIALOBJ, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heursearcheffort heursearcheffort",
-                    "Adjusts the overall level of the local search heuristics; default 1.0 (normal level).",
-                    XPRS_HEURSEARCHEFFORT, 1.0, DBL_MAX);
+    AddSolverOption("mip:heurfreq",
+      "",
+      XPRS_HEURFREQ, -1, INT_MAX);
 
-    AddSolverOption("mip:heursearchfreq heurfreq heursearchfreq",
-                    "Specifies how often the local search heuristic should be run in the tree:\n"
-                    "\n.. value-table::\n",
-                    XPRS_HEURSEARCHFREQ, values_heursearchfreq,-1);
+    AddSolverOption("mip:heursearcheffort",
+      "",
+      XPRS_HEURSEARCHEFFORT, 1.0, DBL_MAX);
 
-    AddSolverOption("mip:heursearchrootcutfreq heurrootcutfreq heursearchrootcutfreq",
-                    "How often to run the local search heuristic while cutting at the root node:\n"
-                    "\n.. value-table::\n",
-                    XPRS_HEURSEARCHROOTCUTFREQ, values_heursearchrootcutfreq,-1);
+    AddSolverOption("mip:heursearchfreq",
+      "",
+      XPRS_HEURSEARCHFREQ, INT_MIN, INT_MAX);
+
+    AddSolverOption("mip:heursearchrootcutfreq heurrootcutfreq",
+      "",
+      XPRS_HEURSEARCHROOTCUTFREQ, INT_MIN, INT_MAX);
 
 
-    AddSolverOption("mip:heursearchrootselect  heursearchrootselect",
-                    "A bit vector control for selecting which local search heuristics to apply on the root node of a global solve; "
-                    "default 117:\n"
-                    "\n.. value-table::\n",
-                    XPRS_HEURSEARCHROOTSELECT, values_heursearchrootcutselect,-1);
+    AddSolverOption("mip:heursearchrootselect",
+      "",
+      XPRS_HEURSEARCHROOTSELECT, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heursearchtreeselect  heursearchtreeselect",
-                    "A bit vector control for selecting which local search heuristics to apply during the tree search of a global solve, "
-                    "default 17:\n"
-                    "\n.. value-table::\n",
-                    XPRS_HEURSEARCHTREESELECT, values_heursearchrootcutselect,-1);
+    AddSolverOption("mip:heursearchtreeselect",
+      "",
+      XPRS_HEURSEARCHTREESELECT, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:heurthreads heurtreads",
-                    "Number of threads to dedicate to running heuristics on the root node:\n",
-                    XPRS_HEURTHREADS, values_heurthreads, 0);
+    AddSolverOption("mip:heurthreads",
+      "",
+      XPRS_HEURTHREADS, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:historycosts historycosts",
-                    "How to update the pseudo cost for a global entity when a strong branch or a regular branch is applied:\n",
-                    XPRS_HISTORYCOSTS, values_historycosts, -1);
+    AddSolverOption("mip:historycosts",
+      "",
+      XPRS_HISTORYCOSTS, INT_MIN, INT_MAX);
 
-    AddSolverOption("mip:localchoice localchoice",
-                    "when to backtrack between two child nodes during a \"dive\":\n"
-                    "\n.. value-table::\n",
-                    XPRS_LOCALCHOICE, values_localchoice, 1);
+    AddSolverOption("mip:localchoice",
+      "",
+      XPRS_LOCALCHOICE, INT_MIN, INT_MAX);
     
-AddSolverOption("mip:maxlocalbacktrack maxlocalbacktrack maxlocalbt",
-                "Max height above current node to look for a local backtrack "
-                "candidate node; default=-1(automatic)",
-                XPRS_MAXLOCALBACKTRACK, -1, INT_MAX);
+AddSolverOption("mip:maxlocalbacktrack maxlocalbt",
+      "",
+      XPRS_MAXLOCALBACKTRACK, -1, INT_MAX);
 
-AddSolverOption("mip:maxtasks maxmiptasks",
-                "Maximum tasks to run in parallel during a MIP solve; default = -1 "
-                "(use mip:threads)."
-                "For mip:maxtasks > 0, branch-and-bound nodes are solved in a "
-		        "deterministic way, but the barrier algorithm (if used) may "
-                "cause a nondeterministic MIP solve unless bar:threads = 1.",
-                XPRS_MAXMIPTASKS, -1, INT_MAX);
+AddSolverOption("mip:maxtasks",
+  "",
+  XPRS_MAXMIPTASKS, -1, INT_MAX);
 
 AddSolverOption("mip:gap mipgap",
-  "Max. relative MIP optimality gap (default 1e-4).",
+  "",
   XPRS_MIPRELSTOP, 1e-4, DBL_MAX);
 
 AddSolverOption("mip:gapabs mipgapabs",
-  "Max. absolute MIP optimality gap (default 0).",
+  "",
   XPRS_MIPABSSTOP, 0.0, DBL_MAX);
 
-AddSolverOption("mip:components mipcomponents",
-  "Determines whether disconnected components in a MIP should\n\
-		be solved as separate MIPs:\n"
-  "\n.. value-table::\n",
-  XPRS_MIPCOMPONENTS, values_autonoyes_, -1);
+AddSolverOption("mip:components",
+  "",
+  XPRS_MIPCOMPONENTS, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:concurrentnodes mipconcurrentnodes",
-  "Node limit to choose the winning solve when concurrent\n\
-		solves are enabled:\n"
-  "\n.. value-table::\n",
-  XPRS_MIPCONCURRENTNODES, values_mipconcurrentnodes, -1);
+AddSolverOption("mip:concurrentnodes",
+  "",
+  XPRS_MIPCONCURRENTNODES, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:concurrentsolves mipconcurrentsolves",
-  "Select the number of concurrent solves to start for a MIP:\n"
-  "\n.. value-table::\n",
-  XPRS_MIPCONCURRENTSOLVES, values_mipconcurrentsolves, 0);
+AddSolverOption("mip:concurrentsolves",
+  "",
+  XPRS_MIPCONCURRENTSOLVES, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:dualreductions mipdualreductions",
-  "Kinds of dual reductions allowed during branch and bound:\n"
-  "\n.. value-table::\n"
-  "\nIf poolnbest > 1 is specified, specifying "
-  "mipdualreductions = 2 might be prudent.",
-  XPRS_MIPDUALREDUCTIONS, values_mipdualreductions, 1);
+AddSolverOption("mip:dualreductions",
+  "The driver sets 2 when a solution pool is requested "
+    "(sol:count or sol:stub).",
+  XPRS_MIPDUALREDUCTIONS, INT_MIN, INT_MAX);
 
 
-AddSolverOption("mip:kappafreq mipkappafreq",
-  "During branch-and-bound, how often to compute "
-  "basis condition numbers:\n"
-  "\n.. value-table::\n"
-  "\nWhen mipkappafreq > 0, a final summary shows the number of "
-  "sampled nodes that are:\n\
-			\"stable\": kappa < 10^7\n\
-			\"suspicious\": 10^7 <= kappa < 10^10\n\
-			\"unstable\": 10^10 <= kappa < 10^13\n\
-			\"ill-posed\": 10^13 <= kappa.\n"
-    "A \"Kappa attention level\" between 0 and 1 is also reported. "
-    "Condition numbers use the Frobenius norms of the basis "
-    "and its inverse.", 
-  XPRS_MIPKAPPAFREQ, values_mipkappafreq,0);
+AddSolverOption("mip:kappafreq",
+  "",
+  XPRS_MIPKAPPAFREQ, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:log miplog",
-  "Frequency of printing MIP iteration log; default = -100."
-  "Values n < 0 display detailed outputs every -n iterations.",
-  XPRS_LPLOG, -INT_MAX, INT_MAX);
+AddSolverOption("mip:log",
+  "",
+  XPRS_MIPLOG, -INT_MAX, INT_MAX);
 
-AddSolverOption("mip:presolve mippresolve",
-  "Type of integer processing to be performed. "
-  "If set to 0, no processing will be performed (default automatic):\n"
-  "\n.. value-table::\n",
-  XPRS_MIPPRESOLVE, values_mippresolve, 1);
+AddSolverOption("mip:presolve",
+  "",
+  XPRS_MIPPRESOLVE, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:rampup miprampup",
-  "Whether to limit the number of parallel tasks\n\
-		during the ramp-up phase of the parallel MIP algorithm:\n"
-  "\n.. value-table::\n",
-  XPRS_MIPRAMPUP, values_miprampup, -1);
+AddSolverOption("mip:rampup",
+  "",
+  XPRS_MIPRAMPUP, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:miprefineiterlimit miprefiterlim miprefineiterlimit",
-  "Max. simplex iterations per reoptimization in MIP refiner "
-  "when refineops is 2 or 3; default -1 (automatic).",
+AddSolverOption("mip:miprefineiterlimit miprefiterlim",
+  "",
   XPRS_MIPREFINEITERLIMIT, -1, INT_MAX);
 
-AddSolverOption("mip:restart miprestart",
-  "Control strategy for in-tree restarts:\n"
-  "\n.. value-table::\n",
-  XPRS_MIPRESTART, values_miprestart, -1);
+AddSolverOption("mip:restart",
+  "",
+  XPRS_MIPRESTART, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:restartgapthreshold miprestartgapthreshold",
-  "Initial gap threshold to delay in-tree restart; "
-    "the restart is delayed if the relative gap is below the "
-    "threshold (default 0.02)",
+AddSolverOption("mip:restartgapthreshold",
+  "",
   XPRS_MIPRESTARTGAPTHRESHOLD, 0.0, DBL_MAX);
 
-AddSolverOption("mip:restartfactor miprestartfactor",
-  "Fine tune initial conditions to trigger an in-tree "
-  "restart; values > 1 increase the aggressiveness, < 1 "
-  "decrease it (default 1.0)",
+AddSolverOption("mip:restartfactor",
+  "",
   XPRS_MIPRESTARTFACTOR, 0.0, DBL_MAX);
 
-AddSolverOption("mip:threads mipthreads",
-  "Determines the number of threads implemented to run the parallel "
-  "MIP code; default -1: alg:threads will determine the number of threads.",
+AddSolverOption("mip:threads",
+  "",
   XPRS_MIPTHREADS, -1, INT_MAX);
 
-AddSolverOption("mip:intfeastol intfeastol",
-  "Feasibility tolerance for integer variables (default 5e-06).",
+AddSolverOption("mip:intfeastol inttol intfeastol",
+  "",
   XPRS_MIPTOL, 0.0, DBL_MAX);
 
-AddSolverOption("mip:toltarget miptoltarget",
-  "Value of miptol used for refining equalities on MIP "
-		"problems when refineops is 2 or 3; default = 0.",
+AddSolverOption("mip:toltarget",
+  "",
   XPRS_MIPTOLTARGET, 0.0, DBL_MAX);
 
-AddSolverOption("mip:nodeprobingeffort nodeprobingeffort",
-  "Multiplier on the default amount of work node probing "
-  "should do. Setting the control to zero disables node probing.",
+AddSolverOption("mip:nodeprobingeffort",
+  "",
   XPRS_NODEPROBINGEFFORT, 0.0, DBL_MAX);
 
-AddSolverOption("mip:nodeselection nodeselection",
-  "Determines which nodes will be considered for solution "
-  "once the current node has been solved:\n"
-  "\n.. value-table::\n",
-  XPRS_NODESELECTION, values_nodeselection, 0);
+AddSolverOption("mip:nodeselection",
+  "",
+  XPRS_NODESELECTION, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:pseudocost pseudocost",
-  "Default pseudo-cost assumed for forcing an integer variable\n\
-		to an integer value; default = 0.01",
+AddSolverOption("mip:pseudocost",
+  "",
   XPRS_PSEUDOCOST, 0.0, DBL_MAX);
 
 
 
-AddSolverOption("mip:qcrootalg qcrootalg",
-  "when using miqcpalg = 1 to solve a mixed - integer problem that "
-  "has quadratic constraints or second - order cone constraints, "
-  "the algorithm for solving the root node:\n"
-  "\n.. value-table::\n",
-  XPRS_QCROOTALG, values_qcrootalg, -1);
+AddSolverOption("mip:qcrootalg",
+  "",
+  XPRS_QCROOTALG, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:relaxtreememorylimit relaxtreemem relaxtreememorylimit",
-  "Fraction of memory limit by which to relax \"treememlimit\" "
-    "when too much structural data appears; default 0.1. Set to 0 to never relax "
-  "the memory limit in this way.",
+AddSolverOption("mip:relaxtreememorylimit relaxtreemem",
+  "",
   XPRS_RELAXTREEMEMORYLIMIT, 0.0, DBL_MAX);
 
-AddSolverOption("mip:sbbest sbbest",
-  "Number of infeasible global entities to initialize pseudo costs for on each node:\n"
-  "\n.. value-table::\n",
-  XPRS_SBBEST, values_sbbest, -1);
+AddSolverOption("mip:sbbest",
+  "",
+  XPRS_SBBEST, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:sbeffort sbeffort",
-  "Adjusts the overall amount of effort when using strong branching to select an "
-  "infeasible global entity to branch on; default = 1.",
+AddSolverOption("mip:sbeffort",
+  "",
   XPRS_SBEFFORT, 0.0, DBL_MAX);
 
-AddSolverOption("mip:sbestimate sbestimate",
-  "How to compute pseudo costs from the local node "
-  "when selecting an infeasible entity to branch on:\n"
-  "\n.. value-table::\n",
-  XPRS_SBESTIMATE, values_sbestimate, -1);
+AddSolverOption("mip:sbestimate",
+  "",
+  XPRS_SBESTIMATE, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:sbiterlimit sbiterlimit",
-  "Number of dual iterations to perform the strong branching; "
-		"0=none, default = -1 (automatic choice)",
+AddSolverOption("mip:sbiterlimit",
+  "",
   XPRS_SBITERLIMIT, -1, INT_MAX);
 
-AddSolverOption("mip:sbselect sbselect",
-  "size of candidate list for strong branching:\n"
-  "\n.. value-table::\n",
-  XPRS_SBSELECT, values_sbselect, -2);
+AddSolverOption("mip:sbselect",
+  "",
+  XPRS_SBSELECT, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:symmetry symmetry",
-  "Amount of effort to detect symmetry in MIP problems:\n"
-  "\n.. value-table::\n",
-  XPRS_SYMMETRY, values_symmetry, 1);
+AddSolverOption("mip:symmetry",
+  "",
+  XPRS_SYMMETRY, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:symselect symselect",
-  "Adjusts the overall amount of effort for symmetry detection:\n"
-  "\n.. value-table::\n",
-  XPRS_SYMSELECT, values_symselect, -1);
+AddSolverOption("mip:symselect",
+  "",
+  XPRS_SYMSELECT, INT_MIN, INT_MAX);
 
-AddSolverOption("mip:varselection varselection",
-  "How to score the integer variables at a MIP node, for "
-    "branching on a variable with minimum score:\n"
-    "\n.. value-table::\n",
-  XPRS_VARSELECTION, values_varselection, -1);
+AddSolverOption("mip:varselection",
+  "",
+  XPRS_VARSELECTION, INT_MIN, INT_MAX);
 
 
 // endmip
     // ****************************
   // Cuts
   // ****************************
-  AddSolverOption("cut:cover covercuts",
-    "The number of rounds of lifted cover inequalities at the top node."
-    "Default=-1, automatic.",
+  AddSolverOption("cut:cover",
+    "",
     XPRS_COVERCUTS, -1, INT_MAX);
 
-  AddSolverOption("cut:gomory gomcuts",
-    "The number of rounds of Gomory or lift-and-project cuts at the top node."
-    "Default=-1, automatic.",
+  AddSolverOption("cut:gomory",
+    "",
     XPRS_GOMCUTS, -1, INT_MAX);
 
-  AddSolverOption("cut:qccuts qccuts",
-    "when using miqcpalg=1 to solve a mixed-integer problem that "
-    "has quadratic constraints or second-order cone constraints, "
-    "the number of rounds of outer approximation cuts at the top "
-    "node; default = -1 (automatic choice).",
+  AddSolverOption("cut:qccuts",
+    "",
     XPRS_QCCUTS, -1, INT_MAX);
 
-    AddSolverOption("cut:lnpbest lnpbest",
-                    "Number of infeasible global entities to create lift-and-project cuts "
-                    "for during each round of Gomory cuts at the top node",
-                    XPRS_LNPBEST, 1, INT_MAX);
+    AddSolverOption("cut:lnpbest",
+      "",
+      XPRS_LNPBEST, 1, INT_MAX);
 
-    AddSolverOption("cut:lnpiterlimit lnpiterlimit",
-                    "Number of iterations to perform in improving each lift-and-project cut; "
-                    "default=-1 (automatic)",
-                    XPRS_LNPITERLIMIT, -1, INT_MAX);
+    AddSolverOption("cut:lnpiterlimit",
+      "",
+      XPRS_LNPITERLIMIT, -1, INT_MAX);
     
-    AddSolverOption("cut:rltcuts rltcuts",
-      "Determines whether RLT cuts should be separated in the global solver:\n"
-      "\n.. value-table::\n",
-      XPRS_RLTCUTS, values_autonoyes_, -1);
+    AddSolverOption("cut:rltcuts",
+      "",
+      XPRS_RLTCUTS, INT_MIN, INT_MAX);
 
-  AddSolverOption("cut:treecover treecovercuts",
-    "The number of rounds of lifted cover inequalities at MIP nodes "
-    "other than the top node. Default=-1 (automatic).",
+  AddSolverOption("cut:treecover",
+    "",
     XPRS_TREECOVERCUTS, -1, INT_MAX);
 
-  AddSolverOption("cut:treegomory treegomcuts",
-    "The number of rounds of Gomory or lift-and-project cuts at MIP nodes "
-    "other than the top node. Default=-1 (automatic).",
+  AddSolverOption("cut:treegomory",
+    "",
     XPRS_TREEGOMCUTS, -1, INT_MAX);
 
-  AddSolverOption("cut:treeqccuts treeqccuts",
-    "when using miqcpalg=1 to solve a MIP that "
-    "has quadratic constraints or second-order cone constraints, "
-    "the number of rounds of outer approximation cuts during the "
-    "tree search; default = -1 (automatic choice).",
+  AddSolverOption("cut:treeqccuts",
+    "",
     XPRS_TREEQCCUTS, -1, INT_MAX);
 
-  AddSolverOption("cut:depth cutdepth",
-    "Maximum MIP tree depth at which to generate cuts. Default "
-    "-1 (automatic); a value of 0 will disable cuts generation.",
+  AddSolverOption("cut:depth",
+    "",
     XPRS_CUTDEPTH, -1, INT_MAX);
 
 
-  AddSolverOption("cut:factor cutfactor",
-    "Limit on number of cuts and cut coefficients added "
-    "while solving MIPs. Default=-1 (automatic); a value of 0 "
-    "will disable cuts generation.",
-    XPRS_CUTFACTOR, -1, INT_MAX);
+  AddSolverOption("cut:factor",
+    "",
+    XPRS_CUTFACTOR, -1.0, DBL_MAX);
 
-  AddSolverOption("cut:freq cutfreq",
-    "Cuts are only generated at tree depths that are integer\n\
-		multiples of cutfreq. Default=-1 (automatic choice).",
+  AddSolverOption("cut:freq",
+    "",
     XPRS_CUTFREQ, -1, INT_MAX);
 
-  AddSolverOption("cut:select cutselect",
-    "Detailed control of cuts at MIP root node; sum of:\n"
-    "\n.. value-table::\n",
-    XPRS_CUTSELECT, values_cutselect, -1);
+  AddSolverOption("cut:select",
+    "",
+    XPRS_CUTSELECT, INT_MIN, INT_MAX);
 
-  AddSolverOption("cut:treeselect treecutselect",
-    "Detailed control of cuts created during the tree search; sum of:\n"
-    "\n.. value-table::\n",
-    XPRS_TREECUTSELECT, values_cutselect, -1);
+  AddSolverOption("cut:treeselect",
+    "",
+    XPRS_TREECUTSELECT, INT_MIN, INT_MAX);
 
-  AddSolverOption("cut:strategy cutstrategy",
-    "How aggressively to generate MIP cuts; more ==> fewer nodes "
-    "but more time per node:\n"
-    "\n.. value-table::\n",
-    XPRS_CUTSTRATEGY, values_cutstrategy, -1);
+  AddSolverOption("cut:strategy",
+    "",
+    XPRS_CUTSTRATEGY, INT_MIN, INT_MAX);
 
   // ****************************
   // Q(C)P
   // ****************************
-  AddSolverOption("qp:nonconvex nonconvex",
-    "Determines if the convexity of the problem is checked before optimization:\n"
-    "\n.. value-table::\n",
-    XPRS_IFCHECKCONVEXITY, values_01_noyes_1default_, 1);
+  AddStoredOption("qp:nonconvex nonconvex",
+    "Deprecated, use qp:convexitychk. Values 0 and 1 are passed on to "
+    "qp:convexitychk (convexity check off/on); the value 2, with which "
+    "other AMPL drivers allow nonconvex quadratics, switches the "
+    "convexity check off as well.",
+    storedOptions_.nonconvex_);
 
-  AddSolverOption("qp:eigenvaluetol eigenvaluetol",
-    "Regard the matrix in a quadratic form as indefinite if its "
-    "smallest eigvenalue is < -eigevnaltol; default = 1e-6",
+  AddSolverOption("qp:eigenvaluetol",
+    "",
     XPRS_EIGENVALUETOL, 0.0, DBL_MAX);
 
-  AddSolverOption("qp:simplexops qsimplexops",
-    "Bit vector, controls the behavior of the quadratic simplex solvers:\n"
-    "\n.. value-table::\n",
-    XPRS_QSIMPLEXOPS, values_qsimplexops, 1);
+  AddSolverOption("qp:simplexops",
+    "",
+    XPRS_QSIMPLEXOPS, INT_MIN, INT_MAX);
 
-  AddSolverOption("qp:miqcpalg miqcpalg",
-    "Which algorithm is to be used to solve mixed integer quadratic constrained and mixed integer second order cone problems:\n"
-    "\n.. value-table::\n",
-    XPRS_MIQCPALG, values_miqcpalg, 1);
+  AddSolverOption("qp:miqcpalg",
+    "",
+    XPRS_MIQCPALG, INT_MIN, INT_MAX);
 
-  AddSolverOption("qp:unshift quadunshift quadraticunshift",
-    "whether quadratic simplex should do an extra "
-	  "purification after finding a solution:\n"
-    "\n.. value-table::\n",
-    XPRS_QUADRATICUNSHIFT, values_autonoyes_, -1);
+  AddSolverOption("qp:unshift quadunshift",
+    "",
+    XPRS_QUADRATICUNSHIFT, INT_MIN, INT_MAX);
 
-  AddSolverOption("qp:repairindefiniteq repairindefq repairindefiniteq",
-    "whether to repair indefinite quadratic forms:\n"
-    "\n.. value-table::\n",
-    XPRS_REPAIRINDEFINITEQ, values_yesnoinverted_defaultno, -1);
+  AddSolverOption("qp:repairindefiniteq repairindefq",
+    "",
+    XPRS_REPAIRINDEFINITEQ, INT_MIN, INT_MAX);
 
   //endqp
 
 
+
+  AddStoredOption("alg:readbasis readbasis startbasis basisin",
+    "File with the starting basis (Xpress .bas format, see "
+    "tech:writesolution). It is read after any incoming .sstatus basis "
+    "(see alg:basis) and overrides it. Xpress matches the basis by row "
+    "and column names, so the model must be passed with names "
+    "(AMPL option auxfiles rc).",
+    storedOptions_.readBasis_);
+
+  AddListOption("tech:optionnative optionnative optnative tech:param param",
+    "Xpress control by name: a quoted string \"NAME=value\" or "
+    "\"NAME value\", for documented and undocumented controls; "
+    "can be repeated. \"NAME=?\" prints the current value.",
+    storedOptions_.nativeOptions_);
 
   AddStoredOption("tech:tunebase tunerdir tunebase",
     "Base name for results of running XPRESS's search for best "
@@ -2405,88 +2233,112 @@ AddSolverOption("mip:varselection varselection",
     "problem called prob will be located at tuneroutput/prob/",
     storedOptions_.tunebase_);
 
-
+  AddStoredOption("tech:tunermethodread tunermethodread",
+      "Read existing tuner method from the specified .xtm file, "
+      "see \"tunermethodwrite\" to obtaing a template file",
+      storedOptions_.tunermethodfileread_
+  );
+  AddStoredOption("tech:tunermethodwrite tunermethodwrite",
+      "Write existing tuner method from the specified .xtm file",
+      storedOptions_.tunermethodfilewrite_
+  );
   AddStoredOption("tech:tunename tunesessionname",
     "Set problem name within the tuner \"tunebase\" is specified.",
     storedOptions_.tunename_);
 
 
-  AddSolverOption("tech:tuneoutput tuneroutput tuneoutput",
-    "Output tuner results and logs to the file system when \"tunebase\" is specified:\n"
-    "\n.. value-table::\n",
-    XPRS_TUNEROUTPUT, values_01_noyes_1default_, 2);
+  AddSolverOption("tech:tuneoutput tuneoutput",
+    "",
+    XPRS_TUNEROUTPUT, INT_MIN, INT_MAX);
 
-  AddSolverOption("tech:tunerhistory tunerhistory",
-    "Reuse and append to previous tuner results of the same problem:\n"
-    "\n.. value-table::\n",
-    XPRS_TUNERHISTORY, values_tunerhistory, 2);
+  AddSolverOption("tech:tunerhistory",
+    "",
+    XPRS_TUNERHISTORY, INT_MIN, INT_MAX);
 
-  AddSolverOption("tech:tunetimelim tunermaxtime tunetimelim lim:tunetime",
-    "Time limit (in seconds) on tuning when \"tunebase\" "
-    "is specified; default 0 (no time limit).",
+  AddSolverOption("tech:tunetimelim tunetimelim lim:tunetime",
+    "",
     XPRS_TUNERMAXTIME, 0.0, Infinity());
 
-  AddSolverOption("tech:tunerthreads tunerthreads",
-    "Number of tuner threads to run in parallel; "    
-    "default=-1 (automatic)",
+  AddSolverOption("tech:tunerthreads",
+    "",
     XPRS_TUNERTHREADS, -1, INT_MAX);
 
-  AddSolverOption("tech:tunermethod tunermethod",
-    "Method for tuning when \"tunebase\" is specified:\n"
-    "\n.. value-table::\n",
-    XPRS_TUNERMETHOD, values_tunermethod, -1);
+  AddSolverOption("tech:tunermethod",
+    "",
+    XPRS_TUNERMETHOD, INT_MIN, INT_MAX);
 
-  AddSolverOption("tech:tunertarget tunertarget",
-    "What to measure to compare two problem solutions "
-		"when running the XPRESS tuner:\n"
-    "\n.. value-table::\n",
-    XPRS_TUNERTARGET, values_tunertarget, -1);
+  AddSolverOption("tech:tunertarget",
+    "",
+    XPRS_TUNERTARGET, INT_MIN, INT_MAX);
 
-  AddSolverOption("tech:tunerverbose tunerverbose",
-    "whether the tuner should prints detailed information for each run:\n"
-    "\n.. value-table::\n",
-    XPRS_TUNERVERBOSE, values_01_noyes_1default_, 1);
+  AddSolverOption("tech:tunerverbose",
+    "",
+    XPRS_TUNERVERBOSE, INT_MIN, INT_MAX);
 
   /////////////////////// Custom solve results /////////////////////////
 //  AddSolveResults({
 //                    { sol::NUMERIC, "failure: numeric issue, no feasible solution" }
 //                  });
+
+  AddSolverOption("obj:multi:ops",
+    "",
+    XPRS_MULTIOBJOPS, INT_MIN, INT_MAX);
+
+  AddSolverOption("obj:multi:log",
+    "",
+    XPRS_MULTIOBJLOG, INT_MIN, INT_MAX);
+
+  // Adding compiled options, see BUILD_XPRESS_OPTION_PARSER
+  this->AddOptimizerOptions();
+  this->AddNonlinearOptions();
 }
 
 
 double XpressmpBackend::MIPGap() {
   // implementation taken from ASL driver for consistency
-  return MIPGapAbs() / (1e-10 + std::abs(ObjectiveValue()));
+  return MIPGapAbs() / (1e-10 + std::abs(MIPGapObjValue()));
+}
+
+double XpressmpBackend::MIPGapObjValue() const {
+  // Native multi-objective: the bound is that of the last pass,
+  // ObjectiveValue() is the 1st objective's value
+  if (multiobj() && NumObjs() > 1 && !pool_best_x_.size())
+    return getDblAttr(XPRS_MIPBESTOBJVAL);
+  return ObjectiveValue();
 }
 double XpressmpBackend::BestDualBound() {
-  return getDblAttr(XPRS_BESTBOUND);
+  auto bnd = getDblAttr(XPRS_BESTBOUND);
+  if (pool_best_x_.size())    // enumeration: bound for the n-th best solution
+    bnd = getDblAttr(XPRS_OBJSENSE) >= 0
+        ? std::min(bnd, pool_best_obj_) : std::max(bnd, pool_best_obj_);
+  return bnd;
 }
 
 double XpressmpBackend::MIPGapAbs() {
   return std::fabs(
-    ObjectiveValue() - BestDualBound());
+    MIPGapObjValue() - BestDualBound());
 }
 
 
 ArrayRef<int> XpressmpBackend::VarStatii() {
 
-  std::vector<int> vars(NumVars());
+  std::vector<int> vars(NumVarsOrig());
   int status = XPRSgetbasis(model_fixed_, NULL, vars.data());
   if (status)
     vars.clear();
   else 
     for (auto& s : vars) {
       switch (s) {
-      case 1:
+      case XPRS_BASISSTATUS_BASIC:
         s = (int)BasicStatus::bas;
         break;
-      case 0:
+      case XPRS_BASISSTATUS_NONBASIC_LOWER:
         s = (int)BasicStatus::low;
         break;
-      case 2:
+      case XPRS_BASISSTATUS_NONBASIC_UPPER:
         s = (int)BasicStatus::upp;
         break;
-      case 3:
+      case XPRS_BASISSTATUS_SUPERBASIC:
         s = (int)BasicStatus::sup;
         break;
       default:
@@ -2497,24 +2349,23 @@ ArrayRef<int> XpressmpBackend::VarStatii() {
 }
 
 ArrayRef<int> XpressmpBackend::ConStatii() {
-
-  std::vector<int> cons(NumLinCons());
+  std::vector<int> cons(NumLinConsOrig());
   int status = XPRSgetbasis(model_fixed_, cons.data(), NULL);
   if (status)
     cons.clear();
   else
     for (auto& s : cons) {
       switch (s) {
-      case 1:
+      case XPRS_BASISSTATUS_BASIC:
         s = (int)BasicStatus::bas;
         break;
-      case 0:
+      case XPRS_BASISSTATUS_NONBASIC_LOWER:
         s = (int)BasicStatus::low;
         break;
-      case 2:
+      case XPRS_BASISSTATUS_NONBASIC_UPPER:
         s = (int)BasicStatus::upp;
         break;
-      case 3:
+      case XPRS_BASISSTATUS_SUPERBASIC:
         s = (int)BasicStatus::sup;
         break;
       default:
@@ -2531,20 +2382,18 @@ std::vector<int> XpressmpBackend::VarStatii(ArrayRef<int> vst) {
     auto& s = stt[j];
     switch ((BasicStatus)s) {
     case BasicStatus::bas:
-      s = 1;
+      s = XPRS_BASISSTATUS_BASIC;
       break;
     case BasicStatus::low:
-      s = 0;
-      break;
-    case BasicStatus::equ:
-      s = 1;
+      s = XPRS_BASISSTATUS_NONBASIC_LOWER;
       break;
     case BasicStatus::upp:
-      s = 2;
+      s = XPRS_BASISSTATUS_NONBASIC_UPPER;
       break;
+    case BasicStatus::equ:
     case BasicStatus::sup:
     case BasicStatus::btw:
-      s = 3;
+      s = XPRS_BASISSTATUS_SUPERBASIC;
       break;
     case BasicStatus::none:
       /// 'none' is assigned to new variables. Compute low/upp/sup:
@@ -2557,11 +2406,11 @@ std::vector<int> XpressmpBackend::VarStatii(ArrayRef<int> vst) {
         XPRESSMP_CCALL(XPRSgetub(lp(), ub.data(), 0, vst.size()-1));
       }
       if (lb[j] >= -1e-6)
-        s = 0;
+        s = XPRS_BASISSTATUS_NONBASIC_LOWER;
       else if (ub[j] <= 1e-6)
-        s = 2;
+        s = XPRS_BASISSTATUS_NONBASIC_UPPER;
       else
-        s = 3;
+        s = XPRS_BASISSTATUS_SUPERBASIC;
       break;
     default:
       MP_RAISE(fmt::format("Unknown AMPL var status value: {}", s));
@@ -2575,15 +2424,19 @@ std::vector<int> XpressmpBackend::ConStatii(ArrayRef<int> cst) {
   for (auto& s : stt) {
     switch ((BasicStatus)s) {
     case BasicStatus::bas:
-      s = 1;
+      s = XPRS_BASISSTATUS_BASIC;
+      break;
+    case BasicStatus::low:
+      s = XPRS_BASISSTATUS_NONBASIC_LOWER;
+      break;
+    case BasicStatus::upp:    // assigned to new rows, it seems good to guess
+      s = XPRS_BASISSTATUS_NONBASIC_UPPER;
       break;
     case BasicStatus::none:   // for 'none', which is the status
-    case BasicStatus::upp:    // assigned to new rows, it seems good to guess
     case BasicStatus::sup:    // a valid status.
-    case BasicStatus::low:    //
     case BasicStatus::equ:    // For active constraints, it is usually 'sup'.
     case BasicStatus::btw:    // We could compute slack to decide though.
-      s = 3;
+      s = XPRS_BASISSTATUS_SUPERBASIC;
       break;
     default:
       MP_RAISE(fmt::format("Unknown AMPL con status value: {}", s));
@@ -2593,6 +2446,7 @@ std::vector<int> XpressmpBackend::ConStatii(ArrayRef<int> cst) {
 }
 
 SolutionBasis XpressmpBackend::GetBasis() {
+  if (fixed_model_failed_) return {};
   int old_outlev = outlev_;
   outlev_ = 0;
     std::vector<int> varstt = VarStatii();
@@ -2601,33 +2455,42 @@ SolutionBasis XpressmpBackend::GetBasis() {
   if (varstt.size() && constt.size()) {
     auto mv = GetValuePresolver().PostsolveBasis(
       { varstt,
-        {{{ CG_Linear, constt }}} });
+        {{{ CG_Algebraic, constt }}} });
     varstt = mv.GetVarValues()();
     constt = mv.GetConValues()();
     assert(varstt.size());
-    assert(constt.size());
   }
   return { varstt,constt};
-
 }
 
 void XpressmpBackend::SetBasis(SolutionBasis basis) {
   auto mv = GetValuePresolver().PresolveBasis(
     { basis.varstt, basis.constt });
-  auto varstt = mv.GetVarValues()();
-  auto constt = mv.GetConValues()(CG_Linear);
-  assert(varstt.size());
-  assert(constt.size());
-  auto convertedVarBasis = VarStatii(varstt);
-  auto convertedConBasis =ConStatii(constt);
-  XPRESSMP_CCALL(XPRSloadbasis(lp(), convertedConBasis.data(), convertedVarBasis.data()));
-
+  auto &varstt = mv.GetVarValues()();
+  auto &constt = mv.GetConValues()(CG_Algebraic);
+//#define XPRESS__ROW_STATS_GENCONS    // Is this valid?
+#ifdef XPRESS__ROW_STATS_GENCONS
+  // Append general constraints. TODO
+  auto& cconstt = mv.GetConValues()(CG_General);
+  constt.insert(constt.end(), cconstt.begin(), cconstt.end());
+#endif  // XPRESS__ROW_STATS_GENCONS
+  if (varstt.size() && constt.size()) {
+    auto convertedVarBasis = VarStatii(varstt);
+    auto convertedConBasis = ConStatii(constt);
+    // Xpress needs to have all constraints, append them as basic
+    convertedConBasis.resize(getIntAttr(XPRS_ROWS), XPRS_BASISSTATUS_BASIC);     
+    
+    XPRESSMP_CCALL(XPRSloadbasis(lp(), convertedConBasis.data(), convertedVarBasis.data()));
+  }
 }
 
 
 void XpressmpBackend::ComputeIIS() {
   int status;
   XPRESSMP_CCALL(XPRSiisfirst(lp(), 1, &status));
+//  switch (status) {
+//  case XPRS_IIS_COMPLETED:
+  SetStatus( GetSolveResult() );
 }
 
 IIS XpressmpBackend::GetIIS() {
@@ -2637,7 +2500,7 @@ IIS XpressmpBackend::GetIIS() {
     { variis, coniis });
   return { mv.GetVarValues()(), mv.GetConValues()() };
 }
-static IISStatus IIS_VarToAMPL(char c) {
+IISStatus XpressmpBackend::IIS_VarToAMPL(char c) {
   switch (c)
   {
   case 'L':
@@ -2646,20 +2509,16 @@ static IISStatus IIS_VarToAMPL(char c) {
     return IISStatus::upp;
   case 'F':
     return IISStatus::fix;
-  }
-  return IISStatus::mem;
-}
-static IISStatus IIS_ConsToAMPL(char c) {
-  switch (c)
-  {
-  case 'G':
-    return IISStatus::low;
-  case 'L':
-    return IISStatus::upp;
-  case '1':
-  case '2':
-  case 'E':
-    return IISStatus::pmem;
+  case 'B':
+  case 'I':
+  case 'P':
+    return IISStatus::intvar;
+  case 'S':
+  case 'R':
+    return IISStatus::semi;
+  default:
+    AddWarning("IISVarStatus",
+               fmt::format("Unknown status '{}' of an IIS variable", c));
   }
   return IISStatus::mem;
 }
@@ -2668,46 +2527,85 @@ ArrayRef<int> XpressmpBackend::VarsIIS() {
   int nconsiis, nvarsiis;
   XPRESSMP_CCALL(XPRSgetiisdata(lp(), 1, &nconsiis, &nvarsiis, 0, 0, 0, 0, 0, 0, 0, 0));
   std::vector<int> vars(nvarsiis);
-  std::vector<char> bounds(nvarsiis), isolvars(nvarsiis);
+  std::vector<char> bounds(nvarsiis);
   XPRESSMP_CCALL(XPRSgetiisdata(lp(), 1, &nconsiis, &nvarsiis, 0,
-    vars.data(), 0, bounds.data(), 0, 0, 0, isolvars.data()));
-  std::vector<int> iis(NumVars(), 0);
+    vars.data(), 0, bounds.data(), 0, 0, 0, 0));
+  std::vector<int> iis(NumVars(), (int)IISStatus::non);
   for (int i = 0; i < nvarsiis; i++)
-    iis[i] = (int)IIS_VarToAMPL(bounds[i]);
+    iis[vars[i]] = (int)IIS_VarToAMPL(bounds[i]);
   return iis;
 }
+
 pre::ValueMapInt XpressmpBackend::ConsIIS() {
   int nconsiis, nvarsiis;
   XPRESSMP_CCALL(XPRSgetiisdata(lp(), 1, &nconsiis, &nvarsiis, 0, 0, 0, 0, 0, 0, 0, 0));
   std::vector<int> cons(nconsiis);
-  std::vector<char> contype(nconsiis), isolrows(nconsiis);
+  std::vector<char> contype(nconsiis);
   XPRESSMP_CCALL(XPRSgetiisdata(lp(), 1, &nconsiis, &nvarsiis, cons.data(),
-    0, contype.data(), 0, 0, 0, isolrows.data(), 0));
-  std::vector<int> iis_lincon(NumLinCons(), 0);
+    0, contype.data(), 0, 0, 0, 0, 0));
+  std::vector<int> iis_algcon(NumLinCons(), (int)IISStatus::non);
+  std::vector<int> iis_sos(NumSOSCons(), (int)IISStatus::non);
+  std::vector<int> iis_pl(NumPWLs(), (int)IISStatus::non);
+  std::vector<int> iis_gencon(NumGenCons(), (int)IISStatus::non);
+  std::vector<int> iis_indcon(NumIndicatorCons(), (int)IISStatus::non);
   for (int i = 0; i < nconsiis; i++)
-    iis_lincon[i] = (int)IIS_VarToAMPL(contype[i]);
-  return { {{ CG_Linear, iis_lincon }} }; // TODO other constraint types
+  {
+    switch (contype[i]) {
+    case 'G':
+      iis_algcon[cons[i]] = (int)IISStatus::low;
+      break;
+    case 'L':
+      iis_algcon[cons[i]] = (int)IISStatus::upp;
+      break;
+    case 'E':
+      iis_algcon[cons[i]] = (int)IISStatus::fix;
+      break;
+    case '1':
+    case '2':
+      iis_sos[cons[i]] = (int)IISStatus::mem;
+      break;
+    case 'W':
+      iis_pl[cons[i]] = (int)IISStatus::mem;
+      break;
+    case 'X':
+      iis_gencon[cons[i]] = (int)IISStatus::mem;
+      break;
+    case 'I':
+      iis_indcon[cons[i]] = (int)IISStatus::mem;
+      break;
+    default:
+      AddWarning("IISVarStatus",
+                 fmt::format("Unknown status '{}' of an IIS constraint",
+                             contype[i]));
+    }
+  }
+  return {{{ CG_Algebraic, iis_algcon },
+           { CG_SOS, iis_sos },
+           { CG_Piecewiselinear, iis_pl },
+           { CG_General, iis_gencon },
+           { CG_Indicator, iis_indcon }}};
 }
 
 void XpressmpBackend::AddPrimalDualStart(Solution sol0_unpres) {
   auto mv = GetValuePresolver().PresolveSolution(
     { sol0_unpres.primal, sol0_unpres.dual });
-  auto x0 = mv.GetVarValues()();
-  auto pi0 = mv.GetConValues()(CG_Linear);
+  auto& x0 = mv.GetVarValues()();
+  auto& pi0 = mv.GetConValues()(CG_Algebraic);
 
   int status;
   XPRESSMP_CCALL(XPRSloadlpsol(lp(), x0.data(), NULL,
     pi0.data(), NULL, &status));
   if (status)
-    fmt::print("warmstart: solution is not loaded because the problem is in presolved status.\n");
+    Print("warmstart: solution is not loaded "
+          "because the problem is in presolved status.\n");
 }
 
 void XpressmpBackend::AddMIPStart(
 		ArrayRef<double> x0_unpres, ArrayRef<int> s0_unpres) {
   auto mv = GetValuePresolver().PresolveSolution({ x0_unpres });
   auto ms = GetValuePresolver().PresolveGenericInt({ s0_unpres });
-  auto x0 = mv.GetVarValues()();
-  auto s0 = ms.GetVarValues()();
+  auto& x0 = mv.GetVarValues()();
+  auto& s0 = ms.GetVarValues()();
   std::vector<int> idx;                 // Create sparse vector
   idx.reserve(x0.size());
   std::vector<double> val;
@@ -2718,10 +2616,14 @@ void XpressmpBackend::AddMIPStart(
       val.push_back(x0[i]);
     }
   }
-  XPRESSMP_CCALL(XPRSaddmipsol(lp(), idx.size(), val.data(), idx.data(), nullptr));
+  XPRESSMP_CCALL(
+      XPRSaddmipsol(lp(), idx.size(), val.data(), idx.data(), "AMPL_initial_guess"));
+  XPRESSMP_CCALL(  // in MIPStart() because NLP start is primal-only
+      XPRSnlpsetinitval(lp(), idx.size(), idx.data(), val.data()));
 }
 
-void XpressmpBackend::xpdisplay(XPRSprob prob, void* data, const char* ch, int n, int msglvl)
+void XpressmpBackend::xpdisplay(
+    XPRSprob prob, void* data, const char* ch, int n, int msglvl)
 {
   /*
    msglvl gives the message level as follows:
@@ -2737,19 +2639,25 @@ void XpressmpBackend::xpdisplay(XPRSprob prob, void* data, const char* ch, int n
   if (msglvl < 0)
     fflush(NULL);
   else if (msglvl >= outlev_ && (msglvl != 4 || strncmp(ch, "?899 ", 5)))
+  {
     fmt::print("{}\n", ch);
+    fflush(stdout);
+  }
 }
 
-int XpressmpBackend::xp_mse_display(XPRSobject o, void* context, void* thread,
-  const char* ch, int msglvl, int msgnumber)
-{
+int XpressmpBackend::xp_mse_display(
+    XPRSobject o, void* context, void* thread,
+    const char* ch, int msglvl, int msgnumber) {
   if (outlev_ == 0) return 0;
   if (msglvl < 0)
     fflush(NULL);
-  else if (msglvl >= outlev_ && (msglvl != 4))
+  else if (msglvl >= outlev_ && (msglvl != 4)) {
     fmt::print("{}\n", ch);
+    fflush(stdout);
+  }
   return 0;
 }
+
 } // namespace mp
 
 // AMPLs

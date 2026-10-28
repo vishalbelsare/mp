@@ -1,7 +1,7 @@
 /*
  Basic flat model API definitions.
 
- Copyright (C) 2021 AMPL Optimization Inc
+ Copyright (C) 2024 AMPL Optimization Inc.
 
  Permission to use, copy, modify, and distribute this software and its
  documentation for any purpose and without fee is hereby granted,
@@ -16,13 +16,11 @@
  whatsoever resulting from loss of use, data or profits, whether in an
  action of contract, negligence or other tortious action, arising out
  of or in connection with the use or performance of this software.
+
+ Author: Gleb Belov <gleb@ampl.com>
 */
 #ifndef FLAT_MODEL_API_BASE_H_
 #define FLAT_MODEL_API_BASE_H_
-
-/**
-  * Basic definitions for a FlatModelAPI
-  */
 
 #include <string>
 
@@ -72,31 +70,67 @@ public:
 
 
 /// Level of acceptance of a constraint by a backend
-enum ConstraintAcceptanceLevel {
+enum class ConstraintAcceptanceLevel {
+  NotAccepted=0,
+  AcceptedButNotRecommended=1,
+  Recommended=2
+};
+
+/// Level of acceptance of an expression by a backend
+enum class ExpressionAcceptanceLevel {
   NotAccepted=0,
   AcceptedButNotRecommended=1,
   Recommended=2
 };
 
 
+/// ... then for a certain constraint it can be specified
+#define ACCEPT_CONSTRAINT(ConstrType, level, con_grp) \
+static mp::ConstraintAcceptanceLevel \
+    AcceptanceLevel(const ConstrType*) \
+{ return mp::ConstraintAcceptanceLevel::level; } \
+    static constexpr int \
+    GroupNumber(const ConstrType*) { return con_grp; }
+
+/// ... and/or for expressions, e.g., AbsExpression:
+#define ACCEPT_EXPRESSION(FlatExprType, level) \
+static mp::ExpressionAcceptanceLevel \
+AcceptanceLevel(const FlatExprType*) { \
+  static_assert( std::is_same_v<FlatExprType, \
+      ExprWrapper<typename FlatExprType::FlatConType> >, \
+    #FlatExprType \
+      " should be an ExprWrapper<> - use standard MP flat expressions" ); \
+  return mp::ExpressionAcceptanceLevel::level; \
+}        // pc{} checks that FlatExprType = ExprWrapper<...>
+
+
+/// Constraint group names.
+/// @todo Keep consistent with the \a ConstraintGroups enum.
+const char* ConGroupName(int cg);
+
 /// Constraint groups
 ///
 /// This is used to access constraint attributes (basis status, duals, ...)
-/// Convenient when the solver accesses constraint attributes in groups
+/// Convenient, when the solver accesses constraint attributes in groups.
 /// For example, Gurobi 9.5 has linear, quadratic, SOS, and general
+///
+/// @todo Keep consistent with \a congroup_names
 enum ConstraintGroup {
 	CG_Default,
 	CG_All,
-	CG_Algebraic,          // e.g., MOSEK 10 seems to have algebraic vs others
+  CG_Algebraic,          // MOSEK and Xpress: algebraic vs others
   CG_Linear,
   CG_Quadratic,
 	CG_Conic,
   CG_General,
+  CG_Indicator,          // Xpress
+  CG_Nonlinear,
   CG_Piecewiselinear,
   CG_SOS,
   CG_SOS1,
   CG_SOS2,
-  CG_Logical
+  CG_Logical,
+  CG_END_
 };
 
 
@@ -104,9 +138,12 @@ enum ConstraintGroup {
 class BasicFlatModelAPI {
 public:
   /// Placeholder for GetTypeName()
-  static const char* GetTypeName()    { return "BasicBackendFlatModelAPI"; }
+  static const char* GetTypeName()    { return "BasicFlatModelAPI"; }
   /// Placeholder for GetLongName()
   static const char* GetLongName() { return nullptr; }
+
+  /// Init standard options
+  void InitStandardOptions() { }
 
   /// Placeholder for InitCustomOptions()
   void InitCustomOptions() { }
@@ -127,6 +164,18 @@ public:
 
   ////////////////// Some standard items /////////////////
 
+  /// Add function definitions
+  void AddFuncDefs(const std::vector<FuncDef>& funcs)
+  { pfuncs_ = &funcs; }
+
+  /// Get N functions
+  int GetNumFuncs() const
+  { assert(pfuncs_); return (int)pfuncs_->size(); }
+
+  /// Retrieve function definition
+  const FuncDef& GetFuncDef(int i) const
+  { assert(pfuncs_); return (*pfuncs_).at(i); }
+
   /// Placeholder for SetLinearObjective()
   void SetLinearObjective(int , const LinearObjective& ) {
     MP_UNSUPPORTED("FlatModelAPI::SetLinearObjective()");
@@ -136,9 +185,45 @@ public:
   /// 0 - no, 1 - convex, 2 - nonconvex
   static int AcceptsQuadObj() { return 0; }
 
+  /// Whether accepts NLObjective (relevant in BasicExprModelAPI)
+  static int AcceptsNLObj() { return 0; }
+
+  /// Above which reference count,
+  /// an algebraic formula node should be assigned to a variable.
+  /// Should normally be INT_MAX for solvers
+  /// using pointers to store expressions (SCIP)
+  /// or introducing defined variables (MP2NL).
+  /// Should be small for solvers
+  /// using strings to represent formulas.
+  /// @note 0 means all nodes outlined.
+  /// @note Option *cvt:expr:nlassign*.
+  static int NLAssignLevelDefault() { return 1; }
+
+  /// Same for logical expressions.
+  /// @note Option *cvt:expr:nlreif*.
+  static int NLReifLevelDefault() { return 1; }
+
+  /// Default of option *cvt:pre:auxint*: whether auxiliary
+  /// variables with implied integrality (if-then-else, count, ...)
+  /// are submitted as integer. 1 for solvers without continuous
+  /// variables.
+  static int AuxIntDefault() { return 0; }
+
+  /// Default of option *cvt:multoutcard*: up to which (estimated)
+  /// number of quadratic terms a product of two sums is multiplied
+  /// out. 1 for solvers taking products of variables natively
+  /// (MulConstraint): a product of sums then stays one product
+  /// of two auxiliary variables.
+  static double MultOutCardDefault() { return 1e9; }
+
+
   /// Placeholder for SetQuadraticObjective()
   void SetQuadraticObjective(int , const QuadraticObjective& ) {
     MP_UNSUPPORTED("FlatModelAPI::SetQuadraticObjective()");
+  }
+  /// Placeholder for SetNLObjective()
+  void SetNLObjective(int , const NLObjective& ) {
+    MP_UNSUPPORTED("FlatModelAPI::SetNLObjective()");
   }
 
   /// Placeholder for AddConstraint<>()
@@ -149,6 +234,7 @@ public:
           Constraint::GetTypeName() +
           "'. Provide a handler or a converter method");
   }
+
   /// Derived backends have to tell C++ to use default handlers if they are needed
   /// when they overload AddConstraint(), due to C++ name hiding
 #define USE_BASE_CONSTRAINT_HANDLERS(BaseBackend) \
@@ -161,13 +247,39 @@ public:
 		return CG_Default;
   }
 
-  /// By default, we say constraint XYZ is not accepted but...
-  static constexpr ConstraintAcceptanceLevel AcceptanceLevel(const BasicConstraint*) {
-    return NotAccepted;
+  /// By default, we say constraint XYZ is not accepted
+  static constexpr ConstraintAcceptanceLevel AcceptanceLevel(
+      const BasicConstraint*) {
+    return ConstraintAcceptanceLevel::NotAccepted;
+  }
+
+  /// By default, no expressions (global switch)
+  static constexpr ExpressionAcceptanceLevel \
+      ExpressionInterfaceAcceptanceLevel()
+  { return ExpressionAcceptanceLevel::NotAccepted; }
+
+  /// By default, we say expression XYZ is not accepted
+  template <class FlatCon>
+  static constexpr ExpressionAcceptanceLevel AcceptanceLevel(
+      const ExprWrapper<FlatCon>*) {
+    return ExpressionAcceptanceLevel::NotAccepted;
   }
 
   /// Specifically, ask if the solver accepts non-convex quadratic constraints
   static constexpr bool AcceptsNonconvexQC() { return false; }
+
+  /// If cvt:prod=7 (and not 5) default.
+  /// Recommendation to return the opposite value as
+  /// AcceptsNonconvexQC().
+  static constexpr bool WantLogicalizedProd2Bin() { return true; }
+
+  /// Should we by default recognize signpow() from the input?
+  /// See option cvt:pre:signpow.
+  static constexpr bool WantSignPow() { return false; }
+
+  /// Should we by default recognize logistic() from the input?
+  /// See option cvt:pre:logistic.
+  static constexpr bool WantLogistic() { return false; }
 
   /// Specifically, ask if the solver can mix conic quadratic
   /// (entered via dedicated API) and direct quadratic constraints
@@ -181,16 +293,15 @@ public:
 
 private:
   const FlatModelInfo* pfmi_ { nullptr };
+
+  /// FuncDef defs
+  const std::vector<FuncDef>* pfuncs_ { nullptr };
+
+  // struct Options {
+  //   // int nl_assign_ = Impl::NLAssignLevelDefault();
+  // } options_;
 };
 
-
-/// ... then for a certain constraint it can be specified
-#define ACCEPT_CONSTRAINT(ConstrType, level, con_grp) \
-  static mp::ConstraintAcceptanceLevel \
-    AcceptanceLevel(const ConstrType*) \
-  { return (mp::ConstraintAcceptanceLevel)level; } \
-  static constexpr int \
-    GroupNumber(const ConstrType*) { return con_grp; }
 
 } // namespace mp
 

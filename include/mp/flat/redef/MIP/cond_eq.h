@@ -4,8 +4,109 @@
 #include "mp/common.h"
 #include "mp/flat/redef/redef_base.h"
 #include "mp/flat/constr_std.h"
+#include "mp/flat/redef/MIP/cond_literal.h"
 
 namespace mp {
+
+/// Conditional equality body == rhs with body type \a Body
+template <class Body>
+using CondEQ = ConditionalConstraint<
+  AlgebraicConstraint< Body, AlgConRhs<0> > >;
+
+/// Add (lit) ==> body == rhs for a non-empty body.
+/// Shared by CondEQConverter_MIP (literal = result variable)
+/// and by disjunction absorption.
+template <class MC, class Body>
+void AddCondEqAsIndicator(
+    MC& mc, const CondEQ<Body>& eq0c, CondLiteral lit) {
+  const auto& con = eq0c.GetConstraint();
+  if (SurelyTriggers(mc, lit))
+    mc.AddConstraint( con );                  // static constraint
+  else if (CanTrigger(mc, lit))
+    mc.AddConstraint( IndicatorConstraint<
+                     AlgebraicConstraint< Body, AlgConRhs<0> > >(
+                        lit.var_, lit.val_, con) );
+}
+
+/// If the body's bounds leave just one side of body != rhs
+/// (body >= rhs+eps or body <= rhs-eps), add it statically.
+/// @return whether added
+template <class MC, class Body, class BndNType>
+bool AddNeAsStaticIfOneSided(MC& mc, const CondEQ<Body>& eq0c,
+                             const BndNType& bnt, double eps) {
+  const auto& con = eq0c.GetConstraint();
+  if (bnt.lb() > con.rhs() - eps) {          // body > rhs-eps
+    mc.AddConstraint( AlgebraicConstraint< Body, AlgConRhs<1> >{
+                        con.GetBody(), con.rhs() + eps } );
+    return true;
+  }
+  if (bnt.ub() < con.rhs() + eps) {          // body < rhs+eps
+    mc.AddConstraint( AlgebraicConstraint< Body, AlgConRhs<-1> >{
+                        con.GetBody(), con.rhs() - eps } );
+    return true;
+  }
+  return false;
+}
+
+/// Add one side of body != rhs as an indicator on a new binary
+/// q: q==1 ==> body (cmp) rhs_side, where (cmp) is <= or >=
+/// for \a kind -1 or 1. Add q to the disjunction \a disj.
+template <int kind, class MC, class Body>
+void AddNeSide(MC& mc, const CondEQ<Body>& eq0c,
+               double rhs_side, LinTerms& disj) {
+  const int q = (int)mc.AddVar(0.0, 1.0, var::INTEGER);
+  disj.add_term(1.0, q);
+  mc.AddConstraint( IndicatorConstraint<
+                   AlgebraicConstraint< Body, AlgConRhs<kind> > >(
+                      q, 1, { eq0c.GetConstraint().GetBody(), rhs_side }) );
+}
+
+/// Add (lit) ==> body <= rhs-eps || body >= rhs+eps
+/// as  [lit does not trigger] + q1 + q2 >= 1
+/// with indicators on q1, q2, for the sides
+/// allowed by the body's bounds.
+template <class MC, class Body, class BndNType>
+void AddNeDisjunction(MC& mc, const CondEQ<Body>& eq0c,
+                      CondLiteral lit, const BndNType& bnt, double eps) {
+  const auto rhs = eq0c.GetConstraint().rhs();
+  auto non_trigger = NonTriggerExpr(lit);
+  LinTerms disj = non_trigger.GetBody();
+  if (bnt.lb() <= rhs - eps)
+    AddNeSide<-1>(mc, eq0c, rhs - eps, disj);
+  if (bnt.ub() >= rhs + eps)
+    AddNeSide<1>(mc, eq0c, rhs + eps, disj);
+  if (disj.size() > non_trigger.GetBody().size())
+    mc.AddConstraint( LinConGE(
+                        std::move(disj), 1.0 - non_trigger.constant_term() ) );
+  else
+    ForbidTrigger(mc, lit);                  // body == rhs for sure
+}
+
+/// Add (lit) ==> body != rhs for a non-empty body,
+/// directly in flat algebra and indicators.
+/// Shared by CondEQConverter_MIP (literal: result var == 0)
+/// and by disjunction absorption.
+///
+/// @note An alternative would be the logical constraint
+///   res || body <= rhs-eps || body >= rhs+eps.
+///   It is not used: it would propagate CTX+ into the result
+///   variable being redefined, and the new conditional
+///   inequalities could have been redefined in CTX- before,
+///   losing the CTX+ redefinition (#248, eqVarConst01.mod,
+///   int_ne_05_redef_ctx.mod).
+template <class MC, class Body>
+void AddCondNeAsIndicators(
+    MC& mc, const CondEQ<Body>& eq0c, CondLiteral lit) {
+  if (!CanTrigger(mc, lit))
+    return;
+  const auto bnt = mc.ComputeBoundsAndType(eq0c.GetConstraint().GetBody());
+  const double eps = mc.ComparisonEps( bnt.get_result_type() );
+  if (SurelyTriggers(mc, lit)
+      && AddNeAsStaticIfOneSided(mc, eq0c, bnt, eps))
+    return;
+  AddNeDisjunction(mc, eq0c, lit, bnt, eps);
+}
+
 
 /// Converts conditional equality for MIP
 template <class ModelConverter, class AlgConBody>
@@ -22,79 +123,49 @@ public:
   /// Constructor
   CondEQConverter_MIP(ModelConverter& mc) : Base(mc) { }
 
-  /// Underlying algebraic constraint,
-  /// parameterized by comparison type
-  template <int kind>
-  using AlgCon =
-    AlgebraicConstraint< AlgConBody, AlgConRhs<kind> >;
-
   /// Converted item type
-  using ItemType = ConditionalConstraint< AlgCon<0> >;
+  using ItemType = CondEQ<AlgConBody>;
 
-  /// Reuse Base::Convert() template but ...
-  using Base::Convert;
+  /// Reuse
+  using Base::IfDelayConversion;
 
-  /// ... but reimplement Convert() for \a CondLinConEQ
-  /// only: add filter
-  void Convert(const CondLinConEQ& eq0c, int i) {
-    assert(!eq0c.GetContext().IsNone());
+  /// Generic check whether the constraint
+  /// needs to be skipped from conversion,
+  /// despite being not accepted by ModelAPI.
+  /// Reimplementing for the linear case.
+  bool IfDelayConversion(const CondLinConEQ& eq0c, int ) {
     const auto& args = eq0c.GetArguments();
-    if (1<args.size() ||               // >1 variable
-        !GetMC().IfMightUseEqualityEncodingForVar(
-          args.var(0))) {
-      Base::Convert(eq0c, i); // Calls ConvertCtxPos / Neg
-    } // else, might use unary encoding whose flags are,
-  }   // in the fixed case, fixed by PropagateResult()
+    return 1==args.size() &&               // 1 variable
+        GetMC().IfMightUseEqualityEncodingForVar(
+            args.var(0));
+  } // If yes, might use unary encoding whose flags are,
+    // in the fixed case, fixed by PropagateResult()
 
   /// Convert in positive context
   /// resvar==1 => body==d
   void ConvertCtxPos(const ItemType& eq0c, int ) {
-    const auto& con = eq0c.GetConstraint();
-    const auto res = eq0c.GetResultVar();
-    if (con.empty()) {
-      if (std::fabs(con.rhs()) != 0.0)
-        GetMC().NarrowVarBounds(res, 0.0, 0.0);
-    } else {
-      if (GetMC().is_fixed(res)) {
-        if (GetMC().fixed_value(res)) {  // fixed to 1
-          GetMC().AddConstraint( con );
-        } // else, skip
-      } else
-        GetMC().AddConstraint(IndicatorConstraint< AlgCon<0> >(
-                              res, 1, con));
-    }
+    if (!FixResultIfEmpty(eq0c))
+      AddCondEqAsIndicator(GetMC(), eq0c, {eq0c.GetResultVar(), 1});
   }
 
   /// Convert in negative context
   /// resvar==0 ==> body!=d
   void ConvertCtxNeg(const ItemType& eq0c, int ) {
+    if (!FixResultIfEmpty(eq0c))
+      AddCondNeAsIndicators(GetMC(), eq0c, {eq0c.GetResultVar(), 0});
+  }
+
+
+protected:
+  /// For an empty body (0 == rhs), fix the result.
+  /// @return whether the body is empty
+  bool FixResultIfEmpty(const ItemType& eq0c) {
     const auto& con = eq0c.GetConstraint();
-    const auto res = eq0c.GetResultVar();
-    if (con.empty()) {
-      if (std::fabs(con.rhs()) == 0.0)
-        GetMC().NarrowVarBounds(res, 1.0, 1.0);
-    } else if ( !GetMC().is_fixed(res) ||   // not fixed, or
-                !GetMC().fixed_value(res) ) // fixed to 0
-    {
-      auto con = eq0c.GetArguments();
-      auto newvars = GetMC().AddVars_returnIds(2, 0.0, 1.0, var::INTEGER);
-      newvars.push_back( res );
-      GetMC().AddConstraint( LinConGE(   // b1+b2+resvar >= 1
-                                         {{1.0, 1.0, 1.0}, newvars},
-                                         1.0 ) );
-      auto bNt = GetMC().ComputeBoundsAndType(con.GetBody());
-      double cmpEps = GetMC().ComparisonEps( bNt.get_result_type() );
-      {
-        GetMC().AddConstraint(IndicatorConstraint< AlgCon<-1> >(
-                                newvars[0], 1,
-                              { con.GetBody(),
-                                con.rhs() - cmpEps }));
-      }
-      GetMC().AddConstraint(IndicatorConstraint< AlgCon<1> >(
-                              newvars[1], 1,
-                            { con.GetBody(),
-                              con.rhs() + cmpEps }));
-    } // else, skip
+    if (!con.empty())
+      return false;
+    const bool valid = !con.rhs();
+    GetMC().NarrowVarBounds(eq0c.GetResultVar(), valid, valid);
+    return true;
   }
 
   /// Reuse the stored ModelConverter

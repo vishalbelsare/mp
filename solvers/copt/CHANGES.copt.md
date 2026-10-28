@@ -1,6 +1,292 @@
 Summary of recent updates to COPT for AMPL
 ==========================================
 
+
+## 20261101
+- Fix indicator IIS suffix postsolve: use the same constraint group as
+  the model API so indicator conflict members reach the original model.
+- Emulate *mip:basis* for linear algebraic MIPs, with separate
+  *mip:basis:timelimit* and *mip:basis:iterlimit* options.
+- Added option *tech:seed*.
+- Fixed the feasibility relaxation (*alg:feasrelax*): it returned the
+  infeasible model's status and a zero solution; the mode was ignored.
+  COPT does not support the squared-violation modes 2 and 5 for
+  models with integer variables.
+- Fixed the *.iis* suffixes and a spurious warning on infeasible MIPs
+  (COPT has no dual ray for them).
+- *tech:logfile* no longer echoes the log to the console unless
+  *tech:outlev* asks for it.
+- Per-objective options (*obj:N:...*) are now applied by COPT.
+- Option values outside COPT's range are rejected with
+  "Rejecting <param>=<value>; must be between L and U" instead of
+  being clamped silently.
+- New options: *alg:nlptol*, *alg:nlpmuupdate*, *alg:nlplinscale*,
+  *alg:sdpmethod*, *bar:start*, *mip:fapheurlevel*,
+  *mip:startnodelimit*, *mip:linearizeindicators*, *mip:linearizesos*,
+  *lim:multiobjtime*, *tech:writedualprob*.
+- Parameter files and native parameters: *tech:optionnativeread*,
+  *tech:optionnativewrite*, *tech:optionnative*.
+- Parameter tuning: *tech:tunebase* and the *tech:tune\** parameters.
+- Sensitivity analysis (*alg:sens*), also for the fixed LP of
+  *mip:basis*.
+- Lazy constraints (suffix *.lazy* > 0, option *mip:lazy*).
+- Solution pool options *sol:poollimit*, *sol:poolgap*,
+  *sol:poolgapabs* (and *sol:poolmode* for compatibility) filter the
+  solutions COPT found during the search.
+- Corrected option descriptions: defaults of *lim:mipnlpiterlimit*,
+  *lim:nlpiterlimit*, *lim:memlimit*; values of *pre:solve* and
+  *lp:barorder*.
+
+
+## 20260813
+- Updated to COPT 8.0.6, that introduces performance improvements 
+  and bug fixes.
+- Added keywords *lim:memlimit* and *tech:mempeak* to control and report memory usage.
+- Added keyword *tech:numericalranges* to return the numerical 
+  ranges of the problem in suffixes:
+  - Linear constraints:
+      - minelem: minimum absolute value of the non-zero elements of the coefficient matrix
+      - maxelem: maximum absolute value of the non-zero elements of the coefficient matrix
+      - minbound: minimum absolute value of the non-zero variable bounds
+      - maxbound: maximum absolute value of the non-zero variable bounds
+      - minrhs: minimum absolute value of the non-zero right-hand sides
+      - maxrhs: maximum absolute value of the non-zero right-hand sides
+  - Quadratic constraints:
+      - minqelem: minimum absolute value of the non-zero quadratic elements
+      - maxqelem: maximum absolute value of the non-zero quadratic elements
+      - minqlelem: minimum absolute value of the non-zero linear elements
+      - maxqlelem: maximum absolute value of the non-zero linear elements
+      - minqrhs: minimum absolute value of the non-zero right-hand sides
+      - maxqrhs: maximum absolute value of the non-zero right-hand sides
+  - Objectives:
+      - mincost: minimum absolute value of the non-zero linear costs
+      - maxcost: maximum absolute value of the non-zero linear costs
+      - minqcost: minimum absolute value of the non-zero quadratic costs
+      - maxqcost: maximum absolute value of the non-zero quadratic costs
+
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+  - The main driver code is separated into a shared
+    library and used commonly with AMPLS API.
+
+
+## 20260610
+- Fixed a bug causing NLP initial guess to be submitted
+  only when a dual initial guess was available.
+- Fixed input of LP basis (which helps accelerate resolve).
+- Option *tech:writesolution* to export .bas, .iis, .sol
+  files.
+
+
+## 20260609
+- Fixed a bug in the interface for the local solver
+  where parts of expressions and objective function
+  could be lost.
+- Use initial guess in NLP.
+- Added various solution statuses, in particular
+  locally optimal and locally infeasible for NLP.
+- Added option *alg:qmatrixtol*.
+- Updated to COPT 8.0.5, with performance improvements
+  and bug fixes.
+
+
+## 20260414
+- Option *alg:nonconvex*, *mip:startmode*.
+- Fixed objective value output.
+- Fixed objective suffixes (.objpriority etc, see option *obj:multi*).
+- Changes in MP, in particular:
+  - Option *cvt:pre:boundsbest* defaults to making
+    auxiliary subexpression result variables free,
+    unless the result is constant. This allows
+    stronger nonlinear presolve.
+
+
+## 20260322
+- Updated to COPT 8.0.3, with performance improvements and bug fixes
+- Added option *lp:concurrentmode*
+- Added support for conic constraints 
+- Added support for many non-linear expressions
+- Added native multi-objective optimization
+
+
+## 20260108
+- Updated to COPT 8.0.2, that introduces a global 
+  nonconvex (MI)QCQP solver and performance improvements.
+- Added options *tech:loglevel*, *mip:prerootheurlevel*, 
+  *mip:repair*
+
+  
+## 20251210
+- Option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- New option *obj:multi:options* to control
+  whether multi-objective option suffixes
+  are used.
+
+
+## 20251021
+- Changes in MP: option *cvt:expr:nlassign*.
+- Upgrade to COPT 7.2.11.
+- Enable NLP (set options
+  *acc:_expr=2 alg:relax=1*).
+
+
+## 20251015
+- Changes in MP
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options cvt:pre:unnest, cvt:pre:sort).
+  - Option cvt:pre:boundlogarg (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    pre:feastolrel both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options cvt:compl, cvt:compl:eps control
+    complementarity reformulations.
+
+
+## 20250617
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+- Enable native indicator constraints by default
+  (options acc:ind..)
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250424
+- Changes in MP
+  - Option cvt:qp2pass (default even faster parsing
+    of quadratics)
+
+
+## 20250408
+- Fixed a bug in parsing of quadratic expressions
+
+
+## 20250407
+- Updated to COPT version 7.2.6
+- GPU is now supported for PDLP on Windows and Linux;
+  CUDA library version >= 11.7 is required. See
+  options *lp:method* and *lp:pdlpgpumode*.
+
+
+## 20250329
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250308
+- Option mip:gapabs
+
+
+## 20241228
+- Updated to COPT 7.2.4, which includes performance improvements to 
+  the MIP, SOCP and QCQP solvers
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240531
+- Updated to Copt 7.1.3, which provides many bugfixes.
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+
+## 20240410
+- Updated to Copt 7.1.1, with support for first-order 
+  method (PDLP). On Windows this can be used with GPU
+  supporting CUDA.
+  It can be controlled setting `lp:method` to the new 
+  value `6` (PDLP) and with options `lp:pdlpgpumode`, 
+  `lp:pdlpgpudevice` and `lp:pdlptol`
+
+
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use 
+    MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
 ## 20240115
 - *Solve result codes*.
   - List codes by running (solver) -!

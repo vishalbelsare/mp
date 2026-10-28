@@ -1,12 +1,11 @@
 #ifndef CONSTRAINT_HASH_H
 #define CONSTRAINT_HASH_H
 
-/// Specialize std::hash<> for some standard constraints
-
 #include <functional>
 #include <array>
 #include <vector>
 
+#include "mp/arrayref.h"
 #include "mp/utils-hash-stream.h"
 #include "mp/flat/constr_std.h"
 #include "mp/flat/expr_affine.h"
@@ -16,7 +15,7 @@ namespace std {
 /// Specialize std::hash<> for various expressions and constraints.
 /// Remember we also need operator== for [std::reference_wrapper<> of]
 /// the compared types. Operator=='s are class memebrs, or
-/// defined in ``constraint_keeper.h``.
+/// defined in ``constr_keeper.h``.
 
 /// Partially specialize std::hash<> for CustomFunctionalConstraint<>
 ///
@@ -39,30 +38,31 @@ struct hash<
 };
 
 
-/// Specialize std::hash<> for std::array<>
-///
-/// Might assume std::hash<> specialized for elements
-template <class Element, std::size_t N>
-struct hash< std::array<Element, N> >
+/// Specialize std::hash<> for mp::PLPoints
+template <>
+struct hash< mp::PLPoints >
 {
   size_t operator()(
-      const std::array<Element, N>& x) const
+      const mp::PLPoints& plp) const
   {
-    return mp::HashStreamer::HashArray(0, x);
+    mp::HashStreamer hs;
+    hs.Add(std::hash< std::vector<double> >{}(plp.x_));
+    hs.Add(std::hash< std::vector<double> >{}(plp.y_));
+    return hs.FinalizeHashValue();
   }
 };
 
 
-/// Specialize std::hash<> for std::vector<>
-///
-/// Might assume std::hash<> specialized for elements
-template <class Element, class Allocator>
-struct hash< std::vector<Element, Allocator> >
+/// Specialize std::hash<> for mp::PLConParams
+template <>
+struct hash< mp::PLConParams >
 {
   size_t operator()(
-      const std::vector<Element, Allocator>& x) const
+      const mp::PLConParams& plp) const
   {
-    return mp::HashStreamer::HashArray(0, x);
+    mp::HashStreamer hs;
+    hs.Add(std::hash<mp::PLPoints>{}(plp.GetPLPoints()));
+    return hs.FinalizeHashValue();
   }
 };
 
@@ -154,9 +154,7 @@ struct hash< mp::QuadTerms >
       const mp::QuadTerms& qt) const
   {
     mp::HashStreamer hs;
-    hs.Add(qt.vars1());
-    hs.Add(qt.vars2());
-    hs.Add(qt.coefs());
+    hs.Add(qt.get_folded());
     return hs.FinalizeHashValue();
   }
 };

@@ -3,7 +3,7 @@
 
 #include "mp/solver-app-base.h"
 #include "mp/solver-io.h"
-#include "mp/clock.h"
+#include "mp/utils-clock.h"
 #include "mp/ampls-ccallbacks.h" // For CCallbacks
 
 namespace mp {
@@ -132,7 +132,7 @@ bool SolverApp<Solver, Reader>::Init(char **argv, int nl_reader_flags) {
 
 template <typename Solver, typename Reader>
 void SolverApp<Solver, Reader>::ReadNL(int nl_reader_flags) {
-  steady_clock::time_point start = steady_clock::now();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 
   builder_.reset(new ProblemBuilder(solver_));
   handler_.reset(new internal::SolverNLHandler<Solver>(*builder_, solver_));
@@ -156,6 +156,8 @@ void SolverApp<Solver, Reader>::Solve() {
     mt.n_vars = builder_->problem().num_vars();
     mt.n_alg_con = builder_->problem().num_algebraic_cons();
     mt.n_log_con = builder_->problem().num_logical_cons();
+    mt.n_conic_con = 0;
+    mt.n_quad_con = 0;
     GetCallbacks().check(&mt);
   }
   solver_.Solve(builder_->problem(), sol_handler);

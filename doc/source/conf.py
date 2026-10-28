@@ -5,8 +5,24 @@ import subprocess
 import datetime
 
 # Important: keep this as a string or sphinx will fail with
-# a non-helpful error message
-MP_VERSION = "20211021"
+# a non-helpful error message.
+# The version is the date of the latest entry in CHANGES.mp.md.
+def _mp_version():
+    import re
+    changes = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "..", "CHANGES.mp.md")
+    try:
+        with open(changes, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"##\s+(\d{8})", line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+MP_VERSION = _mp_version()
 
 # -- General configuration -----------------------------------------------------
 
@@ -15,7 +31,14 @@ needs_sphinx = "3.2.0"
 
 # Add any Sphinx extension module names here, as strings. They can be extensions
 # coming with Sphinx (named 'sphinx.ext.*') or your custom ones.
-extensions = ["breathe", "sphinx.ext.mathjax", "sphinx.ext.graphviz"]
+extensions = [
+    "breathe",
+    "sphinx.ext.mathjax",
+    "sphinx.ext.graphviz",
+    "sphinx_design",
+    "sphinx_sitemap",
+    "sphinxcontrib.googleanalytics",
+]
 
 # Configure Breathe.
 # When building with CMake, the path to doxyxml is passed via the command line.
@@ -75,45 +98,26 @@ pygments_style = "sphinx"
 # a list of builtin themes.
 html_theme = "ampl_sphinx_theme"
 html_theme_options = {
-    "logo_link": "index",
     "icon_links": [
         {
             "name": "GitHub",
             "url": "https://github.com/ampl/mp",
             "icon": "fab fa-github",
         },
-        {
-            "name": "AMPL Resources",
-            "url": "https://developers.ampl.com",
-            "icon": "fas fa-book fa-fw",
-            "target": "_self",
-        },
-        {
-            "name": "AMPL Portal",
-            "url": "https://portal.ampl.com",
-            "icon": "fas fa-sign-in-alt fa-fw",
-            "target": "_self",
-        },
-        {
-            "name": "AMPL.com",
-            "url": "https://ampl.com",
-            "icon": "fas fa-home fa-fw",
-            "target": "_self",
-        },
-    ],
-    "collapse_navigation": True,
-    "external_links": [
-        # {"name": "Try AMPL", "url": "https://ampl.com"}
     ],
     "logo_text": "MP",
 }
+html_context = {"default_mode": "light"}
+googleanalytics_id = "G-2K2EEK1LBD"
 
 html_baseurl = "https://mp.ampl.com"
 
+html_extra_path = ["_html"]
+
+sitemap_filename = "sphinx-sitemap.xml"
+
 html_static_path = ["_static"]
-# html_css_files = [
-#     'css/custom.css',
-# ]
+html_css_files = ["css/mp.css"]
 # The name for this set of Sphinx documents.  If None, it defaults to
 # "<project> v<release> documentation".
 html_title = "AMPL MP Documentation"
@@ -123,10 +127,10 @@ html_short_title = "ampl::mp"
 
 # The name of an image file (relative to this directory) to place at the top
 # of the sidebar.
-html_logo = "_static/logo-inline-web-v4.png"
+html_logo = "https://raw.githubusercontent.com/ampl/ampl.github.io/master/themes/static/ampl-navbar-logo.png"
 
 # Add favicon
-html_favicon = "_static/cropped-favicon-raw-192x192.png"
+html_favicon = "https://raw.githubusercontent.com/ampl/ampl.github.io/master/themes/static/ampl-favicon.png"
 
 # If true, links to the reST sources are added to the pages.
 html_show_sourcelink = False

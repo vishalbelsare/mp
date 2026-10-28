@@ -1,6 +1,9 @@
 #ifndef UTILSHASHSTREAM_H
 #define UTILSHASHSTREAM_H
 
+#include <functional>
+
+#include "mp/arrayref.h"
 #include "mp/utils-hash.h"
 
 /// Wrappers implementing a HashStreamer interface.
@@ -71,5 +74,68 @@ private:
 using HashStreamer = HashStreamerCombine;
 
 } // namespace mp
+
+
+namespace std {
+
+/// Specialize std::hash<> for std::pair<>
+///
+/// Might assume std::hash<> specialized for elements
+template <class T1, class T2>
+struct hash< std::pair<T1, T2> >
+{
+  size_t operator()(
+      const std::pair<T1, T2>& x) const
+  {
+    mp::HashStreamer hs;
+    hs.Add(std::hash<T1>{}(x.first));
+    hs.Add(std::hash<T2>{}(x.second));
+    return hs.FinalizeHashValue();
+  }
+};
+
+
+/// Specialize std::hash<> for std::array<>
+///
+/// Might assume std::hash<> specialized for elements
+template <class Element, std::size_t N>
+struct hash< std::array<Element, N> >
+{
+  size_t operator()(
+      const std::array<Element, N>& x) const
+  {
+    return mp::HashStreamer::HashArray(0, x);
+  }
+};
+
+
+/// Specialize std::hash<> for std::vector<>
+///
+/// Might assume std::hash<> specialized for elements
+template <class Element, class Allocator>
+struct hash< std::vector<Element, Allocator> >
+{
+  size_t operator()(
+      const std::vector<Element, Allocator>& x) const
+  {
+    return mp::HashStreamer::HashArray(0, x);
+  }
+};
+
+
+/// Specialize std::hash<> for mp::ArrayRef<>
+///
+/// Might assume std::hash<> specialized for elements
+template <class Element>
+struct hash< mp::ArrayRef<Element> >
+{
+  size_t operator()(
+      const mp::ArrayRef<Element>& x) const
+  {
+    return mp::HashStreamer::HashArray(0, x);
+  }
+};
+
+}  // namespace std;
 
 #endif // UTILSHASHSTREAM_H

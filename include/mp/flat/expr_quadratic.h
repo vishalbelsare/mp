@@ -7,71 +7,80 @@
 
 namespace mp {
 
-/// Quadratic terms x'Qx
+/// Quadratic terms x'Qx.
 class QuadTerms {
 public:
   /// Name
   static constexpr const char* GetTypeName() { return "QuadTerms"; }
 
+  /// Folded entry type
+  using TupleType = std::pair<std::pair<int, int>, double>;
+
   /// Default constructor
   QuadTerms() = default;
 
   /// Construct from 3 vectors
-  QuadTerms(std::vector<double> c,
-           std::vector<int> v1, std::vector<int> v2) noexcept
-    : coefs_(std::move(c)), vars1_(std::move(v1)), vars2_(std::move(v2))
-  { assert(check()); }
-
-  /// Validate
-  bool check() const {
-    return
-        coefs_.size()==vars1_.size() &&
-        coefs_.size()==vars2_.size() &&
-        (!size() || 0<=*std::min_element(vars1_.begin(), vars1_.end())) &&
-        (!size() || 0<=*std::min_element(vars2_.begin(), vars2_.end()));
-  }
+  QuadTerms(const std::vector<double>& c,
+            const std::vector<int>& v1, const std::vector<int>& v2);
 
   /// Empty?
-  bool empty() const { return coefs_.empty(); }
+  bool empty() const { return folded_.empty(); }
 
   /// Size
-  int size() const { return (int)coefs_.size(); }
+  size_t size() const { return folded_.size(); }
 
   /// Capacity
-  int capacity() const { return (int)coefs_.capacity(); }
+  size_t capacity() const { return folded_.capacity(); }
 
-  const double* pcoefs() const { return coefs_.data(); }
-  const int* pvars1() const { return vars1_.data(); }
-  const int* pvars2() const { return vars2_.data(); }
+  /// Folded vector reference.
+  /// This should be used by default.
+  ArrayRef<TupleType> get_folded() const
+  { return {folded_.data(), folded_.size()}; }
 
-  const std::vector<double>& coefs() const { return coefs_; }
-  const std::vector<int>& vars1() const { return vars1_; }
-  const std::vector<int>& vars2() const { return vars2_; }
+  /// coef vector pointer
+  const double* pcoefs() const
+  { unfold_if_need(); return coefs_aux_.data(); }
+  const int* pvars1() const
+  { unfold_if_need(); return vars1_aux_.data(); }
+  const int* pvars2() const
+  { unfold_if_need(); return vars2_aux_.data(); }
 
-  double coef(int i) const { return coefs_[i]; }
-  void set_coef(int i, double c) { coefs_[i] = c; }
-  int var1(size_t i) const { return vars1_[i]; }
-  int var2(size_t i) const { return vars2_[i]; }
+  /// Coef vector as ArrayRef<>
+  ArrayRef<double> coefs() const
+  { unfold_if_need(); return {coefs_aux_.data(), coefs_aux_.size()}; }
+  ArrayRef<int> vars1() const
+  { unfold_if_need(); return {vars1_aux_.data(), vars1_aux_.size()}; }
+  ArrayRef<int> vars2() const
+  { unfold_if_need(); return {vars2_aux_.data(), vars2_aux_.size()}; }
+
+  /// coef(i)
+  double coef(int i) const { return folded_[i].second; }
+  void set_coef(int i, double c) { folded_[i].second = c; }
+  int var1(size_t i) const { return folded_[i].first.first; }
+  int var2(size_t i) const { return folded_[i].first.second; }
 
   /// Compute value given a dense vector of variable values
   template <class VarInfo>
   long double ComputeValue(const VarInfo& x) const {
     long double s=0.0;
-    for (size_t i=coefs().size(); i--; )
-      s += (long double)(coefs()[i]) * x[vars1()[i]] * x[vars2()[i]];
+    for (size_t i=size(); i--; )
+      s += ((long double)(coef(i))) * x[var1(i)] * x[var2(i)];
     return s;
   }
 
-  void add_term(double coef, int var1, int var2) {
-    coefs_.push_back(coef);
-    vars1_.push_back(var1);
-    vars2_.push_back(var2);
-  }
+  void add_term(double coef, int var1, int var2)
+	{ add_index_value({{var1, var2}, coef}); clear_unfolded(); }
 
-  void reserve(std::size_t num_terms) {
-    coefs_.reserve(num_terms);
-    vars1_.reserve(num_terms);
-    vars2_.reserve(num_terms);
+  void reserve(std::size_t num_terms)
+  { folded_.reserve(num_terms); }
+
+  /// shrink_to_fit.
+  /// Takes time, so use only when necessary.
+  void shrink_to_fit() {
+    folded_.shrink_to_fit();
+    coefs_aux_.shrink_to_fit();
+    vars1_aux_.shrink_to_fit();
+    vars2_aux_.shrink_to_fit();
   }
 
   /// Is normalized? Assume sorted.
@@ -82,16 +91,17 @@ public:
 
   /// Arithmetic
   void negate() {
-    for (auto& cf: coefs_)
-      cf = -cf;
+    for (auto& iv: folded_)
+      iv.second = -iv.second;
+		clear_unfolded();
   }
 
   void add(const QuadTerms& li) {
     this->reserve(size() + li.size());
     /// eliminate duplicates when?
-    coefs_.insert(coefs_.end(), li.coefs_.begin(), li.coefs_.end());
-    vars1_.insert(vars1_.end(), li.vars1_.begin(), li.vars1_.end());
-    vars2_.insert(vars2_.end(), li.vars2_.begin(), li.vars2_.end());
+    auto fld = li.get_folded();
+    folded_.insert(folded_.end(), fld.begin(), fld.end());
+		clear_unfolded();
   }
 
   void subtract(QuadTerms&& ae) {
@@ -100,18 +110,30 @@ public:
   }
 
   void operator*=(double n) {
-    for (auto& c: coefs_)
-      c *= n;
+    for (auto& c: folded_)
+      c.second *= n;
+		clear_unfolded();
   }
+
+  /// Is the expression sorted,
+  /// all elements non-0 and unique?
+  bool is_sorted() const;
 
   /// Sort and eliminate duplicates
   void sort_terms();
 
+  /// ({var1, var2}, coef)
+  TupleType IndexValue(size_t i) const
+  { assert(i<=size()); return folded_[i]; }
+
+  /// Add ({var1, var2}, coef)
+  void add_index_value(TupleType iv)
+	{ folded_.push_back(iv); clear_unfolded(); }
+
   /// Clear
   void clear() {
-    coefs_.clear();
-    vars1_.clear();
-    vars2_.clear();
+    folded_.clear();
+    clear_unfolded();
   }
 
   /// Test equality
@@ -119,18 +141,77 @@ public:
     return *this == qt;
   }
 
-  /// Testing API
+  /// operator==: testing API
   bool operator==(const QuadTerms& qt) const {
-    return coefs_==qt.coefs_ && vars1_==qt.vars1_ && vars2_==qt.vars2_;
+    return folded_ == qt.folded_;
   }
 
+  /// operator!=
+  bool operator!=(const QuadTerms& qt) const
+  { return !(*this==qt); }
+
+protected:
+  /// Unfold if alternative empty
+  void unfold_if_need() const;
+
+  /// Unfold into the alternative
+  void unfold() const;
+
+  /// Clear alternative
+  void clear_unfolded() {
+    coefs_aux_.clear();
+    vars1_aux_.clear();
+    vars2_aux_.clear();
+  }
+
+  /// Sort index pairs
+  template <class Vec>
+  static void sort_index_pairs(Vec& );
+
+  /// Fold the alternative terms into a vector of ((var1, var2), coef) tuples
+  template <class Vec>
+  void fold_into(Vec& vec);
+
+  /// Unfold the terms from a vector of ((var1, var2), coef) tuples
+  template <class Vec>
+  void unfold_from(const Vec& vec) const;
+
+  /// Fold the terms into a vector of ((var1, var2), coef) tuples
+  template <class Vec, class ArrayC, class ArrayV>
+  static void fold_into(Vec& vec,
+                 const ArrayC& coefs,
+                 const ArrayV& vars1, const ArrayV& vars2);
+
+  /// Unfold the terms from a vector of ((var1, var2), coef) tuples
+  template <class Vec, class ArrayC, class ArrayV>
+  static void unfold_from(const Vec& vec,
+                          ArrayC& coefs,
+                          ArrayV& vars1, ArrayV& vars2);
 
 private:
-  std::vector<double> coefs_;
-  std::vector<int> vars1_;
-  std::vector<int> vars2_;
+  /// Currently always there.
+  /// @todo switch between alternatives but not too often.
+  SmallVec<TupleType, 8> folded_;
+  /// Alternative
+  mutable SmallVec<double, 6> coefs_aux_;
+  mutable SmallVec<int, 6> vars1_aux_;
+  mutable SmallVec<int, 6> vars2_aux_;
 };
 
+/// Merge 2 sorted QuadTerms
+QuadTerms Merge(const QuadTerms& , const QuadTerms& );
+
+/// Multiply out two LinTerms.
+/// Sort both factors - only in Debug,
+/// then produce sorted result.
+QuadTerms MultiplyOut(const LinTerms& e1, const LinTerms& e2);
+
+void WriteModelItem(fmt::MemoryWriter& wrt, const QuadTerms& qt,
+                    ItemNamer& vnam);
+
+/// Specialize
+template <>
+void WriteJSON(JSONW jw, const QuadTerms& qt);
 
 ////////////////////////////////////////////////////////////////////////
 /// Quadratic and linear terms.
@@ -207,10 +288,24 @@ public:
     QuadTerms::add(qlt.GetQPTerms());
   }
 
+  /// Multiply by const
+  void operator*=(double n) {
+    GetLinTerms() *= n;
+    GetQPTerms() *= n;
+  }
+
+  /// Clear
+  void clear() {
+    GetLinTerms().clear();
+    GetQPTerms().clear();
+  }
+
   /// Value at given variable vector
   template <class VarInfo>
   long double ComputeValue(const VarInfo& x) const {
-    return LinTerms::ComputeValue(x) + QuadTerms::ComputeValue(x);
+    return
+        LinTerms::ComputeValue(x)
+           + QuadTerms::ComputeValue(x);
   }
 
   /// Sort terms
@@ -226,9 +321,37 @@ public:
   }
 
   /// Test equality
-  bool operator==(const QuadAndLinTerms& qlc) const { return equals(qlc); }
+  bool operator==(const QuadAndLinTerms& qlc) const
+  { return equals(qlc); }
+
+  /// Test disuality
+  bool operator!=(const QuadAndLinTerms& qlc) const
+  { return !equals(qlc); }
 };
 
+void WriteModelItem(fmt::MemoryWriter& wrt, const QuadAndLinTerms& qlt,
+                    ItemNamer& vnam);
+
+/// Specialize
+template <>
+void WriteJSON(JSONW jw, const QuadAndLinTerms& qt);
+
+/// Special
+void VisitArguments_PossRepeated(
+    const QuadTerms& lt, std::function<void (int) > argv);
+
+/// Specialize
+/// @warning This may multiply count variables:
+///   occurence in the linear, plus potentially several in the QP part
+void VisitArguments(const QuadAndLinTerms& lt, std::function<void (int) > argv);
+
+/// Visit lin & quad terms without repetitions
+void VisitArguments_PossRepeated(
+    const LinTerms& lt, const QuadTerms& qt, std::function<void (int) > argv);
+
+/// Visit lin & quad terms without repetitions
+void VisitArgumentsOnce(
+    const LinTerms& lt, const QuadTerms& qt, std::function<void (int) > argv);
 
 /// Typedef QuadraticExpr
 using QuadraticExpr = AlgebraicExpression<QuadAndLinTerms>;

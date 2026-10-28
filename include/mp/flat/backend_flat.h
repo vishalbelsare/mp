@@ -12,7 +12,7 @@ namespace mp {
 struct SensRangesPresolved {
   pre::ModelValuesDbl
     varlblo, varlbhi, varublo, varubhi,
-    varobjlo, varobjhi,
+    varobjlo, varobj, varobjhi,
     conrhslo, conrhshi,                   // for rhs-constraints
     conlblo, conlbhi, conublo, conubhi;   // for range constraints
 };
@@ -29,24 +29,29 @@ class FlatBackend :
 public:
   /// Default GetSolution() for flat backends.
   /// Invokes postsolver.
+  /// @note requires solve code retrieved.
   Solution GetSolution() override {
     auto x = PrimalSolution();
     auto y = DualSolution();
+    auto objs = GetObjectiveValues();
     auto fKnownInfeasOrUnb = BaseBackend::IsProblemInfeasible();
     auto mv = GetValuePresolver().PostsolveSolution(
           { x,
             y,
-            GetObjectiveValues(),
+            objs,
          (void*)fKnownInfeasOrUnb } );
     auto x1 = std::move(mv.GetVarValues()());
     if (x.empty())
       x1.clear();      // don't send variable values
     auto y1 = std::move(mv.GetConValues()());
     if (y.Empty())
-        y1.clear();      // don't send variable values
-    return{ x1,
-            y1,
-            mv.GetObjValues()() };
+        y1.clear();      // don't send dual values
+    auto objs1 = std::move(mv.GetObjValues()());
+    if (objs.empty())    // e.g., MP2NL
+      objs1.clear();
+    return{ std::move(x1),
+            std::move(y1),
+            std::move(objs1) };
   }
 
   /// Redeclare GetObjectiveValues()
@@ -74,6 +79,7 @@ public:
     auto mvubhi = GetValuePresolver().PostsolveGenericDbl(senspre.varubhi);
     auto mvublo = GetValuePresolver().PostsolveGenericDbl(senspre.varublo);
     auto mvobjhi = GetValuePresolver().PostsolveGenericDbl(senspre.varobjhi);
+    auto mvobj = GetValuePresolver().PostsolveGenericDbl(senspre.varobj);
     auto mvobjlo = GetValuePresolver().PostsolveGenericDbl(senspre.varobjlo);
     auto mvconlbhi = GetValuePresolver().PostsolveGenericDbl(senspre.conlbhi);
     auto mvconlblo = GetValuePresolver().PostsolveGenericDbl(senspre.conlblo);
@@ -88,6 +94,7 @@ public:
     sensr.varubhi = mvubhi.GetVarValues()();
     sensr.varublo = mvublo.GetVarValues()();
     sensr.varobjhi = mvobjhi.GetVarValues()();
+    sensr.varobj = mvobj.GetVarValues()();
     sensr.varobjlo = mvobjlo.GetVarValues()();
     sensr.conlbhi = mvconlbhi.GetConValues()();
     sensr.conlblo = mvconlblo.GetConValues()();
@@ -99,6 +106,69 @@ public:
     return sensr;
   }
 
+
+protected:
+  /// Supplementary LP data in solver coordinates, published atomically only
+  /// after an optimal fixed solve and successful extraction.
+  struct FixedLPResult {
+    std::vector<double> primal, dual;
+    std::vector<int> varstt, constt;
+    double objective = 0;
+    int iterations = 0;
+  };
+  virtual FixedLPResult SolveFixedLP(ArrayRef<double>) {
+    MP_RAISE("Fixed-model emulation not implemented");
+  }
+  bool FixedModelReady() const override {
+    return !this->IsFixedModelEmulated() || fixed_ready_;
+  }
+  const FixedLPResult& FixedLP() const { return fixed_lp_; }
+  bool HasFixedLP() const { return fixed_ready_; }
+
+  /// Called after recording MIP status/messages/pool, before standard reports.
+  void ConsiderEmulatedFixedModel() {
+    fixed_ready_ = false;
+    fixed_lp_ = {};
+    if (!BaseBackend::need_fixed_MIP() || !this->IsMIP())
+      return;
+    try {
+      if (!this->GetMM().IsLinearAlgebraic())
+        MP_RAISE("unsupported model: requires linear algebraic constraints and objective, without SOS/PWL/logical constructs");
+      auto x = PrimalSolution();
+      if (x.empty())
+        MP_RAISE("no integer-feasible incumbent");
+      if (this->fixed_model_time_limit() == 0 || this->fixed_model_iter_limit() == 0)
+        MP_RAISE("fixed-model time or iteration limit is zero");
+      auto result = SolveFixedLP(x);
+      fixed_lp_ = std::move(result);
+      fixed_ready_ = true;
+      this->AddToSolverMessage(fmt::format(
+          "Fixed MIP for mip:basis (emulated): {} iterations\n", fixed_lp_.iterations));
+    } catch (const std::exception& e) {
+      this->AddToSolverMessage(fmt::format(
+          "Fixed MIP for mip:basis (emulated) failed: {}.\n", e.what()));
+    }
+  }
+
+  SolutionBasis FixedLPBasis(int group) {
+    if (!fixed_ready_)
+      return {};
+    auto mv = GetValuePresolver().PostsolveBasis(
+        {fixed_lp_.varstt, {{{group, fixed_lp_.constt}}}});
+    return {mv.GetVarValues()(), mv.GetConValues()()};
+  }
+
+  static double FixedIntegerValue(double x, double lb, double ub, double tol) {
+    double rounded = std::round(x);
+    if (!std::isfinite(x) || std::fabs(x-rounded) > tol ||
+        rounded < lb-tol || rounded > ub+tol)
+      MP_RAISE("incumbent has an invalid integer value");
+    return rounded;
+  }
+
+private:
+  FixedLPResult fixed_lp_;
+  bool fixed_ready_ = false;
 
 protected:
   /// Convenience feature:

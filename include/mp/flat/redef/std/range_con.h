@@ -126,16 +126,25 @@ public:
   void PostsolveIISEntry(const typename Base::LinkEntry& be) {
     if (auto slk_iis = GetInt(be, VAR_SLK)) {
       switch ((IISStatus)slk_iis) {
-        case IISStatus::low:
-          slk_iis = (int)IISStatus::upp;
-          break;
-        case IISStatus::upp:
-          slk_iis = (int)IISStatus::low;
-          break;
-        case IISStatus::fix:
-          break;
-        default:
-          MP_RAISE("Unknown IIS status for a range constraint slack");
+      case IISStatus::low:
+        slk_iis = (int)IISStatus::upp;
+        break;
+      case IISStatus::upp:
+        slk_iis = (int)IISStatus::low;
+        break;
+      case IISStatus::plow:
+        slk_iis = (int)IISStatus::pupp;
+        break;
+      case IISStatus::pupp:
+        slk_iis = (int)IISStatus::plow;
+        break;
+      case IISStatus::fix:
+        break;
+      default: { }
+        cvt_.GetEnv().AddWarning("range_con_IIS_status",
+            fmt::format(
+                "Unexpected IIS status {} for a range constraint slack",
+                slk_iis));
       }
       SetInt(be, CON_SRC, slk_iis);
     } else
@@ -220,17 +229,27 @@ public:
   /// Resulting constraint type: GE
   using AlgConGE = AlgebraicConstraint< AlgConBody, AlgConRhs<1> >;
 
+  /// Quadratic ranges are also converted when accepted, but quadratic
+  /// constraints are not to be passed (cvt:quadcon=0): the resulting
+  /// quadratic constraints are then linearized.
+  bool IfNeedsConversion(const ItemType& , int ) {
+    if constexpr (std::is_same_v<AlgConBody, QuadAndLinTerms>)
+      return !GetMC().IfPassQuadCon();
+    return false;
+  }
+
   /// Conversion
   ///
   /// Responsible for adding presolve links
   /// @param item: the item to be converted
   /// @param i: item index, used to create a presolve link
-  void Convert(const ItemType& item, int i) {
+  Context Convert(const ItemType& item, int i) {
     auto rr = Relate(item.lb(), item.ub());
     if (rr[0] && rr[1] && rr[2])
       ConvertRange(item, i);
     else
       ConvertWithRhs(item, rr);
+    return Context::CTX_ROOT;
   }
 
 protected:
@@ -240,7 +259,7 @@ protected:
     return {lb!=ub, lb>GetMC().MinusInfty(), ub<GetMC().Infty()};
   }
   void ConvertRange(const ItemType& item, int i) {
-    GetMC().TurnOffAutoLinking();     // for range only
+    GetMC().TurnOffAutoLinking(false);     // for range only
     auto slk = int( GetMC().AddVar(0.0, item.ub()-item.lb()) );
     auto body = item.GetBody();
     body.add_term(1.0, slk);
@@ -263,7 +282,7 @@ protected:
     } // else, both are inf, forget
   }
 
-  using SlackLink = pre::RangeLinCon2Slack<ModelConverter>;
+	using SlackLink = pre::RangeCon2Slack<ModelConverter, ItemType>;
   SlackLink& GetSlackLink() { return link_rng2slk_; }
 
 private:

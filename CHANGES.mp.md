@@ -2,6 +2,466 @@ Summary of recent updates to the AMPL MP Library
 ================================================
 
 
+## 20261101
+- New: AMPL's *floor*, *ceil*, *round(x[, n])* (ties to even),
+  *trunc(x[, n])*, *div* and *mod* (also for real numbers and variable
+  divisors), before rejected as "unsupported". MIP reformulations:
+  floor/ceil by bounds with *cvt:mip:eps*, round with an even/odd
+  decomposition, div/mod by quotient and remainder as in MiniZinc's
+  linearization library. Options *acc:floor*, *acc:ceil*,
+  *acc:round*, *acc:intdiv*, *acc:mod*.
+- Products of variables with a bounded integer factor are reformulated
+  exactly for MIP solvers without (nonconvex) quadratics, by binary
+  expansion of the integer factor (option *cvt:mip:intprodbits*, default
+  30; 0 restores the piecewise-linear approximation); integer powers
+  x^k likewise. Before, such products were approximated.
+- Fix: with *cvt:quadcon=0*, quadratic range constraints were still
+  passed to solvers accepting them (e.g., MOSEK).
+- New functional constraint *r = x\*y* (*acc:mul*) for solvers taking
+  products of variables natively (CP-SAT): quadratic terms of
+  non-binary variables become such constraints instead of the
+  piecewise-linear approximation of *((x+y)^2-x^2-y^2)/2*; equal
+  products share one constraint. The default of *cvt:multoutcard*
+  is now per solver (1 for CP-SAT: a product of sums stays one
+  product of two auxiliary variables).
+- Fix: inlining algebraic subexpressions into an objective
+  (*cvt:pre:unnest*) could make it quadratic for solvers without
+  quadratic objectives (*cvt:quadobj=0*), which then failed.
+- Fix: checking whether an auxiliary variable can be replaced by its
+  defining expression (e.g., for MP2NL and expression-based solvers)
+  could add an unused copy of a comparison to the model.
+- Fix: a dual ray requested for a model without constraints
+  (MOSEK, "infeasible or unbounded") failed with "map::at".
+- Fix: *tech:writegraph* wrote empty names for auxiliary variables.
+- Fix: a nonconvex piecewise-linear term whose argument becomes
+  fixed at a breakpoint failed with "MIPFlatConverter: vector"
+  in solvers without native SOS2 (e.g., HiGHS, MOSEK, or
+  *acc:sos2=0*). The term now reduces to its value at that point.
+  A term with a single linear piece over its argument's domain
+  becomes one linear equality, without an SOS2 constraint.
+- Fix: chained piecewise-linear terms (one term's argument depends
+  on another term's result) could get wrong solutions in solvers
+  without native SOS2. The results of piecewise-linear terms now
+  receive bounds from their arguments' domains, also when these
+  are narrowed later, e.g., by linear constraints.
+- Change: the MIP reformulation of a nonconvex piecewise-linear
+  term (solvers without native SOS2, e.g., HiGHS, MOSEK, or
+  *acc:pl=0 acc:sos2=0*) no longer limits an unbounded argument to
+  +-1e6 silently: this amplified the feasibility tolerance by up to
+  1e6 and could give wrong solutions. An unbounded argument is now
+  an error; finite bounds are used as given. New option
+  *cvt:pl:domain* sets the limit explicitly, with a warning when
+  it applies (use with caution). With native SOS2, unbounded sides
+  of the argument are now modeled exactly by ray variables instead
+  of extending the end segments to 1e6; *cvt:pl:domain* restores
+  the extension.
+- Fix: *AMPLSSolve* (AMPLS C API) called the solver once, skipping
+  the iterations of the multiobjective emulator (*obj:multi=2*, or
+  *obj:multi=1* without native support); postsolving the results then
+  read uninitialized objectives and crashed. It now solves as drivers
+  do. This affected ASL drivers run with mp2nl=1.
+- AMPLS C API: *AMPLSReportError* writes the .sol file with a
+  solve result and message after a failed *AMPLSLoadNLModel* or
+  *AMPLSReportResults*, as drivers do on errors.
+- Fix: 64-bit integer options rejected values above 2^31
+  ("this number is larger than an int"); they are now parsed
+  as 64-bit integers.
+- Fix: the IIS of a model with logical constraints or if-then-else
+  expressions marked many unrelated constraints (*upp*): every
+  constraint that used a constant, e.g. the implicit else-0 of
+  *if ... then*, received the IIS status of MP's shared fixed
+  variable for that constant. Constants are no longer linked to
+  the constraints using them. Constraints sharing a subexpression
+  that is in the IIS are all reported.
+- Fix: with several objectives (*obj:multi*), *mip:return_gap* and
+  *mip:bestbound* stopped debug builds with an assertion in
+  *ReportSuffix*; release builds were unaffected. The objective
+  suffixes *.relmipgap*, *.absmipgap* and *.bestbound* carry the value
+  for the first objective and 0 for the others.
+- Option *cvt:pre:boundsbest* value 4: best-known bounds for all
+  variables when the submitted model has no nonlinear or quadratic
+  constraints or objectives, hard bounds otherwise. MP2NL sets it in
+  the configurations of the nonlinear subsolvers (knitro, ipopt,
+  conopt, snopt, minos, lgo, bonmin, couenne, baron, lindoglobal):
+  on MILPs the bounds speed up their branch-and-bound, on MINLPs the
+  bounds of auxiliary results degrade their barrier subproblems.
+- Option *cvt:pre:boundsbest* has values 2 and 3: 2 submits the
+  best-known bounds of all result variables except those of smooth
+  nonlinear expressions (exp, log, pow, trigonometric functions,
+  divisions, products), 3 only those. The decision whether a result
+  variable with a significant best-known bound stays explicit follows
+  the same per-variable rule.
+- Option *cvt:pre:auxint* (default 0): auxiliary result variables
+  whose integrality is implied by their defining constraint
+  (if-then-else, min/max/abs, count/numberof, integer linear and
+  quadratic functions of integer arguments) are submitted as
+  continuous; MP keeps their integrality for its reformulations.
+  Results of logical constraints, indicator binaries and arguments
+  of logical constraints submitted to the solver stay integer.
+  Solvers without continuous variables (CP-SAT) default to 1.
+  Fixed variables made continuous (*cvt:pre:continuous_fixed_vars*)
+  no longer change MP's internal variable types.
+- Fix: the big-M linearization of an indicator *b==v ==> c'x >= d*
+  (or *<=*) dropped the row when *d* equalled the body's best-known
+  bound, although that bound is not submitted by default
+  (*cvt:pre:boundsbest=0*). The solver then saw, e.g., the result of
+  *if b then x else 0* without its lower bound 0, and objectives
+  containing it were underestimated. The plain row is now kept.
+- *cvt:pre:disj2ind*: a variable reused as an indicator binary
+  (an if-then-else result in {0, 1}) gets hard bounds [0, 1]
+  (Xpress: "Non binary variable used as an indicator binary").
+- Option *cvt:pre:disj2ind* (default 11): convert disjunctions
+  *literal || C* with a single-use comparison *C*, which is how AMPL
+  sends implications *b==1 ==> C*, into indicators *b==1 ==> C*,
+  without auxiliary binaries. Also for conjunctions *C1 && C2* and
+  for *x != k*; *x == k* awaiting the unary encoding decision is
+  absorbed only if no encoding is chosen.
+- Option *cvt:pre:vbnd* (default 3): a comparison *x (cmp) c*
+  decided by the domain of *x* reuses an existing binary.
+  Bit 1: variable-bound constraints *x >= L*b*, *x <= U*b*
+  (*b* binary; AMPL's encoding of *x in {0} union interval[L, U]*),
+  with *0 <= c <= L*: *b* or its negation. Bit 2: root disjunctions
+  *x <= a || x >= b* (e.g., *x == 0 || x >= L*), *a < c < b*:
+  the comparison *x >= b* or its negation.
+- *cvt:pre:disj2ind* bits 16 (an AND of comparisons in positive
+  context, e.g., a disjunct of a multi-term disjunction, becomes
+  indicators on the AND's result) and 32 (a static disjunction
+  with an AND argument is distributed into clauses); AND members
+  which are not comparisons are implied by clauses.
+- Solution check: in the realistic mode, evaluate recomputed
+  conditional comparisons within *sol:chk:feastol*; recompute only
+  eliminated auxiliary variables.
+- Emulate *mip:basis* for linear algebraic MIPs in COPT, MOSEK, HiGHS,
+  and SCIP. Add independent fixed-model limits *mip:basis:timelimit*
+  and *mip:basis:iterlimit*, including native fixed-model paths.
+- *obj:multi:stats* with multi-objective emulation:
+  report *.objpass_objbound* separately from *.objpass_mipgap*;
+  report the statistics also when a pass stops
+  the solve (*.objpass=0*, *.objpass_result=-1*
+  and NaN values for the passes not run).
+- Fix multi-objective emulation when objectives of different
+  senses share a priority level: the sign of the weight was flipped
+  twice for objectives of a sense different from the first
+  objective of the level, giving wrong solutions.
+
+
+## 20260908
+- Set membership operator discouraged
+  during rework, see Modeling Guide.
+- Don't fail when *mip:return_gap* or *mip:bestbound*
+  ask for values but they are not available
+  (warning issued).
+- Option *obj:multi:stats=1* outputs multi-objective
+  pass statistics in the *.objpass[_...]* suffixes.
+- Fix a bug in complementarity reformulation
+  with *cvt:compl=2,3*.
+- Options *mip:plateau:...* control MIP
+  tailing-off in supporting solvers.
+  Can be used in multi-objective solves,
+  see option *obj:multi:options*. 
+- Option *cvt:nlobj* controls whether nonlinear
+  objective terms are passed to the objective,
+  vs moved to a constraint or piecewise-linearly
+  approximated. Setting *cvt:nlobj=0*
+  *cvt:quadobj=0* enables native
+  multiobjective method (*obj:multi=1*)
+  if only supported for linear objectives.
+- Option *cvt:pre:unnest*: bit 4 (value 16) turns on
+  inlining of algebraic subexpressions in indicator
+  constraints. When it is off, the body of indicator
+  constraints is always just a variable
+  (possibly assigned to a larger expression).
+  On by default.
+
+
+## 20260624
+- CMake option *MP_LINK_WITH_SHARED_LIB* links the
+  driver as a shared library (Gurobi, IBM ILOG CPLEX,
+  Cardinal Optimizer, FICO Xpress;
+  for them, it's the default).
+- Option *debug=1* outputs all options in problem
+  suffixes *option___...*.
+- Option *cvt:pow2_as_qp* prefers quadratization
+  of the ^2 operator for affine arguments (default).
+- Faster parsing of quadratic expressions with
+  defined variables.
+
+
+## 20260515
+- Fixed a bug in solve result name in the Multi-Objective
+  Emulator.
+- Similar to inlining, nonlinear expressions with nontrivial
+  external bounds are explicified into an auxiliary variable,
+  depending on options *cvt:pre:boundsbest* and
+  *cvt:pre:boundlogarg*.
+- Fixed a debugging feature on Windows.
+- Fixed a non-critical bug in the inlining of algebraic
+  subexpressions resulting from redefinitions,
+  option *cvt:pre:unnest*. In particular
+  with *cvt:pre:boundsbest=1*, subexpressions
+  with stronger result bounds are not inlined.  
+
+
+## 20260414
+- Fixed a bug in the multi-objective emulator
+  (see option *obj:multi*) when nonlinear terms
+  were not reset for consecutive objectives.
+- Option *cvt:pre:continuous_fixed_vars* to declare
+  fixed variables continuous. Default 1.
+- Option *cvt:pre:boundsbest* defaults to making
+  auxiliary subexpression result variables free,
+  unless the result is constant.  This allows
+  stronger nonlinear presolve.
+- Additional case where the signpow function
+  is recognized: abs(C*x)*x
+  (C constant, x variable).
+- Auxiliary variables and constraints receive names
+  describing the redefinition path. Such names are
+  only given if AMPL option (solver_)auxfiles rc is
+  set, or solver option *cvt:names=2,3* provided.
+- Added option *tech:stats* to return solution 
+  statistics via problem suffixes.
+
+
+## 20260109
+- Remove excessive '_' symbols in output 
+  model constraint and variable names.
+
+
+## 20251213
+- Recognize the logistic function 1/(1+e^(-x)),
+  option *cvt:pre:logistic*.
+- Recognize the signpow function sign(x)*x^k
+  from several kinds of algebra, such as abs(x)*x^k.
+  Option *cvt:pre:signpow*.
+- *iis:find* now the main name for option
+  *alg:iisfind* (which is now a synonym).
+- Option *obj:multi:options*: fix integer-valued
+  options.
+
+
+## 20251121
+- Meta-driver MP2NL, see
+  https://mp.ampl.com/modeling-tools.html#mp2nl.
+- New option *obj:multi:options* to control
+  whether multi-objective option suffixes
+  are used.
+- Catch duplicate solver options.
+
+
+## 20251021
+- Option *cvt:expr:nlassign* adjusting expression
+  inlining. Improves problem building performance
+  for some nonlinear solvers on large models.
+
+
+## 20251015
+- Option *cvt:pre:ctx2count* is deprecated,
+  with a new default value 7. Its former behavior
+  is specialized and generalized by the new option
+  *cvt:pre:ctx2bndeq*.
+- Option *cvt:pre:ctx2bndeq* controls whether
+  conditional comparisons with upper/lower
+  bounds are reformulated in exact context,
+  vs. always mixed. Default yes, value 1.
+- Workaround for #270 (redefinition of
+  an expression as an existing expression can
+  lose connection to the original).
+- Fixed *multiobj=2* for a single objective.
+  Running multiobjective for a single-objective
+  model makes sense with a negative `.objweight`
+  suffix.
+- Options *cvt:pre:ineq2bndeq*,
+  *cvt:pre:ineq2related* control unification
+  of conditional equlaities and inequalities.
+- *cvt:compl:eps=1e-9* new default.
+- *alg:start=3* default (new value),
+  which passes both the
+  initial guesses and basis for LP
+  (previously basis only).
+- Option *cvt:uenc:negctx:max* disregards lb(x), ub(x).
+- Options *cvt:pre:ctx:abs* etc. control propagation
+  of expression context.
+
+
+## 20250814
+- Fixed reformulation of numberof and alldiff.
+  Previously could produce an inefficient
+  reformulation.
+- Option *cvt:pre:sort*:
+  - Sorting and eliminating duplicates
+    in arguments of AND, OR, MIN, MAX.
+    This is necessary for some solvers.
+  - Sorting arguments of COUNT, ATLEAST,
+    EXACTLY, ATMOST, NUMBEROF, ALLDIFF.
+- Option *cvt:pre:unnest* extended for MIN, MAX
+  (bit 3).
+
+
+
+## 20250811
+- The legacy fmt::MemoryWriter has double output
+  precision of 17 significant digits
+  (previously 6).
+- Option *cvt:pre:boundlogarg* (default 0) to bound
+  arguments of logarithms nonnegative. Previously
+  always done, sometimes deteriorating performance
+  of nonlinear solvers.
+
+
+## 20250801
+- Tolerances set by options *cvt:pre:feastol*,
+  *cvt:pre:feastolrel* both need to be violated
+  to produce a warning on contradicting
+  variable/constraint bounds. Previously
+  the preprocessor failed on any violation,
+  without letting the solver try.
+- Options *cvt:compl*, *cvt:compl:eps* control
+  complementarity reformulations.
+
+
+## 20250617
+- Option *cvt:unnest*: bits 1 and 2 switch on
+  inlining of linear and quadratic subexpressions
+  produced during reformulations (by default on).
+- Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+  to control context propagation into conditional
+  comparisons #267.
+
+
+## 20250616
+- Multi-objective emulator: added support for 
+  objective-specific options via objective suffixes
+  beginning with *option_*.
+
+
+## 20250429
+- Fixed a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250424
+- Option *alg:sens* returns synonym suffixes
+  `.down/.up/.current` for objective coefficients
+  and `.down/.up` for right-hand sides.
+- Improved parsing speed of large sums of quadratic
+  and polynomial expressions.
+  - Setting option *cvt:qp2passes=0* switches to
+    a simpler method, usually slightly slower.
+  - Option *cvt:multoutcard* to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models, but prone to numerical issues.
+
+
+## 20250308
+- Fixed a bug in monotonicity presolve which could
+  have led to wrong models using a^x with a<1.
+- Reduced memory fragmentation for linear
+  and quadratic expressions.
+- Option *tech:outlev_mp=1* (implied by *tech:outlev=1*)
+  prints initial and transformed model statistics.
+- Improved presolve for disequality: more cases when
+  no logical disjunction is needed.
+
+
+## 20250205
+- Fixed a bug in model reformulations which could
+  cause some constraints to be lost, see issue 248.
+- Option *alg:sens=1* now returns suffix `.sensobj` with
+  current objective coefficients in the solver model
+  (this is the model corresponding to AMPL command `solexpand`.)
+- Option *acc:_all* is overridden by individual acceptance
+  options, e.g., *acc:or*.
+- Substitute AMPL defined variables
+  into linear, quadratic, and polynomial expressions
+  (option *cvt:dvelim*).
+  This can simplify quadratic and polynomial models
+  (linear substitutions are already performed by AMPL,
+  see AMPL options *linelim* and *substout.)
+- *cvt:prod=7* default for LP and convex solvers,
+  logicalizing also products of just 2 binary variables.
+- More presolve for logical expressions
+  (Not, And, Or, Indicator), and new options to control
+  some of them: *cvt:pre:ineqresult*, *cvt:pre:ineqrhs*.
+- Fix lower bound calculation of the division result.
+- [BREAKING] Option *acc:pow* now affects only expressions x^y
+  with both x, y variable; previous meaning of *acc:pow*
+  is now with *acc:powconstexp*.
+- Option *tech:writemodel:index* to choose the iteration
+  when solver model is exported
+  in the multi-objective emulator.
+- SCIP (and any solver with linear objective
+	and non-linear constraints): improve reformulation
+	of QP objectives.
+- Fix reformulation of non-linear objective expressions
+  for the multi-objective case (option *obj:multi*) when
+  negative objective weights are used (*obj:multi:weight*).
+
+
+## 20240724
+- Option *acc:_all*
+  - Useful to disable all reformulations (*acc:_all=2*),
+    or force linearization (*acc:_all=0*).
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+  - *obj:multi=2* forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+    `.objabstol`, `.objreltol`.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240529
+- *Multi-objective emulator*
+  - All flat MP solvers support multi-objective mode (*obj:multi=1*),
+		either natively, or via emulation.
+  - Suffixes `.objpriority`, `.objweight`, `.objabstol`, `.objreltol`.
+  - [BREAKING] Default intuitive handling of `.objweight`,
+    see option `obj:multi:weight`, even when natively supported.
+
+
+## 20240429
+- *Options `report_times` and `timing`*.
+  - Options `timing` and `report_times` now have the same effect:
+    setting their value to 1 returns basic timing information, 
+    setting it to 2 returns more granular info.
+
+
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use the solver's
+    native PL functions if supported, or MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`).
+- *Reformulation explorer*.
+  - Upgraded option *writegraph* exports the reformulation
+    graph which can be explored with the script in
+    support/modelexplore (WIP).
+- *Native handling of POW(x, INT)*.
+  - Power expressions with positive integer exponent
+    are passed natively to the solvers accepting them,
+    vs previously quadratic or linear reformulation.
+  - For best performance, global solving capability
+    might be needed (e.g., Gurobi: `global=1`.)
+- *Option `report_times`*.
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+- *NLWPY*.
+  - Python NL Writer API for MIQP models.
+  - Available on PyPI.
+
+
 ## 20240115
 - *Solve result codes*.
   - List codes by running (solver) -!
@@ -11,9 +471,9 @@ Summary of recent updates to the AMPL MP Library
     - 300-349 means unbounded problem but
       feasible solution returned
     - 400-449 means limit/interrupt but feasible
-  - [BREAKING] sol:chk:fail returns code 150 (solved?)
+  - [BREAKING] *sol:chk:fail* returns code 150 (solved?)
 - Improved translation of *SOCP constraints*.
-  - Options cvt:socp, cvt:socp2qc.
+  - Options *cvt:socp*, *cvt:socp2qc*.
 - Compact solution check warnings
 - Fixed presolve of the power function #226.
 - Fixed graceful exit on Ctrl-C from AMPL in Linux.
@@ -32,13 +492,13 @@ Summary of recent updates to the AMPL MP Library
 ## 20230919
 - *mp_options*.
 	Receive mp_options from AMPL (for all MP solvers).
-	They are parsed before (solvername)_options.
+  They are parsed before `(solvername)_options`.
 - Solution checking: relative tolerance
-	sol:chk:feastolrel; options sol:chk:round, sol:chk:prec.
+  *sol:chk:feastolrel*; options *sol:chk:round*, *sol:chk:prec*.
 
 
 ## 20230831
-- Solution checking, options sol:chk:* (experimental).
+- Solution checking, options *sol:chk:...* (experimental).
 - Preprocess And/Or constraints.
 
 

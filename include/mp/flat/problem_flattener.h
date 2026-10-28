@@ -1,18 +1,25 @@
 #ifndef PROBLEM_FLATTENER_H
 #define PROBLEM_FLATTENER_H
 
-#include <utility>
 #include <unordered_map>
 #include <map>
 #include <cmath>
+#include <utility>
+#include <memory>
 
 #include "mp/problem.h"    // for ToLinTerms()
 #include "mp/converter-base.h"
+#include "mp/flat/problem_flattener_base.h"
 #include "mp/expr-visitor.h"
+#include "mp/obj-option-base.h"
 #include "mp/flat/eexpr.h"
+#include "mp/flat/bucketaccum.h"
+#include "mp/flat/qp2passes.h"
+#include "mp/flat/prepro_prod.h"
 #include "mp/flat/constr_std.h"
 #include "mp/flat/obj_std.h"
 #include "mp/valcvt.h"
+#include "mp/utils-vec.h"
 
 
 namespace mp {
@@ -28,6 +35,21 @@ LinTerms ToLinTerms(const LinearExpr& e) {
   return le;
 }
 
+/// Write algebraic expression (linear + non-linear.)
+template <typename ExprTypes,
+          typename LinearExpr, typename NumericExpr,
+          typename Namer>
+void WriteExpr(fmt::Writer &w, const LinearExpr &linear,
+               NumericExpr nonlinear, Namer);
+
+/// Write logical expression
+template <typename ExprTypes, typename LogicalExpr, class VN>
+void WriteExpr(fmt::Writer &w, LogicalExpr expr, VN);
+
+/// Write algebraic constraint.
+template <class ExprTypes, class AlgCon, class VN>
+void WriteAlgCon(fmt::Writer &w, const AlgCon &con, VN);
+
 
 /// ProblemFlattener: it walks and "flattens" most expressions
 /// by replacing them by a result variable and constraints.
@@ -41,7 +63,8 @@ LinTerms ToLinTerms(const LinearExpr& e) {
 template <class Impl, class Problem, class FlatConverter>
 class ProblemFlattener :
     public ExprConverter<Impl, EExpr>,
-    public BasicConverter<Problem>
+    public BasicConverter<Problem>,
+    public BasicProblemFlattener
 {
 public:
   using ProblemType = Problem;
@@ -49,15 +72,18 @@ public:
 
 public:
   using Var = typename FlatConverter::Var;
+  /// The low-level expression
+  using ExprType = Expr;
+  /// The intermediate expression
   using EExprType = EExpr;
   using VarArray = std::vector<Var>;
+  using BaseExprVisitor = ExprVisitor<Impl, EExpr>;
 
 protected:
   using ClassName = ProblemFlattener;
-  using BaseExprVisitor = ExprVisitor<Impl, EExpr>;
   using BaseConverter = BasicConverter<Problem>;
 
-  using EExprArray = std::vector<EExpr>;
+  using EExprArray = SmallVec<EExpr, 2>;
 
   using BaseConverter::GetEnv;
 
@@ -65,6 +91,7 @@ public:
   static const char* GetTypeName() { return "ProblemFlattener"; }
 
   ProblemFlattener(Env& e) : BaseConverter(e), flat_cvt_(e) { }
+  ~ProblemFlattener() { DeleteQP2PassVisitor(&GetQP2PVisitor()); }
 
 public:
   /// INCREMENTAL INTERFACE.
@@ -103,9 +130,81 @@ public:
 public:
   /// Convert the whole model, e.g., after reading from NL
   void ConvertModel() override {
+    PrepareModelConversion();
+
     GetFlatCvt().StartModelInput();
     MP_DISPATCH( ConvertStandardItems() );
     GetFlatCvt().FinishModelInput();      // Chance to flush to the Backend
+
+    OutputDebugInfo();
+  }
+
+  /// Prepare model conversion
+  void PrepareModelConversion() {
+    SetSuffixCallbacks();
+    InitNameChunks();
+  }
+
+  /// Set suffix callbacks
+  void SetSuffixCallbacks() {
+    GetFlatCvt().SetSuffixManip({
+              [this](const SuffixDef<int>& sd) { return GetModel().ReadIntSuffix(sd); },
+              [this](const SuffixDef<double>& sd) { return GetModel().ReadDblSuffix(sd); },
+              [this](const SuffixDef<int>& sd, ArrayRef<int> data) { GetModel().ReportSuffix(sd, data); },
+              [this](const SuffixDef<double>& sd, ArrayRef<double> data) { GetModel().ReportSuffix(sd, data); },
+              [this](suf::Kind kind) -> const SuffixSet& { return GetModel().suffixes(kind); }
+    });
+  }
+
+  /// Init value node name chunks.
+  /// This empties chunks for top-level algebraic cons
+  /// and original variables,
+  /// so their names are not modified.
+  /// But for objectives and alg cons with outlined
+  /// arguments we add "_flat_".
+  void InitNameChunks() {
+    /// Reset name presolve chunks
+    GetFlatCvt().SetValueNodeNameChunksAsShortTypeNames();
+
+    auto EmptyNC = [this](auto* pCon) {
+      this->GetFlatCvt().GetConstraintKeeper(pCon).
+          SetValueNodeNameChunk("");
+    };
+
+    EmptyNC((LinConRange*)nullptr);
+    EmptyNC((LinConLE*)nullptr);
+    EmptyNC((LinConEQ*)nullptr);
+    EmptyNC((LinConGE*)nullptr);
+    EmptyNC((QuadConRange*)nullptr);
+    EmptyNC((QuadConLE*)nullptr);
+    EmptyNC((QuadConEQ*)nullptr);
+    EmptyNC((QuadConGE*)nullptr);
+
+    GetFlatCvt().GetVarValueNode().SetNameChunk("");
+  }
+
+  /// Need and successfully prepared the next solve iteration?
+  bool PrepareSolveIteration(
+      std::function<sol::Status(void)> get_stt, std::function<Solution(void)> get_sol)
+      override
+  { return GetFlatCvt().PrepareNextSolveIteration(get_stt, get_sol); }
+
+  /// Is/was MultiObj Emulator used?
+  bool IsMOEmulationOn() const override
+  { return GetFlatCvt().IsMOActive(); }
+
+  /// Vector of pass indexes for each original objective
+  /// @note 0 is the first index
+  ArrayRef<int> GetMultiobjPasses() const override
+  { return GetFlatCvt().GetMultiobjPasses(); }
+
+  /// Objective weights
+  ArrayRef<double> GetObjWeightsAdapted() override
+  { return GetFlatCvt().GetObjWeightsAdapted(); }
+
+  /// Get obj option setter
+  BasicObjOptionSetter* GetObjOptionSetter() override {
+    return GetFlatCvt().GetObjOptionSetter();
   }
 
   /// Fill model traits
@@ -122,10 +221,13 @@ public:
 protected:
   /// Convert problem items
   void ConvertStandardItems() {
-    CopyItemNames();
-
     ////////////////////////// Variables
     ConvertVars();
+    ScanVarBoundRows();          // before any comparison is flattened
+    ScanDomainHoles();
+
+    ////////////////////////// function defs
+    ConvertFuncDefs();
 
     ////////////////////// SOS constraints //////////////////////////
     /// SOS2 come before algebraic constraints, so we can omit
@@ -134,29 +236,157 @@ protected:
 
     ////////////////////////// Common exprs
     int num_common_exprs = GetModel().num_common_exprs();
-    for (int i = 0; i < num_common_exprs; ++i)
+    for (int i = 0; i < num_common_exprs; ++i) {
+      MPD( ExportCommonExpr(i) );
       MP_DISPATCH( Convert( GetModel().common_expr(i) ) );
+    }
 
     ////////////////////////// Objectives
     ifFltCon_ = 0;
     if (int num_objs = GetModel().num_objs())
-      for (int i = 0; i < num_objs; ++i)
-        MP_DISPATCH( Convert( GetModel().obj(i) ) );
+      for (int i = 0; i < num_objs; ++i) {
+        MPD( ExportObj(i) );
+        MP_DISPATCH( ConvertObj( i ) );
+      }
+    GetFlatCvt().PropagateObjContexts();      // all now, because of GetMOWeights()
 
     ////////////////////////// Algebraic constraints
     ifFltCon_ = 1;
     if (int n_cons = GetModel().num_algebraic_cons())
-      for (int i = 0; i < n_cons; ++i)
+      for (int i = 0; i < n_cons; ++i) {
+        MPD( ExportAlgCon(i) );
         MP_DISPATCH( ConvertAlgCon( i ) );
+      }
 
     ////////////////////////// Logical constraints
     ifFltCon_ = 1;
     if (int n_lcons = GetModel().num_logical_cons())
-      for (int i = 0; i < n_lcons; ++i)
+      for (int i = 0; i < n_lcons; ++i) {
+        MPD( ExportLogCon(i) );
         MP_DISPATCH( ConvertLogicalCon( i ) );
+      }
 
-    /// Signal we are not flattening anything
+    // We could have input variable names
+    // from .col, .row files (option auxfiles rc;)
+    CopyItemNames();
+
+    // Shrink temp storage
+    Shrink();
+
+    // Signal we are not flattening anything
     ifFltCon_ = -1;
+  }
+
+  /// Output some debug info
+  void OutputDebugInfo() {
+    auto ReportVal = [this](const char* sufname, auto val) {
+      double va [] = { (double)val };
+      GetModel().ReportSuffix(
+          {sufname, suf::PROBLEM | suf::OUTONLY}, ArrayRef<double>(va));
+      if (GetEnv().debug_mode() > 1)
+        GetEnv().Print("  ----- DEBUG: Suffix '{}' = {}\n",
+                       sufname, val);
+    };
+    if (GetEnv().debug_mode()) {
+      ReportVal("stat__qp2p_runs", n_qp2pass_runs_);
+      ReportVal("stat__qp2p_complete_runs", n_qp2pass_complete_runs_);
+      ReportVal("stat__qp2p_bucket_runs", n_qp2pass_bucket_runs_);
+      ReportVal("stat__qp2p_outmults", n_qp2pass_outmult_);
+      ReportVal("stat__qp2p_qpterms", sum_qp2pass_qpterms_);
+      ReportVal("stat__visitsum_bucket_runs", n_visitsum_bucket_runs_);
+      ReportVal("stat__visitsum_bucket_outmults", n_visitsum_bucket_outmults_);
+      ReportVal("stat__visitsum_bucket_qpterms", sum_visitsum_bucket_qpterms_);
+      ReportVal("stat__qp_outmults", n_qp_outmult_);
+      ReportVal("stat__qp_outmult_qpterms", sum_qp_outmult_qpterms_);
+    }
+  }
+
+  /// Export common expression \a i.
+  void ExportCommonExpr(int i) {
+    if (GetFlatCvt().GetFileAppender().IsOpen()) {
+      fmt::MemoryWriter wrt;
+      {
+        MiniJSONWriter jw(wrt);
+        jw["NL_COMMON_EXPR_index"] = i;
+        // We don't receive defvar names from AMPL
+        auto vn = GetModel().GetVarNamer();
+        jw["name"] = vn.dvname(i);
+        auto ce = GetModel().common_expr(i);
+        fmt::MemoryWriter w2;
+        w2 << "var " << vn.dvname(i) << " = ";
+        WriteExpr<typename ProblemType::ExprTypes>(
+              w2, ce.linear_expr(), ce.nonlinear_expr(), vn);
+        jw["printed"] = w2.c_str();
+      }
+      wrt.write("\n");                     // EOL
+      GetFlatCvt().GetFileAppender().Append(wrt);
+    }
+  }
+
+  /// Export objective \a i.
+  void ExportObj(int i) {
+    if (GetFlatCvt().GetFileAppender().IsOpen()) {
+      fmt::MemoryWriter wrt;
+      {
+        MiniJSONWriter jw(wrt);
+        jw["NL_OBJECTIVE_index"] = i;
+        jw["name"] = GetModel().obj_name(i);
+        auto obj = GetModel().obj(i);
+        jw["sense"] = (int)obj.type();
+        fmt::MemoryWriter w2;
+        w2 << (obj::MAX==obj.type() ? "maximize " : "minimize ");
+        w2 << GetModel().obj_name(i) << ": ";
+        WriteExpr<typename ProblemType::ExprTypes>(
+              w2, obj.linear_expr(), obj.nonlinear_expr(),
+              GetModel().GetVarNamer());
+        jw["printed"] = w2.c_str();
+      }
+      wrt.write("\n");                     // EOL
+      GetFlatCvt().GetFileAppender().Append(wrt);
+    }
+  }
+
+  /// Export algebraic constraint \a i.
+  void ExportAlgCon(int i) {
+    if (GetFlatCvt().GetFileAppender().IsOpen()) {
+      fmt::MemoryWriter wrt;
+      {
+        MiniJSONWriter jw(wrt);
+        auto con = GetModel().algebraic_con(i);
+        jw["NL_CON_TYPE"] = (con.nonlinear_expr() ? "nonlin" : "lin");
+        jw["index"] = i;
+        jw["name"] = GetModel().con_name(i);
+        fmt::MemoryWriter w2;
+        w2 << GetModel().con_name(i) << ": ";
+        WriteAlgCon<typename ProblemType::ExprTypes>(
+              w2, con, GetModel().GetVarNamer());
+        jw["printed"] = w2.c_str();
+      }
+      wrt.write("\n");                     // EOL
+      GetFlatCvt().GetFileAppender().Append(wrt);
+    }
+  }
+
+  /// Export logical constraint \a i.
+  void ExportLogCon(int i) {
+    if (GetFlatCvt().GetFileAppender().IsOpen()) {
+      fmt::MemoryWriter wrt;
+      {
+        MiniJSONWriter jw(wrt);
+        auto con = GetModel().logical_con(i);
+        jw["NL_CON_TYPE"] = "logical";
+        int i_actual = GetModel().num_algebraic_cons() + i;
+        jw["index"] = i_actual;
+        jw["name"] = GetModel().con_name(i_actual);
+        fmt::MemoryWriter w2;
+        w2 << GetModel().con_name(i_actual) << ": ";
+        WriteExpr<typename ProblemType::ExprTypes>(
+              w2, con.expr(), GetModel().GetVarNamer());
+        jw["printed"] = w2.c_str();
+      }
+      wrt.write("\n");                     // EOL
+      GetFlatCvt().GetFileAppender().Append(wrt);
+    }
   }
 
   /// Convert variables
@@ -171,11 +401,26 @@ protected:
       types[i] = mpvar.type();
     }
 
+    auto src_rng =
+        GetValuePresolver().GetSourceNodes().GetVarValues().MakeSingleKey().
+                   Add(lbs.size());
+    auto emptylinker = GetFlatCvt().MakeEmptyLinker(src_rng);
     auto vnr = GetFlatCvt().AddVars(lbs, ubs, types);
-    GetCopyLink().AddEntry({
-          GetValuePresolver().GetSourceNodes().GetVarValues().MakeSingleKey().
-                             Add(lbs.size()),
-          vnr });
+    GetCopyLink().AddEntry({ src_rng, vnr });
+    // Append "_flatvNN" for any other variables,
+    // in particular the new variables during flattening
+    GetFlatCvt().GetVarValueNode().SetNameChunk("flatv");
+  }
+
+  /// Convert Function Definitions
+  void ConvertFuncDefs() {
+    std::vector<FuncDef> funcs;
+    funcs.reserve(GetModel().num_functions());
+    for (int i=0; i<GetModel().num_functions(); ++i) {
+      auto fn = GetModel().function(i);
+      funcs.push_back({fn.name(), fn.num_args()});
+    }
+    GetFlatCvt().AddFuncDefs(std::move(funcs));
   }
 
   /// Convert a common expr
@@ -184,61 +429,147 @@ protected:
   }
 
   /// Convert an objective
-  void Convert(typename ProblemType::MutObjective obj) {
-    auto obj_src =              // source value node for this obj
-        GetValuePresolver().GetSourceNodes().GetObjValues()().Add();
-    GetCopyLink().AddEntry(
+  void ConvertObj(int i_obj) {
+    try {
+      typename ProblemType::MutObjective obj = GetModel().obj(i_obj);
+      auto obj_src =              // source value node for this obj
+          GetValuePresolver().GetSourceNodes().GetObjValues()().Add();
+      auto& obj_trg_nodes = GetValuePresolver().GetTargetNodes().GetObjValues()();
+      GetCopyLink().AddEntry(
           {
-            obj_src,
-            GetValuePresolver().GetTargetNodes().GetObjValues()().Add() });
-    /// After the CopyLink, add One2ManyLink for converted expressions.
-    /// When postsolving, CopyLink is executed last and copies obj values.
-    /// This should resolve the issue of the "max-out"
-    /// value conflict resolution.
-    /// Tested by suf_common/funcpieces_01_01_obj.mod.
-    pre::AutoLinkScope<FlatConverterType> auto_link_scope{
-      GetFlatCvt(), obj_src
-    };
-    auto le = ToLinTerms(obj.linear_expr());
-    NumericExpr e = obj.nonlinear_expr();
-    EExpr eexpr;
-    if (e) {
-      eexpr=MP_DISPATCH( Visit(e) );
-      le.add(eexpr.GetLinTerms());
-      if (std::fabs(eexpr.constant_term())!=0.0) {
-        /// Not using objective constant, should we?
-        le.add_term(1.0, MakeFixedVar(eexpr.constant_term()));
+           obj_src,
+           obj_trg_nodes.Add() });
+      /// After the CopyLink, add One2ManyLink for converted expressions.
+      /// When postsolving, CopyLink is executed last and copies obj values.
+      /// This should resolve the issue of the "max-out"
+      /// value conflict resolution.
+      /// Tested by suf_common/funcpieces_01_01_obj.mod.
+      ///
+      /// @note Do not link from obj_trg.
+      pre::AutoLinkScope<FlatConverterType> auto_link_scope{
+          GetFlatCvt(), obj_src
+      };
+      auto le = ToLinTerms(obj.linear_expr());
+      NumericExpr e = obj.nonlinear_expr();
+      EExpr eexpr;
+      if (e) {
+        eexpr=MP_DISPATCH( Visit(e) );
+        le.add(eexpr.GetLinTerms());
+        if (std::fabs(eexpr.constant_term())!=0.0) {
+          /// Not using objective constant, should we?
+          le.add_term(1.0, MakeFixedVar(eexpr.constant_term()));
+        }
       }
-    }
-    /// Sort/merge terms, otherwise we lose repeated terms
-    /// in Gurobi where we just set 'obj attributes'
-    /// to variables
-    le.sort_terms();
-    eexpr.GetQPTerms().sort_terms();
-    /// Propagate context
-    auto ctx = obj::MAX==obj.type() ? Context::CTX_POS : Context::CTX_NEG;
-    GetFlatCvt().PropagateResult2LinTerms(le,
-                                          GetFlatCvt().MinusInfty(),
-                                          GetFlatCvt().Infty(), ctx);
-    GetFlatCvt().PropagateResult2QuadTerms(eexpr.GetQPTerms(),
-                                           GetFlatCvt().MinusInfty(),
-                                           GetFlatCvt().Infty(), ctx);
-    /// Add linear / quadratic obj
-    LinearObjective lo { obj.type(),
-          std::move(le.coefs()), std::move(le.vars()) };
-    GetFlatCvt().AddObjective(
+      /// Sort/merge terms, otherwise we lose repeated terms
+      /// in Gurobi where we just set 'obj attributes'
+      /// to variables.
+      /// Context is propagated after adding all objectives.
+      eexpr.GetQPTerms().sort_terms();
+      if (!GetFlatCvt().IfPassQuadObj()            // SCIP 10
+          && eexpr.GetQPTerms().size()) {
+        EExpr qpnew;
+        qpnew.GetQPTerms() = std::move(eexpr.GetQPTerms());
+        int qpres = Convert2Var(std::move(qpnew));
+        eexpr.GetQPTerms().clear();                // explicitly remove obj qp terms
+        le.add_term(1.0, qpres);
+      }
+      le.sort_terms();                             // in the end
+      if (GetFlatCvt().HasInitExpression(le)       // Add "_flat_" if expr args
+          || GetFlatCvt().HasInitExpression(eexpr.GetQPTerms()))
+        obj_trg_nodes.ReplaceNameChunk(-1, "flat");
+      /// Add linear / quadratic obj
+      LinearObjective lo { obj.type(),
+                         std::move(le.coefs()), std::move(le.vars()) };
+      GetFlatCvt().AddObjective(
           QuadraticObjective{std::move(lo),
                              std::move(eexpr.GetQPTerms())});
+    } catch (const std::exception& exc) {
+      MP_RAISE(fmt::format(
+          "Error flattening objective _obj[{}]:\n  {}", i_obj, exc.what()));
+    }
   }
 
   /// Convert an algebraic constraint
+  /// Pass two-term linear constraints to the FlatConverter,
+  /// which records variable-bound implications (cvt:pre:vbnd).
+  /// Done before flattening, as comparisons can be flattened
+  /// earlier than such rows (e.g., in objectives).
+  void ScanVarBoundRows() {
+    for (int i = 0; i < GetModel().num_algebraic_cons(); ++i) {
+      auto con = GetModel().algebraic_con(i);
+      const auto& le = con.linear_expr();
+      if (con.nonlinear_expr() || 2 != le.num_terms())
+        continue;
+      GetFlatCvt().NoteVarBoundRow(le.coef(0), le.var_index(0),
+                                   le.coef(1), le.var_index(1),
+                                   con.lb(), con.ub());
+    }
+  }
+
+  /// Pass root disjunctions  x <= a || x >= b  on one variable
+  /// to the FlatConverter as domain holes (cvt:pre:vbnd bit 2)
+  void ScanDomainHoles() {
+    for (int i = 0; i < GetModel().num_logical_cons(); ++i) {
+      auto e = GetModel().logical_con(i).expr();
+      if (expr::OR != e.kind())
+        continue;
+      auto disj = Cast<BinaryLogicalExpr>(e);
+      const auto s1 = HalfLine(disj.lhs()), s2 = HalfLine(disj.rhs());
+      if (s1.var_ >= 0 && s1.var_ == s2.var_ && s1.low_ != s2.low_)
+        GetFlatCvt().NoteDomainHole(s1.var_,
+                                    s1.low_ ? s1.bnd_ : s2.bnd_,
+                                    s1.low_ ? s2.bnd_ : s1.bnd_, i);
+    }
+  }
+
+  /// A half-line  x <= bnd_  (low_) or  x >= bnd_
+  struct HalfLineInfo {
+    int var_ {-1};
+    bool low_ {false};
+    double bnd_ {0.0};
+  };
+
+  /// If \a e is  x <= c,  x >= c,  or  x == c  at a bound of x,
+  /// its half-line, otherwise var_ < 0
+  HalfLineInfo HalfLine(LogicalExpr e) {
+    auto rel = Cast<RelationalExpr>(e);
+    if (!rel)
+      return {};
+    auto x = Cast<Reference>(rel.lhs());
+    auto c = Cast<NumericConstant>(rel.rhs());
+    if (!x || expr::VARIABLE != x.kind() || !c)
+      return {};
+    const int v = x.index();
+    const double val = c.value();
+    switch (rel.kind()) {
+    case expr::LE: return { v, true, val };
+    case expr::GE: return { v, false, val };
+    case expr::EQ:
+      if (val == GetFlatCvt().lb(v)) return { v, true, val };
+      if (val == GetFlatCvt().ub(v)) return { v, false, val };
+      return {};
+    default: return {};
+    }
+  }
+
   void ConvertAlgCon(int i) {
-    pre::AutoLinkScope<FlatConverterType> auto_link_scope{
-      GetFlatCvt(),
-      GetValuePresolver().GetSourceNodes().GetConValues()().
+    try {
+      pre::AutoLinkScope<FlatConverterType> auto_link_scope{
+          GetFlatCvt(),
+          GetValuePresolver().GetSourceNodes().GetConValues()().
           Add()           // Just add next node -
-    };                    // assume the constraint order in NL
-    AddAlgebraicConstraint( PrepareAlgConstraint(i) );
+      };                    // assume the constraint order in NL
+      AddAlgebraicConstraint( PrepareAlgConstraint(i) );
+    } catch (const Error& err) {
+      MP_RAISE_WITH_CODE(
+          err.exit_code(), fmt::format(
+              "Algebraic constraint _scon[{}]:\n  {}",
+              i+1, err.what()));
+    } catch (const std::exception& exc) {
+      MP_RAISE(fmt::format(
+          "Error flattening algebraic constraint _scon[{}]:\n  {}",
+          i+1, exc.what()));
+    }
   }
 
   /// Algebraic constraint flattening preparation info
@@ -278,6 +609,8 @@ protected:
     pre_result.lt.sort_terms();
     pre_result.qt = std::move(ee.GetQPTerms());        // quadratic terms, if any
     pre_result.qt.sort_terms();
+    GetFlatCvt().SetNameChunk(     // Append _flat_ if nonlinear
+        con.nonlinear_expr() ? "flat" : nullptr);
     return pre_result;
   }
 
@@ -287,11 +620,24 @@ protected:
       if (pr.compl_var<0)
         AddConstraint_AS_ROOT( LinConRange{ std::move(pr.lt),
                             { pr.lb, pr.ub }} );
-      else
+      else {
+        // Add "_flat_" if expr args, similar to quadratics below.
+        GetFlatCvt().SetNameChunk(
+            (GetFlatCvt().HasInitExpression(pr.lt))
+                ? "flat" : nullptr);
         AddConstraint_AS_ROOT(
               ComplementarityLinear{
                 AffineExpr(std::move(pr.lt), pr.const_term), pr.compl_var } );
+      }
     } else {
+      // Add "_flat_" if expr args.
+      // For quadratics, we check arguments;
+      // for the linear case above, we rely on PrepareAlgCon
+      // setting chunk "flat" based on the nonlinear expression
+      GetFlatCvt().SetNameChunk(
+          (GetFlatCvt().HasInitExpression(pr.lt)
+           || GetFlatCvt().HasInitExpression(pr.qt))
+              ? "flat" : nullptr);
       if (pr.compl_var<0)
         AddConstraint_AS_ROOT( QuadConRange{
                               { std::move(pr.lt), std::move(pr.qt) },
@@ -303,26 +649,39 @@ protected:
                 { { std::move(pr.lt), std::move(pr.qt) }, pr.const_term },
                 pr.compl_var } );
     }
+    GetFlatCvt().SetNameChunk(nullptr);             // reset name chunk
   }
 
   /// Convert a logical constraint
   void ConvertLogicalCon(int i) {
-    pre::AutoLinkScope<FlatConverterType> auto_link_scope{
-      GetFlatCvt(),
-      GetValuePresolver().GetSourceNodes().GetConValues()().
+    try {
+      pre::AutoLinkScope<FlatConverterType> auto_link_scope{
+          GetFlatCvt(),
+          GetValuePresolver().GetSourceNodes().GetConValues()().
           Add()           // Just add next node -
-    };                    // assume the constraint order in NL
-    auto e = GetModel().logical_con(i);
-    const auto resvar = MP_DISPATCH( Convert2Var(e.expr()) );
-    if (GetFlatCvt().is_fixed(resvar)) {
-      if (0==GetFlatCvt().fixed_value(resvar)) {
-        MP_INFEAS("Logical constraint _slogcon["
-                  + std::to_string(i+1)
-                  + "] is false");
+      };                    // assume the constraint order in NL
+      auto e = GetModel().logical_con(i);
+      typename FlatConverterType::HoleDefiningScope hds{GetFlatCvt(), i};
+      const auto resvar = MP_DISPATCH( Convert2Var(e.expr()) );
+      if (GetFlatCvt().is_fixed(resvar)) {
+        if (0==GetFlatCvt().fixed_value(resvar)) {
+          MP_INFEAS("Constraint is false");
+        }
+      } else {
+        GetFlatCvt().FixAsTrue(resvar);
+        // No: assert(GetFlatCvt().HasInitExpression(resvar));
+        // The constraint was simplified to 1 variable
+        // see hanoi1.mod
       }
-    } else {
-      GetFlatCvt().FixAsTrue(resvar);
-      assert(GetFlatCvt().HasInitExpression(resvar));
+    } catch (const Error& err) {
+      MP_RAISE_WITH_CODE(
+          err.exit_code(), fmt::format(
+              "Logical constraint _slogcon[{}]:\n  {}",
+              i+1, err.what()));
+    } catch (const std::exception& exc) {
+      MP_RAISE(fmt::format(
+          "Error flattening logical constraint _slogcon[{}]:\n  {}",
+          i+1, exc.what()));
     }
   }
 
@@ -330,10 +689,20 @@ protected:
     GetFlatCvt().AddVarNames(GetModel().var_names());
     GetFlatCvt().AddConNames(GetModel().con_names());
     GetFlatCvt().AddObjNames(GetModel().obj_names());
+
+    /// Reset name presolve chunks
+    GetFlatCvt().SetValueNodeNameChunksAsShortTypeNames();
+    // Append "_auxvNN" for any other variables,
+    // in particular the new variables during flattening
+    GetFlatCvt().GetVarValueNode().SetNameChunk("auxv");
+  }
+
+  void Shrink() {
+    mp::Shrink(GetQP2PVisitor());
   }
 
 
-protected:
+public:
   //////////////////////////////////// VISITOR ADAPTERS /////////////////////////////////////////
 
   /// Convert an expression to an EExpr
@@ -342,12 +711,34 @@ protected:
   }
 
   /// From an expression:
-  /// Adds a result variable r and constraint r == expr
+  /// Adds a result variable r and constraint r == expr.
+  /// @note sorts terms before checking for duplicates.
   int Convert2Var(Expr e) {
     return Convert2Var( Convert2EExpr(e) );
   }
+  /// From an EExpr
   int Convert2Var(EExpr&& ee) {
     return GetFlatCvt().Convert2Var(std::move(ee));
+  }
+  /// Extract the initializing EExpr, if any,
+  /// or just put the \a var into the empty EExpr
+  EExpr Var2EExpr(int var) {
+    if (const auto pConLFC =
+        GetFlatCvt().template
+        GetInitExpressionOfType<LinearFunctionalConstraint>(var)) {
+      const auto& ae = pConLFC->GetArguments();
+      return
+          { {ae.GetLinTerms()}, {}, ae.constant_term() };
+    }
+    if (const auto pConQFC =
+        GetFlatCvt().template
+        GetInitExpressionOfType<QuadraticFunctionalConstraint>(var)) {
+      const auto& qe = pConQFC->GetArguments();
+      return
+          { {qe.GetLinTerms()}, {qe.GetQPTerms()},
+              qe.constant_term() };
+    }
+    return EExpr::Variable{ var };
   }
   /// Makes an affine expr representing just one variable
   AffineExpr Convert2VarAsAffineExpr(EExpr&& ee) {
@@ -359,6 +750,7 @@ protected:
     return Convert2VarAsAffineExpr(std::move(ee));
   }
 
+public:
   /// Generic functional expression array visitor.
   /// Assumes the arguments should be converted to variables.
   /// Can produce a new result variable/expression and
@@ -368,6 +760,56 @@ protected:
     FuncConstraint fc;
     Exprs2Vars(ea, fc.GetArguments());
     return AssignResult2Args( std::move(fc) );
+  }
+
+  /// Specialize for Div:
+  /// For constant divisor, return linear expression.
+  /// Why we need this: AMPL 20240331 does not preprocess this.
+  template <class ExprArray=std::initializer_list<Expr> >
+  EExpr VisitDivExpression(ExprArray ea) {
+    auto dividend = Convert2EExpr(*ea.begin());
+    auto it = ea.begin();
+    auto divisor = Convert2EExpr(*(++it));
+    if (divisor.is_constant()) {
+      if (!divisor.constant_term())
+        MP_RAISE("Division by 0");
+      dividend *= (1.0 / divisor.constant_term());
+      return dividend;
+    }
+    if (auto logi
+        = ConsiderLogisticFunction(std::move(dividend), std::move(divisor)))
+      return logi;
+    DivConstraint fc
+        {{ Convert2Var(std::move(dividend)), Convert2Var(std::move(divisor)) }};
+    return AssignResult2Args( std::move(fc) );
+  }
+
+  EExpr ConsiderLogisticFunction(EExpr&& dividend, EExpr&& divisor) {
+    if (recognize_logistic()
+        && 1.0 == divisor.constant_term()
+        && divisor.GetQPTerms().empty()
+        && 1 == divisor.GetLinTerms().size()
+        && 1.0 == divisor.GetLinTerms().coef(0)) {
+      if (const auto pConExp =
+          GetFlatCvt().template
+          GetInitExpressionOfType<ExpConstraint>(
+              divisor.GetLinTerms().var(0))) {
+        EExpr arg = Var2EExpr(pConExp->GetArguments()[0]);
+        arg.negate();
+        int argvar = arg.is_variable() ?
+                         arg.get_representing_variable() :
+                         Convert2Var(std::move(arg));
+        int logi = GetFlatCvt().AssignResultVar2Args(
+            LogisticConstraint{ {argvar} });
+        if (dividend.is_constant())
+          return LinTerms{ {dividend.constant_term()}, {logi} };
+        return QuadraticExpr{ {
+            {},  // linear part
+              { {1.0}, {Convert2Var(std::move(dividend))}, {logi} } },
+                             0.0 };
+      }
+    }
+    return {};
   }
 
   template <class ExprArray>
@@ -414,16 +856,46 @@ protected:
     Exprs2EExprs(ea, ee);
     ee[0].subtract(std::move(ee[1]));
     auto& lhs = ee[0];
-    lhs.sort_terms();                             // to catch duplicates
-    if (lhs.is_affine())                          // no QP terms
-      return AssignResult2Args(                   // add conditional linear constraint
+    lhs.sort_terms();                 // to catch duplicates
+// #define FULL_CONDITIONALS
+#ifdef  FULL_CONDITIONALS
+    /// This stores the compared expressions inline.
+    /// Deprecated, see #268.
+    if (lhs.is_affine())              // no QP terms
+      return AssignResult2Args(       // add conditional linear constraint
             ConditionalConstraint< LinConRhs<comp_kind> >
             { { std::move(lhs.GetLinTerms()),
                 -lhs.constant_term() } } );
-    return AssignResult2Args(                     // add conditional quadratic constraint
+    return AssignResult2Args(         // add conditional quadratic constraint
             ConditionalConstraint< QuadConRhs<comp_kind> >
             { { std::move(lhs.GetAlgConBody()),
                 -lhs.constant_term() } } );
+#else   // FULL_CONDITIONALS
+    /// Here we always compress the compared expression into a variable.
+    /// This might be substituted out when linearized, see cvt:pre:unnest.
+    bool fNegate {false};
+                       // Normalize sign. Scale too?
+    if ((lhs.GetLinTerms().size() && lhs.GetLinTerms().coef(0)<0.0)
+        || (lhs.GetQPTerms().size() && lhs.GetQPTerms().coef(0)<0.0)) {
+      lhs.negate();
+      fNegate = true;
+    }
+    auto rhs = -lhs.constant_term();
+    int cmp_var;
+    if (lhs.is_variable()) {
+      cmp_var = lhs.get_representing_variable();
+    } else {
+      lhs.constant_term(0.0);
+      cmp_var = Convert2Var(std::move(lhs));
+    }
+    if (fNegate)
+      return AssignResult2Args(    // add conditional linear constraint
+          ConditionalConstraint< LinConRhs<-comp_kind> >
+          { { { {1.0}, {cmp_var} }, rhs } }  );
+    return AssignResult2Args(
+        ConditionalConstraint< LinConRhs<comp_kind> >
+        { { { {1.0}, {cmp_var} }, rhs } }  );
+#endif  // FULL_CONDITIONALS
   }
 
   /// Disequality visitor.
@@ -458,6 +930,7 @@ protected:
       }
     }
     // General case: represent as: Not(lhs == 0)
+#ifdef  FULL_CONDITIONALS
     auto eq = (lhs.is_affine()) ?                // no QP terms
         AssignResult2Args(  // add conditional linear constraint
               ConditionalConstraint< LinConRhs<0> >
@@ -467,9 +940,14 @@ protected:
               ConditionalConstraint< QuadConRhs<0> >
               { { std::move(lhs.GetAlgConBody()),
                   -lhs.constant_term() } } );
-    assert(eq.is_variable());
-    return AssignResult2Args(
+#else
+    auto eq = VisitRelationalExpression<0>(ea);
+#endif
+    if (eq.is_variable())
+      return AssignResult2Args(
           NotConstraint({eq.get_representing_variable()}));
+    assert( eq.is_constant() );
+    return EExpr::Constant{ 1.0 - eq.constant_term() };
   }
 
   /// Convert array of Expr's to array of EExpr's
@@ -490,26 +968,67 @@ public:          // need to be public due to CRTP
     return EExpr::Constant{ n.value() };
   }
 
+  /// @todo constant if lb>=ub and cvt:pre:all?
   EExpr VisitVariable(Reference r) {
     return EExpr::Variable{ r.index() };
   }
 
+  /// If the DefVar can be eliminated
+  bool CanElimCommonExpr(Reference r) const override final {
+    const auto index = r.index();
+    auto ce = GetCommonExpr(index);
+    return CanElimCommonExpr(ce);
+  }
+
+  /// If the DefVar can be eliminated
+  bool CanElimCommonExpr(typename Problem::CommonExpr ce) const {
+    return
+        2==defvarelim()         // always inline
+        || (1==defvarelim()
+            && ce.position());  // used only 1x. @todo own ref count #153
+  }
+
+  /// Get the common expr
+  typename Problem::CommonExpr
+  GetCommonExpr(int index) const override final {
+    auto ce = MPCD( GetModel() ).common_expr(index);
+    MP_ASSERT_ALWAYS(ce.is_known(),
+                     fmt::format(
+                         "Defined variable {} not provided in the input.\n"
+                         "Please contact AMPL support.",
+                         index));
+    return ce;
+  }
+
   EExpr VisitCommonExpr(Reference r) {
     const auto index = r.index();
+    auto ce = GetCommonExpr(index);
+    bool dvelim = CanElimCommonExpr(ce);
     if (index >= (int)common_exprs_.size()) {
       assert(index < GetModel().num_common_exprs());
       common_exprs_.resize(
                   GetModel().num_common_exprs(),
                   -1);          // init by -1, "no variable"
+      if (defvarelim())
+        common_ee_.resize(common_exprs_.size());
     }
     if (common_exprs_[index]<0) {                 // not yet converted
-      auto ce = MP_DISPATCH( GetModel() ).common_expr(index);
       EExpr eexpr( ToLinTerms(ce.linear_expr()) );
       if (ce.nonlinear_expr())
         eexpr.add( Convert2EExpr(ce.nonlinear_expr()) );
-      common_exprs_[index] = Convert2Var(std::move(eexpr));
+      if (dvelim) {             // provide the eexpr itself
+        common_exprs_[index] = 0;
+        assert((int)common_ee_.size() > index);
+        common_ee_[index] = std::move(eexpr);
+      } else {                           // convert 2 var
+        auto resvar = common_exprs_[index] =
+            Convert2Var(std::move(eexpr));
+        GetFlatCvt().MarkAsExplicitDV(resvar);  // explicify
+      }
     }
-    return EExpr::Variable{ common_exprs_[index] };
+    if (dvelim)                  // return EExpr which can be substituted
+      return common_ee_[index];
+    return EExpr::Variable{ common_exprs_[index] }; // return result var
   }
 
   EExpr VisitMinus(UnaryExpr e) {
@@ -519,36 +1038,100 @@ public:          // need to be public due to CRTP
   }
 
   EExpr VisitAdd(BinaryExpr e) {
-    auto ee = Convert2EExpr(e.lhs());
-    ee.add( Convert2EExpr(e.rhs()) );
-    return ee;
+    BucketAccumulator<EExpr> ba;
+    ba.Add( Convert2EExpr(e.lhs()) );
+    ba.Add( Convert2EExpr(e.rhs()) );
+    return ba.ExtractSum();
   }
 
   EExpr VisitSub(BinaryExpr e) {
-    auto el = Convert2EExpr(e.lhs());
+    BucketAccumulator<EExpr> ba;
+    ba.Add( Convert2EExpr(e.lhs()) );
     auto er = Convert2EExpr(e.rhs());
     er.negate();
-    el.add(er);
-    return el;
+    ba.Add( std::move(er) );
+    return ba.ExtractSum();
   }
 
   EExpr VisitMul(BinaryExpr e) {
+    if (prepro_products()
+        || recognize_signpow()) {
+      PreproProd<Impl> preprod(*(Impl*)this);
+      return preprod.FlattenProduct(e);
+    }
     auto el = Convert2EExpr(e.lhs());
     auto er = Convert2EExpr(e.rhs());
     return QuadratizeOrLinearize( el, er );
   }
 
   EExpr VisitDiv(BinaryExpr e) {
-    return VisitFunctionalExpression<DivConstraint>(
+    return VisitDivExpression(
           { e.lhs(), e.rhs() });
   }
 
   EExpr VisitSum(typename BaseExprVisitor::SumExpr expr) {
-    EExpr sum;              // Add up the elements' AffExpressions
+    if (GetFlatCvt().IfParseQPIn2Passes()) {
+#ifdef DEBUG_QP2PASSES
+      static int depth=0;
+      ++depth;
+      {
+        fmt::MemoryWriter wrt;
+        wrt << "FLATTEN: ";
+        WriteExpr<typename ProblemType::ExprTypes>(
+            wrt, LinearExpr{}, Cast<NumericExpr>(expr),
+            GetModel().GetVarNamer());
+        fmt::print("{:{}}{}\n", "", depth*2, wrt.str());
+      }
+#endif
+      QP2Passes qp2p {*this, GetQP2PVisitor()};
+      qp2p.Process(expr);
+      // return qp2p.GetResult();
+      auto ee1 = qp2p.GetResult();
+      ++ n_qp2pass_runs_;
+      n_qp2pass_complete_runs_ += qp2p.Was2Pass();
+      n_qp2pass_bucket_runs_ += !qp2p.Was2Pass();
+      n_qp2pass_outmult_ = qp2p.NumOutMults();
+      sum_qp2pass_qpterms_ += ee1.GetQPTerms().size();
+#ifdef DEBUG_QP2PASSES
+      {
+        fmt::MemoryWriter wrt;
+        BucketAccumulator<EExpr> bucketaccum(expr.num_args());
+        for (auto i =
+             expr.begin(), end = expr.end(); i != end; ++i)
+          bucketaccum.Add( MP_DISPATCH( Convert2EExpr(*i) ) );
+        auto ee2 = bucketaccum.ExtractSum();
+        wrt << "FLAT DONE: ";
+        WriteExpr<typename ProblemType::ExprTypes>(
+            wrt, LinearExpr{}, Cast<NumericExpr>(expr),
+            GetModel().GetVarNamer());
+        fmt::print("{:{}}{}\n{:{}}RESULT: ",
+                   "", depth*2,  wrt.str(), "", depth*2);
+        wrt.clear();
+        wrt << ee1.constant_term() << " + ";
+        WriteModelItem(wrt, ee1.GetBody(), GetFlatCvt().GetVarNamer());
+        fmt::print("{}\n", wrt.str());
+        wrt.clear();
+        wrt << ee2.constant_term() << " + ";
+        WriteModelItem(wrt, ee2.GetBody(), GetFlatCvt().GetVarNamer());
+        fmt::print("{:{}}RESULT_BUCKETS: {}\n",
+                   "", depth*2,  wrt.str());
+        MP_ASSERT_ALWAYS(ee1 == ee2, "AAAKKKAAAAK ... ");
+      }
+      --depth;
+#endif
+      return ee1;
+    }  // else
+    auto n_outm_0 = n_qp_outmult_;
+    BucketAccumulator<EExpr> bucketaccum(expr.num_args());
     for (auto i =
          expr.begin(), end = expr.end(); i != end; ++i)
-      sum.add( MP_DISPATCH( Convert2EExpr(*i) ) );
-    return sum;
+      bucketaccum.Add( MP_DISPATCH( Convert2EExpr(*i) ) );
+    auto result = bucketaccum.ExtractSum();
+    ++ n_visitsum_bucket_runs_;
+    // This includes out-mults in any nested expressions:
+    n_visitsum_bucket_outmults_ += (n_qp_outmult_ - n_outm_0);
+    sum_visitsum_bucket_qpterms_ += result.GetQPTerms().size();
+    return result;
   }
 
   EExpr VisitMax(typename BaseExprVisitor::VarArgExpr e) {
@@ -562,6 +1145,65 @@ public:          // need to be public due to CRTP
 
   EExpr VisitAbs(UnaryExpr e) {
     return VisitFunctionalExpression<AbsConstraint>({ e.arg() });
+  }
+
+  EExpr VisitFloor(UnaryExpr e) {
+    return VisitFunctionalExpression<FloorConstraint>({ e.arg() });
+  }
+
+  EExpr VisitCeil(UnaryExpr e) {
+    return VisitFunctionalExpression<CeilConstraint>({ e.arg() });
+  }
+
+  /// x div y = trunc(x / y)
+  EExpr VisitTruncDiv(BinaryExpr e) {
+    return VisitFunctionalExpression<IntDivConstraint>({ e.lhs(), e.rhs() });
+  }
+
+  /// x mod y = x - y * (x div y)
+  EExpr VisitMod(BinaryExpr e) {
+    return VisitFunctionalExpression<ModConstraint>({ e.lhs(), e.rhs() });
+  }
+
+  /// round(x, n) = round(x * 10^n) / 10^n, ties to even
+  EExpr VisitRound(BinaryExpr e) { return VisitRoundOrTrunc(e, true); }
+
+  /// trunc(x, n) = trunc(x * 10^n) / 10^n
+  EExpr VisitTrunc(BinaryExpr e) { return VisitRoundOrTrunc(e, false); }
+
+  /// round(x, n) or trunc(x, n), n a constant integer
+  EExpr VisitRoundOrTrunc(BinaryExpr e, bool f_round) {
+    auto en = Convert2EExpr(e.rhs());
+    const auto n = en.constant_term();
+    if (!en.is_constant() || n != std::round(n) || std::fabs(n) > 300.0)
+      MP_RAISE(fmt::format(
+                 "{}(x, n): n should be a constant integer in [-300, 300]",
+                 f_round ? "round" : "trunc"));
+    const double scale = std::pow(10.0, n);
+    auto ex = Convert2EExpr(e.lhs());
+    ex *= scale;
+    const int x = Convert2Var(std::move(ex));
+    EExpr result = Var2EExpr( f_round
+        ? GetFlatCvt().AssignResultVar2Args(RoundConstraint{ {x} })
+        : TruncVar(x) );
+    result *= 1.0 / scale;
+    return result;
+  }
+
+  /// trunc(x): floor for x >= 0, ceil for x <= 0
+  int TruncVar(int x) {
+    auto& cvt = GetFlatCvt();
+    if (cvt.is_var_integer(x))
+      return x;
+    if (cvt.lb(x) >= 0.0)
+      return cvt.AssignResultVar2Args(FloorConstraint{ {x} });
+    if (cvt.ub(x) <= 0.0)
+      return cvt.AssignResultVar2Args(CeilConstraint{ {x} });
+    const int fl = cvt.AssignResultVar2Args(FloorConstraint{ {x} });
+    const int ce = cvt.AssignResultVar2Args(CeilConstraint{ {x} });
+    const int pos = cvt.AssignResultVar2Args(       // x >= 0
+          CondLinConGE{ { {{1.0}, {x}}, 0.0 } });
+    return cvt.AssignResultVar2Args(IfThenConstraint{ {pos, fl, ce} });
   }
 
   EExpr VisitLogicalConstant(LogicalConstant c) {
@@ -603,6 +1245,9 @@ public:          // need to be public due to CRTP
     return VisitFunctionalExpression<AndConstraint>(e);
   }
 
+  /// @note AMPL presents (e ==> f) as (!e || or).
+  /// We leave it so because seems better with Gurobi 13
+  /// and equally good with Knitro 15.1.0, see #153.
   EExpr VisitOr(BinaryLogicalExpr e) {
     return VisitFunctionalExpression<OrConstraint>({ e.lhs(), e.rhs() });
   }
@@ -674,23 +1319,23 @@ public:          // need to be public due to CRTP
   ////////////////////////////////////////////////////
   EExpr VisitPowConstExp(BinaryExpr e) {
     auto c = Cast<NumericConstant>(e.rhs()).value();
-    if (2.0==c && IfQuadratizePow2()) {
-      auto el = Convert2EExpr(e.lhs());
+    auto el = Convert2EExpr(e.lhs());
+    if (2.0==c && IfQuadratizePow2(el)) {
       return QuadratizeOrLinearize(el, el);
     }
-    return AssignResult2Args( PowConstraint(
-      PowConstraint::Arguments{ Convert2Var(e.lhs()) },
-      PowConstraint::Parameters{ c } ) );
+    return AssignResult2Args( PowConstExpConstraint(
+        PowConstExpConstraint::Arguments{ Convert2Var(std::move(el)) },
+        PowConstExpConstraint::Parameters{ c } ) );
   }
 
   EExpr VisitPow2(UnaryExpr e) {
-    if (IfQuadratizePow2()) {
-      auto el = Convert2EExpr(e.arg());
+    auto el = Convert2EExpr(e.arg());
+    if (IfQuadratizePow2(el)) {
       return QuadratizeOrLinearize(el, el);
     }
-    return AssignResult2Args( PowConstraint(
-      PowConstraint::Arguments{ Convert2Var(e.arg()) },
-      PowConstraint::Parameters{ 2.0 } ) );
+    return AssignResult2Args( PowConstExpConstraint(
+        PowConstExpConstraint::Arguments{ Convert2Var(std::move(el)) },
+        PowConstExpConstraint::Parameters{ 2.0 } ) );
   }
 
   EExpr VisitPow(BinaryExpr e) {
@@ -698,24 +1343,29 @@ public:          // need to be public due to CRTP
     auto er = Convert2EExpr(e.rhs());
     if (er.is_constant()) {
       if (2.0==er.constant_term() &&
-          IfQuadratizePow2()) {
+          IfQuadratizePow2(el)) {
         return QuadratizeOrLinearize(el, el);
       }
       return AssignResult2Args(
-            PowConstraint(
-              PowConstraint::Arguments{ Convert2Var(std::move(el)) },
-              PowConstraint::Parameters{ er.constant_term() } ) );
+          PowConstExpConstraint(
+              PowConstExpConstraint::Arguments{ Convert2Var(std::move(el)) },
+              PowConstExpConstraint::Parameters{ er.constant_term() } ) );
     }
     else if (el.is_constant())
       return VisitPowConstBase(e);
     else
-      MP_RAISE("Unsupported: operator ^ with variable base and exponent");
+      return AssignResult2Args(
+          PowConstraint(
+              PowConstraint::Arguments{ {
+                                        Convert2Var(std::move(el)),
+                                        Convert2Var(std::move(er)) } },
+              {} ) );
   }
 
   EExpr VisitSqrt(UnaryExpr e) {
-    return AssignResult2Args( PowConstraint(
-      PowConstraint::Arguments{ Convert2Var(e.arg()) },
-      PowConstraint::Parameters{ 0.5 } ) );
+    return AssignResult2Args( PowConstExpConstraint(
+      PowConstExpConstraint::Arguments{ Convert2Var(e.arg()) },
+      PowConstExpConstraint::Parameters{ 0.5 } ) );
   }
 
   EExpr VisitExp(UnaryExpr e) {
@@ -786,8 +1436,15 @@ public:          // need to be public due to CRTP
     return VisitFunctionalExpression<AtanhConstraint>({ e.arg() });
   }
 
+  EExpr VisitCall(CallExpr ce) {
+    CallConstraint cc;  // @todo Modify VisitFunctionalExpr <- params
+    cc.GetParameters()[0] = ce.function().index();
+    Exprs2Vars(ce, cc.GetArguments());
+    return AssignResult2Args( std::move(cc) );
+  }
 
-protected:         // More utilities
+
+public:         // More utilities
   void ConvertSOSConstraints() {
     if (sos()) {
       auto sosno = GetModel().
@@ -812,42 +1469,55 @@ protected:         // More utilities
   void ConvertSOSCollection(ArrayRef<int> sosno, ArrayRef<double> ref,
                             bool fAllSOS2) {
     assert(sosno.size() == ref.size());
-    std::map< int, std::multimap< double, int > > sos_map;
+    std::map< int,       // pair.first: N repeated zeros
+        std::pair< int, std::map< double, int > > > sos_map;
     for (auto i=ref.size(); i--; )
-      if (sosno[i] &&
-          ref[i]) {        // AMPL 2022 can produce SOS groups with all weights 0
+      if (sosno[i]) {
         auto& sos_group = sos_map[sosno[i]];
-        if (sos_group.end() != sos_group.find(ref[i])) {
-          GetFlatCvt().AddWarning( "SOS_repeated_weight",
-                                   "An SOS/SOS2 constraint has repeated weights, "
-                                   "solver might reject it" );
+        if (!sos_group.second.insert( {ref[i], i} ).second) {
+          if (!fAllSOS2 || ref[i]) // weights 0 for all: redundant PL linearization
+            MP_RAISE(
+                  fmt::format(
+                    "SOS/SOS2 constraint {} has repeated weight {}",
+                    sosno[i], ref[i]));
+          else
+            ++sos_group.first;
         }
-        sos_group.insert( {ref[i], i} );
       }
     for (const auto& group: sos_map) {
-      std::vector<int> vars;
-      vars.reserve(group.second.size());
-      std::vector<double> weights;
-      weights.reserve(group.second.size());
-      for (const auto& wv: group.second) {
-        weights.push_back(wv.first);
-        vars.push_back(wv.second);
+      if (group.second.second.size()
+          && group.second.first
+          && group.second.second.begin()->first)  // key non-0
+        MP_RAISE(
+              fmt::format(
+                "SOS/SOS2 constraint {} has repeated 0 weights", group.first));
+      if (group.second.second.size()>1) {
+        std::vector<int> vars;
+        vars.reserve(group.second.second.size());
+        std::vector<double> weights;
+        weights.reserve(group.second.second.size());
+        for (const auto& wv: group.second.second) {
+          weights.push_back(wv.first);
+          vars.push_back(wv.second);
+        }
+        auto emptylinker = GetFlatCvt().MakeEmptyLinker(
+            GetFlatCvt().GetVarValueNode().Select(0));     // dummy
+        if (group.first<0 || fAllSOS2)
+          AddConstraint(
+                SOS2Constraint(vars, weights,
+                               fAllSOS2 ?    // for linearized PL
+                                             SOSExtraInfo{{1.0, 1.0}} :
+                                             SOSExtraInfo{},
+                               (fAllSOS2 ? "SOS2_PL_" : "SOS2_")
+                               + std::to_string(group.first)
+                               + '_'));
+        else
+          AddConstraint(
+                SOS1Constraint(vars, weights,
+                               "SOS1_"
+                               + std::to_string(group.first)
+                               + '_'));
       }
-      if (group.first<0 || fAllSOS2)
-        AddConstraint(
-              SOS2Constraint(vars, weights,
-                             fAllSOS2 ?    // for linearized PL
-                               SOSExtraInfo{{1.0, 1.0}} :
-                               SOSExtraInfo{},
-                             (fAllSOS2 ? "SOS2_PL_" : "SOS2_")
-                             + std::to_string(group.first)
-                             + '_'));
-      else
-        AddConstraint(
-              SOS1Constraint(vars, weights,
-                             "SOS1_"
-                             + std::to_string(group.first)
-                             + '_'));
     }
   }
 
@@ -863,7 +1533,7 @@ protected:         // More utilities
       el = Convert2AffineExpr(std::move(el));      // will convert to a new var now
     if (!er.is_affine() && !el.is_constant())
       er = Convert2AffineExpr(std::move(er));
-    if (!IfQuadratizePow2() &&
+    if (!IfQuadratizePow2(el) &&
         !er.is_constant() && !el.is_constant() &&
         er.GetLinTerms().size() == el.GetLinTerms().size()) {
       const auto& ellt = el.GetLinTerms();
@@ -880,14 +1550,18 @@ protected:         // More utilities
       }
     }  // Otherwise, we proceed to store proper multiplication,
     // unless the result is affine
-    if (!IfMultOutQPTerms() &&
-        !er.is_constant() && !el.is_constant() ) {
+    if (er.GetLinTerms().size() && el.GetLinTerms().size()  // both linear
+        && (!IfMultOutQPTerms()
+            || !IfMultOutQPTerms(el.GetLinTerms(), er.GetLinTerms()))) {
       // Create a separate QC with this product.
       // This is handy if we are walking the objective,
       // as MIPFlatCvt only linearizes QC.
       return DontMultOut(std::move(el), std::move(er));
     }
-    return MultiplyOut(el, er);   // Quadratize
+    auto result = MultiplyOut(el, er);   // Quadratize
+    ++ n_qp_outmult_;
+    sum_qp_outmult_qpterms_ += result.GetQPTerms().size();
+    return result;
   }
 
   /// (9*x) * x -> 9 x^2
@@ -896,7 +1570,7 @@ protected:         // More utilities
            ellt.var(0) == erlt.var(0));
     auto coef = ellt.coef(0) * erlt.coef(0);
     auto pow2var = GetFlatCvt().AssignResultVar2Args(
-          PowConstraint{ {{ellt.var(0)}}, {2.0} });
+          PowConstExpConstraint{ {{ellt.var(0)}}, {2.0} });
     return { coef, pow2var };
   }
 
@@ -904,7 +1578,7 @@ protected:         // More utilities
   EExpr Convert2Pow2(EExpr&& el) {
     auto affexpr2var = Convert2Var( std::move(el) );
     auto pow2var = GetFlatCvt().AssignResultVar2Args(
-          PowConstraint{ {{affexpr2var}}, {2.0} });
+          PowConstExpConstraint{ {{affexpr2var}}, {2.0} });
     return EExpr::Variable{ pow2var };
   }
 
@@ -913,60 +1587,57 @@ protected:         // More utilities
   EExpr DontMultOut(EExpr&& el, EExpr&& er) {
     const auto& ellt = el.GetLinTerms();
     const auto& erlt = er.GetLinTerms();
-    if (1 == ellt.size() && 1 == erlt.size() &&   // a variable in el and er
-        0.0 == er.constant_term() && 0.0 == el.constant_term()) {
-      auto coef = ellt.coef(0) * erlt.coef(0);
-      auto qc_res = GetFlatCvt().AssignResultVar2Args(
-            QuadraticFunctionalConstraint{ { {      // = x*y+0
-              LinTerms{},
-              QuadTerms{ {1.0}, {ellt.var(0)}, {erlt.var(0)} }
-            }, 0.0 } });
-      return { coef, qc_res };
-    }
+    assert(el.is_affine() && er.is_affine()
+           && ellt.size() && erlt.size());
     el.sort_terms();
     er.sort_terms();
-    auto qc_res = GetFlatCvt().AssignResultVar2Args(
-          QuadraticFunctionalConstraint{ { {      // = el*er+0
+    auto resvar1 = Convert2Var( std::move(el) );
+    auto resvar2 = (&el==&er || el==er)
+                       ? resvar1 : Convert2Var( std::move(er) );
+    return {                         // = el*er+0, inlined  #260
             LinTerms{},
-            QuadTerms{ {1.0},
-                       {Convert2Var( std::move(el) )},
-                       {Convert2Var( std::move(er) )} }
-          }, 0.0 } });
-    return { 1.0, qc_res };
+            QuadTerms{ {1.0}, {resvar1}, {resvar2} },
+            0.0 };
   }
 
   /// Multiply out two EEXprs
   EExpr MultiplyOut(const EExpr& el, const EExpr& er) {
-    assert((el.is_affine() && er.is_affine()) ||
-           (el.is_constant() || er.is_constant()));
-    EExpr result;
-    if (0.0!=std::fabs(er.constant_term())) {
-      result.GetLinTerms().add(el.GetLinTerms());  // no const here
-      result.GetLinTerms() *= er.constant_term();
-      result.GetQPTerms().add(el.GetQPTerms());
-      result.GetQPTerms() *= er.constant_term();
-    }
-    if (0.0!=std::fabs(el.constant_term())) {
-      {
-        auto ae2 = er.GetLinTerms();
-        ae2 *= el.constant_term();
-        result.GetLinTerms().add(ae2);
-        result.constant_term(
-              er.constant_term() * el.constant_term());
-      }
-      result.GetQPTerms().add(er.GetQPTerms());
-      result.GetQPTerms() *= el.constant_term();
-    }
-    const auto& ae1 = el.GetLinTerms();
-    const auto& ae2 = er.GetLinTerms();
-    for (auto i1 = ae1.size(); i1--; ) {
-      for (auto i2 = ae2.size(); i2--; ) {
-        result.add_term(ae1.coef(i1) * ae2.coef(i2),
-                           ae1.var(i1), ae2.var(i2) );
-      }
-    }
-    result.sort_terms();      // eliminate 0's and duplicates
-    return result;
+    return mp::MultiplyOut(el, er);
+  }
+
+  /// Number of variables in the flat model
+  int num_vars_flat() const override final
+  { return GetFlatCvt().num_vars(); }
+
+  /// Flat model variable's lower bound
+  double var_lb_flat(int i) const override final
+  { return GetFlatCvt().lb(i); }
+  /// Flat model variable's upper bound
+  double var_ub_flat(int i) const override final
+  { return GetFlatCvt().ub(i); }
+
+  /// Mutliply-out cardinality
+  double MultOutCard() const override final
+  { return GetFlatCvt().QPMultOutCard(); }
+
+  /// Flatten an expression
+  EExpr VisitVirtual(Expr e) override final
+  { return MPD( Visit(e) ); }
+
+  /// Get original BasicProblem<>
+  Problem& GetOrigProblem() override
+  { return GetModel(); }
+
+  /// Want to logicalize products of 2 binary variables?
+  bool LogicalizeProd2BinVars() const override
+  { return prepro_products()&2; }
+
+  /// Is LinTerms' result a (negated) binary?
+  bool IsBinaryOrNegatedBinary(const LinTerms& lt)
+      const override {
+    auto bnds = GetFlatCvt().ComputeBoundsAndType(lt);
+    auto pic = GetFlatCvt().ClassifyPreproInfo(bnds);
+    return pic.is_bin_or_neg_bin_;
   }
 
 
@@ -974,7 +1645,8 @@ protected:
   //////////////////////// ADD CUSTOM CONSTRAINT ///////////////////////
   //////////////////////// Takes ownership /////////////////////////////
 
-  /// Add constraint and propagate result into arguments.
+  /// Add a top-level algebraic constraint (lb <= expr <= ub)
+  /// and propagate result into arguments.
   /// Use this when any variables can be the result of an expression
   /// (flat constraint)
   template <class Constraint>
@@ -997,10 +1669,13 @@ protected:
 
 
 private:
-  std::vector<int> common_exprs_;               // should be in FlatModel
+  // @todo pass sdvar names
+  std::vector<int> common_exprs_;    // @todo should be in FlatModel?
+  std::vector<EExpr> common_ee_;     // flattened sdvars, not turned into vars
 
   int ifFltCon_ = -1;   // -1: undefined, 0: walking an expr tree in an objective,
                         // 1: in a constraint
+
 
 protected:
   /// Whether flattening a constraint vs an objective
@@ -1021,24 +1696,91 @@ protected:
 private:
   struct Options {
     int sos_ = 1;
-    int sos2_ = 1;
+    int sos2_ = 0;
   };
   Options options_;
 
+  int prepro_products_ = 1+4      // also 2 binaries for convex solvers
+                         + (GetFlatCvt().
+                                ModelAPIWantsLogicalProd2Bins() ? 2 : 0);
+  int recognize_signpow_ =
+      GetFlatCvt().ModelAPIWantsSignpow() ? 1 : 0;
+  int recognize_logistic_ =
+      GetFlatCvt().ModelAPIWantsLogistic() ? 1 : 0;
+  int dvelim_ = 2;
+  int pow2_as_qp_ = 1;
 
-protected:
+
+public:
   int sos() const { return options_.sos_; }
   int sos2_ampl_pl() const { return options_.sos2_; }
+  int prepro_products() const { return prepro_products_; }
+  int recognize_signpow() const { return recognize_signpow_; }
+  int recognize_logistic() const { return recognize_logistic_; }
+  int defvarelim() const { return dvelim_; }
+  int pow2_as_qp() const { return pow2_as_qp_; }
 
   /// Distinguish between constraints and objectives.
   /// What about common expressions?
   int IfMultOutQPTerms() const {
-    return IfFlatteningAConstraint() ?
-          GetFlatCvt().IfPassQuadCon() : GetFlatCvt().IfPassQuadObj();
+    return
+        IfFlatteningAConstraint() ?
+            GetFlatCvt().IfPassQuadCon() :
+            // For objectives, still multiply out
+            // if we move the QP terms into contraints (SCIP)
+            ( GetFlatCvt().IfPassQuadObj()
+                || GetFlatCvt().IfPassQuadCon() );
   }
 
-  /// Quadratize Pow2 exactly when we pass QP terms
-  bool IfQuadratizePow2() const { return IfMultOutQPTerms(); }
+  /// Estimate resulting QP matrix size
+  bool IfMultOutQPTerms(
+      const LinTerms& lt1, const LinTerms& lt2) const {
+    return
+        (double(lt1.size()))*lt2.size()
+           <= GetFlatCvt().QPMultOutCard();
+  }
+
+  /// Quadratize Pow2 exactly when we parse QP terms.
+  /// @note This is a generic query,
+  ///   without the specific argument.
+  bool IfQuadratizePow2() const override final {
+    bool ifAcceptsQP =
+        IfFlatteningAConstraint() ?
+            GetFlatCvt().IfPassQuadCon() :
+            // For objectives, still multiply out
+            // if we move the QP terms into contraints (SCIP)
+            ( GetFlatCvt().IfPassQuadObj()
+                            || GetFlatCvt().IfPassQuadCon() );
+    if (!ifAcceptsQP)
+      return false;            // So we can Pl-approximate
+    // pow() not desired
+    if ( !GetFlatCvt().template
+         UserAcceptsConOrExpr<PowConstExpConstraint>() )
+      return true;
+    if (!pow2_as_qp())
+      return false;
+    return true;
+  }
+
+  /// Quadratize Pow2 when we parse \a ee.
+  bool IfQuadratizePow2(const EExpr& ee) const {
+    if (!IfQuadratizePow2())
+      return false;
+    if (!ee.is_affine())
+      return false;
+    // Leave ^2 if any subexpressions - otherwise can get big.
+    // (@todo even when flattened?)
+    // (@todo only when the subexpr is not accepted as expression?)
+    // @todo Is this efficient?
+    /// @note Subexpr cannot be linfn (they are inlined when visiting)
+    for (auto arg: ee.GetLinTerms().vars()) {
+      if ( GetFlatCvt().HasInitExpression(arg)
+          &&                   // Also affine subexpr?
+          GetFlatCvt().CanBeEliminated_FastCheck(arg) )   // TODO
+        return false;
+    }
+    return true;
+  }
 
 
 public:
@@ -1049,6 +1791,14 @@ public:
 
 
 private:
+  static constexpr mp::OptionValueInfo values_dvelim[] = {
+      { "0", "Do not eliminate, always instantiate the variables.", 0},
+      { "1", "Eliminate only those used once.", 1},
+      { "2", "(Default). Always substitute where possible, even if the variable needs "
+            "to be instantiated for use in other places. "
+            "Can introduce redundancy but proves efficient in many cases.", 2}
+  };
+
   void InitOwnOptions() {
     GetEnv().AddOption("cvt:sos sos",
         "0/1*: Whether to honor declared suffixes .sosno and .ref describing "
@@ -1059,10 +1809,57 @@ private:
         "corresponding reference values used to order the variables.",
         options_.sos_, 0, 1);
     GetEnv().AddOption("cvt:sos2 sos2",
-        "0/1*: Whether to honor SOS2 constraints for nonconvex "
+        "0*/1: Whether to honor SOS2 constraints for nonconvex "
         "piecewise-linear terms, using suffixes .sos and .sosref "
-        "provided by AMPL.",
+        "provided by AMPL. Currently under rework; we recommend "
+                       "to switch off PL expression linearization "
+                       "in AMPL (option pl_linearize 0).",
         options_.sos2_, 0, 1);
+    GetEnv().AddOption("cvt:pre:prod cvt:prod",
+                       fmt::format("Product preprocessing flags. "
+                       "Sum of a subset of the following bits:\n"
+                       "\n"
+                       "| 1 - Quadratize higher-order products in the "
+                       "      following order: integer terms first, "
+                       "      then real-valued ones; in each group, "
+                       "      smaller-range terms first.\n"
+                       "| 2 - Logicalize products of 2 binary terms. Logicalizing "
+                       "      means that the product is converted to a conjunction. "
+                       "      If the solver does not support it natively (see acc:and), "
+                       "      the conjunction is linearized.\n"
+                       "| 4 - Logicalize products of >=3 binary terms.\n"
+                       "\n"
+                       "Default: {}.\n"
+                       "\n"
+                                   "Bits 2 or 4 imply bit 1.", prepro_products_).c_str(),
+                       prepro_products_, 0, 1023);
+    GetEnv().AddStoredOption("cvt:pre:signpow cvt:signpow",
+                             recognize_signpow() ?
+                             "0/1*: recognize signpow() functions in the model, "
+                                                   "such as abs(x)*x, see acc:signpow." :
+                             "0*/1: recognize signpow() functions in the model, "
+                                                   "such as abs(x)*x, see acc:signpow.",
+                             recognize_signpow_, 0, 1);
+    GetEnv().AddStoredOption("cvt:pre:logistic cvt:logistic",
+                             recognize_logistic() ?
+                                 "0/1*: recognize logistic functions in the model, "
+                                 "see acc:logistic." :
+                                 "0*/1: recognize logistic functions in the model, "
+                                 "see acc:logistic.",
+                             recognize_logistic_, 0, 1);
+    GetEnv().AddStoredOption("cvt:dvelim dvelim",
+                             "Eliminate AMPL defined variables "
+                             "by substitution into linear, quadratic, and polynomial "
+                             "expressions:\n"
+                             "\n.. value-table::\n"
+                             "\nSee also cvt:pre:unnest, as well as AMPL options linelim and substout.",
+                             dvelim_, values_dvelim);
+    GetEnv().AddStoredOption("cvt:pow2_as_qp pow2_as_qp pow2asqp",
+                             "0/1*: whenever both quadratics and ^2 are accepted, "
+                             "submit (expr)^2 as out-multiplied quadratics, "
+                             "if (expr) is linear.\n\nSee also cvt:multoutcard, "
+                             "cvt:quadobj, cvt:quadcon.",
+                             pow2_as_qp_, 0, 1);
   }
 
 
@@ -1076,13 +1873,32 @@ public:
   /// The model as input from NL
   ProblemType& GetInputModel() { return GetModel(); }
 
+  /// The flat converter
   const FlatConverter& GetFlatCvt() const { return flat_cvt_; }
   FlatConverter& GetFlatCvt() { return flat_cvt_; }
 
+  /// The QP2Passes parser
+  const QP2PassVisitor&
+  GetQP2PVisitor() const { return *p_qp2p_visitor_; }
+  QP2PassVisitor&
+  GetQP2PVisitor() { return *p_qp2p_visitor_; }
 
 private:
   ProblemType model_;
   FlatConverter flat_cvt_;
+  QP2PassVisitor* p_qp2p_visitor_ = MakeQP2PassVisitor(*this);
+
+  /// stats
+  long long n_qp2pass_runs_ {},
+      n_qp2pass_complete_runs_ {},
+      n_qp2pass_bucket_runs_ {},
+      n_qp2pass_outmult_ {},
+      sum_qp2pass_qpterms_ {},
+      n_visitsum_bucket_runs_ {},
+      n_visitsum_bucket_outmults_ {},
+      sum_visitsum_bucket_qpterms_ {},
+      n_qp_outmult_ {},
+      sum_qp_outmult_qpterms_ {};
 };
 
 

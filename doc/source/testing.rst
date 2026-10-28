@@ -7,7 +7,7 @@ Testing
 Ensure the major functionality of your driver is tested by :ref:`running
 end-to-end tests <run_end2end_tests>`. :ref:`Add your own test cases
 <add_new_test_cases>` for essential functions.
-:ref:`Unit tests <unit_tests>` can be used as well.
+:ref:`Unit tests <unit_tests>` should be used as well.
 
 
 End-to-end tests
@@ -25,15 +25,29 @@ Run end-to-end tests
 
   .. code-block:: console
 
-      python3 test/end2end/run.py solver [another_solver [...]]
+      python3 test/end2end/run.py solver [another_solver [...]] [--options 'acc:max=0']
 
-  The ``solver`` and ``ampl`` executables are expected to be on the system path.
+  The ``solver`` and ``ampl`` executables are expected to be on the system path,
+  or use options ``--ampl``, ``--bin_path``.
 
 * Detailed results are saved into a CSV report file, see ``--reportstub``.
 
 * To run a **subset of the test cases**, ``cd`` into the corresponding
   subfolder of ``test/end2end/cases``, or use the ``--dir`` or
   ``--nonrecursive`` options.
+
+
+Compulsory configurations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The following test configurations are compulsory for a release.
+
+* All important/representative solvers. While some tests use `acc:...` options
+  to enforce linearization etc., open-source solvers use it everywhere.
+  If desired, such options can be passed to all test cases using the `--options` switch,
+  e.g., `--options 'acc:indle=0 acc:indge=0 acc:indeq=0 acc:and=0 acc:or=0'`.
+
+* Using solution checker with `--options "chk:fail chk:feastol=1e-2[ chk:mode=1023]"`.
 
 
 Add solver to the test library
@@ -57,10 +71,15 @@ Folder :file:`test/end2end/cases/categorized/fast` contains test cases
 which can be run in a few seconds for this purpose, which should be done
 frequently.
 
-To **add new test cases**, add the model/data/AMPL script files in
+To **add new test cases**, add the model/data/AMPL script/NL files in
 a subfolder of :file:`test/end2end/cases/categorized/` and describe
 them in the local ``modellist.json`` having the following format.
-The top JSON
+
+
+Test specification
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In ``modellist.json``, the top JSON
 object is an array of test cases. Each element is a dictionary with the
 following items, where non-compulsory items are italicized:
 
@@ -73,6 +92,10 @@ following items, where non-compulsory items are italicized:
 * **"tags": ["linear", "continuous"]**: tags specifying model type, the case
   is executed only if the tags are a subset of the solver's ones. Except the
   tag **"run"** which means the test case is an AMPL script.
+  List **"continuous"** whenever the model has continuous variables
+  (including AMPL's ``var x in 1..9``): drivers for integer models only
+  skip such cases. Tag **"mpdriver"** marks a case that needs an MP driver
+  (MP options or MP's handling of invalid options).
 
 * *"files": ["diet.mod", "diet.dat"]*
 
@@ -80,21 +103,102 @@ following items, where non-compulsory items are italicized:
 
 * *"options": { "ANYSOLVER_options": "iisfind=1", "baron_options": "iisfind=12", "send_statuses": "0" }*.
   Option key ending with ``ANYSOLVER_options`` is for any solver, except when
-  a solver-specific key is present (like ``baron_options``.)
+  a solver-specific key is present (like ``baron_options``).
+  Moreover, ``mp_options`` applies to all MP drivers.
+  ASL drivers skip cases with ``mp_options`` or with MP (namespaced)
+  options such as ``cvt:bigm=1e5`` in their options; an ASL driver built
+  with the MP2NL wrapper runs them through MP2NL (solver classes
+  ``baron``, ``conopt``, ``knitro``, ``lindoglobal``, ``gurobiaslmp2nl``,
+  ``xpressaslmp2nl``, ``cplexaslmp2nl``): ``mp2nl=1`` is passed in the
+  driver's options, and the case's options go to ``mp2nl_options``.
 
 * *"values": { "X[0].iis": "upp", ... }*. Expected values or expressions,
-  in the form AMPL ``display`` command would accept.
+  in the form AMPL ``display`` command would accept. Only available for AMPL
+  models / scripts. Example:
 
-  * For example, to check *logical expressions*, use if/then:
+  .. code-block:: json
+
+      "values": {
+        "if color['Belgium'] != color['France'] then 1": 1,
+        "if (forall {s in NS} (VAL_U_F2[s] = 1  ==>  U_F2[s] >= 0.0001  else  U_F2[s] = 0)) then 1": 1,
+        "abs(x)": { "max": 1e-3 },
+        "solve_result_num": 0
+      }
+
+  In particular:
+
+  * The *expected value* can be a dictionary of the form `{ "min": ..., "max": ... }`:
 
     .. code-block:: json
 
-        "values": {
-          "if color['Belgium'] != color['France'] then 1": 1,
-          "if (forall {s in NS} (VAL_U_F2[s] = 1  ==>  U_F2[s] >= 0.0001  else  U_F2[s] = 0)) then 1": 1,
-          "if abs(x) < 1e-3 then 1": 1,
-          "solve_result_num": 0
-        }
+        "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+        "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+
+    This checks all complementarity and algebraic constraints.
+
+  * To check *logical expressions*, use if/then:
+
+    .. code-block:: json
+
+        "if forall {i in 1.._nlogcons} _logcon[i] then 1": 1,
+
+    This checks all logical constraints.
+
+
+* *"output": ["Presolved model has 500 variables", "RHS range:  [1e-2, 1e4]"]*.
+  Output chunks expected in the solver / AMPL log.
+
+
+Checking reformulations
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+It is possible to check characteristics of the models received by an MP
+driver from the NL file, as well as of the model submitted to the solver.
+For that, add option ``[tech:]debug=1``. Then, the driver outputs
+problem suffixes of the form
+``flat<N>__[<C>__]<itemtype>`` giving the number of model items
+of various types and statuses. The specifiers:
+
+* ``<N>`` is 0 for the initial flat model obtained from the NL file,
+  1 for the reformulated model.
+
+* If present, ``<C>`` can be ``A`` for the total number of items,
+  ``U`` for the number of total items still relevant, but possibly reformulated.
+  If not present, it is the number of active items at the end of step ``<N>``.
+
+* ``<itemtype>`` can be a constraint type name, variable type, or objective type.
+
+Run an AMPL session to see all such suffixes, or check existing test cases.
+
+These counts depend on which constraints a driver accepts natively,
+i.e., does not reformulate. Test drivers are therefore assigned a
+*solver category* (``SolverCategory`` in the test scripts):
+
+* ``MILP``: linear constraints only (HiGHS, GCG, BARON);
+* ``MIPWithIndicators``: plus indicator constraints (CPLEX, COPT, MOSEK);
+* ``MILPWithLogicals``: plus ``and``, ``or`` (Gurobi, Xpress, SCIP);
+* ``CP``: plus ``count``, ``numberof``, ``alldiff``, if-then (CP-SAT);
+* ``CPLegacy``: drivers on the old MP framework, without the model converter
+  and its counts (Gecode, ilogcp).
+
+Nonlinear functions do not influence the category.
+The test scripts warn when the ``acc:`` options of a driver imply a category
+other than the declared one.
+A case gives *"values"* as for one category and corrections for others in
+*"values_per_solver_category"*; ``null`` drops a check:
+
+.. code-block:: json
+
+    "values": {
+      "Initial.flat1__U__indeq": 6,
+      "Initial.flat1__linle": 14
+    },
+    "values_per_solver_category": {
+      "CP": { "Initial.flat1__U__indeq": 3, "Initial.flat1__linle": 8 },
+      "CPLegacy": { "Initial.flat1__U__indeq": null, "Initial.flat1__linle": null }
+    }
+
+Drivers without a category use *"values"* only.
 
 
 .. _unit_tests:
@@ -102,4 +206,5 @@ following items, where non-compulsory items are italicized:
 Unit tests
 ----------
 
-You can employ unit tests as well, see folder :file:`test`.
+Unit tests are in the folder :file:`test`.
+Compulsory are tests `converter-flat-test` and `converter-mip-test`.

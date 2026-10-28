@@ -2,15 +2,15 @@
   {
     "name" : "Check_Standard_Options",
     "files" : ["diet.mod", "diet.dat"],
-    "tags" : [ ],
+    "tags" : ["continuous"],
     "comment": "Check standard options: version, outlev",
     "comment": "Check acceptance of '?' and space/= for assignment",
     "options": { "ANYSOLVER_options": "version outlev ? outlev=? outlev 1 outlev=1 outlev 1" },
     "objective": 88.2
   },
   {
-    "name" : "Check_Wrong_Options",
-    "tags" : ["linear", "continuous"],
+    "name" : "Check_Wrong_Option_Value",
+    "tags" : ["linear", "continuous", "mpdriver"],
     "files" : ["diet.mod", "diet.dat"],
     "comment": "Check graceful exit on wrong options",
     "options": { "ANYSOLVER_options": "objno=12" },
@@ -20,10 +20,32 @@
     }
   },
   {
+    "name" : "Check_Missing_Option_Value",
+    "tags" : ["linear", "continuous", "mpdriver"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Check graceful exit on wrong options",
+    "options": { "ANYSOLVER_options": "objno " },
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0
+    }
+  },
+  {
+    "name" : "Check_Huge_Option_Value",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Check graceful exit on wrong options",
+    "options": { "mp_options": "cvt:bigM=2e450outlev=1" },
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0
+    }
+  },
+  {
     "name" : "Check_Barrier_Flag",
     "tags" : ["option_flag_barrier"],
     "files" : ["diet.mod", "diet.dat"],
-    "options": { "ANYSOLVER_options": "outlev 1 barrier outlev 0" },
+    "options": { "mp_options": "outlev 1 barrier outlev 0" },
     "objective": 88.2
   },
   {
@@ -31,11 +53,278 @@
     "tags" : ["linear", "feasrelax"],
     "files" : ["infeas_int_01.mod"],
     "options": {
-      "ANYSOLVER_options":
+      "mp_options":
         "sol:chk:fail sol:chk:mode=1023 sol:chk:feastol=1e-7 sol:chk:inttol=1e-4 feasrelax=1"
     },
     "values": {
       "solve_result_num": 150
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value CPLEX",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the CPLEX parameter range: abort before solving",
+    "options": { "cplex_options": "netfind=5" },
+    "solvers": ["cplex"],
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value CPLEXASL",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the CPLEX parameter range: ASL driver reports 'Error in $cplex_options'",
+    "options": { "cplex_options": "netfind=5" },
+    "solvers": ["cplexasl"],
+    "values": {
+      "solve_result_num": 560,
+      "solve_exitcode":   0
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value COPT",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the COPT parameter range (COPT itself would clamp it): abort before solving",
+    "options": { "copt_options": "threads=5000" },
+    "solvers": ["copt"],
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0
+    }
+  },
+  {
+    "name" : "diet COPT options",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "New COPT options and native parameters; writes copt_out.par",
+    "options": { "copt_options": "alg:nlptol=1e-9 bar:start=1 lp:barorder=2 pre:solve=4 mip:fapheurlevel=2 mip:startnodelimit=10 lim:multiobjtime=100 tech:optionnative 'Presolve 1' tech:optionnative 'RelGap=0.001' param:write=copt_out.par" },
+    "solvers": ["copt"],
+    "objective": 88.2,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "diet HiGHS LP options",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Simplex and tolerance options of HiGHS 1.15.1 with their MP-style names",
+    "options": { "highs_options": "alg:simplex=4 alg:simplexscale=3 alg:simplexcrash=2 alg:simplexdualedge=1 alg:simplexprimaledge=1 alg:simplexupdatelim=1000 alg:feastol=1e-8 alg:dualfeastol=1e-8 alg:opttol=1e-8 pre:solve=on tech:threads=1 tech:seed=7 lim:iter=10000" },
+    "solvers": ["highs"],
+    "objective": 88.2,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 HiGHS MIP options",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "MIP options of HiGHS 1.15.1 with their MP-style names",
+    "options": { "highs_options": "mip:gap=1e-6 mip:gapabs=0 mip:intfeastol=1e-7 mip:heureff=0.1 mip:symmetry=0 lim:nodes=1000 lim:sol=100 mip:lpsolver=simplex mip:heur:rins=0 mip:heur:feasjump=0 mip:restart=0 mip:nodecuts=1 mip:poolagelimit=20 tech:miplogfreq=1" },
+    "solvers": ["highs"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value HiGHS",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the HiGHS option range: abort before solving, the message names the AMPL option",
+    "options": { "highs_options": "alg:simplexscale=5" },
+    "solvers": ["highs"],
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0,
+      "solve_message": { "contains": "alg:simplexscale=5" }
+    }
+  },
+  {
+    "name" : "diet SCIP LP options",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "LP and technical options of SCIP 10.0.2 with their MP-style names; native parameters inline; writes scip_out.set",
+    "options": { "scip_options": "alg:method=d alg:remethod=p lp:pricing=s alg:feastol=1e-8 alg:dualfeastol=1e-8 lp:scaling=2 pre:solve=1 tech:threads=1 tech:seed=7 lim:iter=10000 lim:rootiter=10000 tech:clocktype=1 tech:optionnative 'lp/checkstability=1 display/verblevel 0' tech:optionnativewrite=scip_out.set" },
+    "solvers": ["scip"],
+    "objective": 88.2,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 SCIP MIP options",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "MIP options of SCIP 10.0.2 with their MP-style names",
+    "options": { "scip_options": "mip:gap=1e-6 mip:gapabs=0 mip:symmetry=0 lim:nodes=1000 lim:sol=100 cut:gomory=5 cut:cover=-1 cut:clique=0 alg:emphasis=5 heu:settings=1 pre:settings=0 sol:poollimit=3 lim:bestbndstop=2000 tech:outlevnative=0" },
+    "solvers": ["scip"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 SCIP concurrent",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "tech:threads > 1 runs SCIP's concurrent solve",
+    "options": { "scip_options": "tech:threads=2 tech:logfile=scip_knap.log" },
+    "solvers": ["scip"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value SCIP",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the SCIP parameter range: abort before solving, the message names the AMPL option and the range",
+    "options": { "scip_options": "lim:maxsol=0" },
+    "solvers": ["scip"],
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0,
+      "solve_message": { "contains": "lim:maxsol=0" }
+    }
+  },
+  {
+    "name" : "diet MOSEK LP options",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Simplex, barrier and tolerance options of MOSEK 11.2 with their MP-style names; writes mosek_out.par",
+    "options": { "mosek_options": "alg:method=1 alg:feastol=1e-8 alg:dualfeastol=1e-8 lp:primalselection=4 lp:dualselection=3 lp:hotstart=1 lp:degen=1 lp:solveform=0 bar:iterlim=100 bar:pfeastol=1e-9 bar:dfeastol=1e-9 bar:relgaptol=1e-9 bar:order=0 pre:lindep=1 pre:solve=1 lim:iter=100000 tech:threads=1 tech:lpseed=7 param:write=mosek_out.par" },
+    "solvers": ["mosek"],
+    "objective": 88.2,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 MOSEK MIP options",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "MIP options of MOSEK 11.2 with their MP-style names",
+    "options": { "mosek_options": "mip:gap=1e-6 mip:gapabs=0 mip:inttol=1e-7 mip:symmetry=0 mip:cuts=1 cut:gomory=0 cut:cover=1 mip:nodeselect=2 mip:branchdir=0 mip:probing=1 mip:rootmethod=1 mip:nodemethod=1 mip:restarts=0 mip:rootcutrounds=10 lim:nodes=10000 lim:sol=100 lim:miptime=100 tech:seed=7" },
+    "solvers": ["mosek"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 MOSEK node limit",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "A branch limit reports the node-limit result code with the feasible solution",
+    "options": { "mosek_options": "lim:nodes=0 mip:heurlevel=0" },
+    "solvers": ["mosek"],
+    "values": {
+      "solve_result_num": 404
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value MOSEK",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the MOSEK parameter range: abort before solving, the message names the AMPL option",
+    "options": { "mosek_options": "alg:method=9" },
+    "solvers": ["mosek"],
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0,
+      "solve_message": { "contains": "alg:method" }
+    }
+  },
+  {
+    "name" : "diet GCG LP options",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "LP and technical options of GCG 4.0.2 with their MP-style names; native parameters inline; writes gcg_out.set",
+    "options": { "gcg_options": "alg:method=d lp:pricing=s alg:feastol=1e-8 alg:dualfeastol=1e-8 lp:scaling=2 pre:solve=1 tech:seed=7 lim:iter=10000 tech:clocktype=1 tech:optionnative 'lp/checkstability=1 detection/maxrounds 1' tech:optionnativewrite=gcg_out.set" },
+    "solvers": ["gcg"],
+    "objective": 88.2,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 GCG MIP options",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "MIP, pricing and detection options of GCG 4.0.2 with their MP-style names",
+    "options": { "gcg_options": "mip:gap=1e-6 mip:gapabs=0 lim:nodes=1000 lim:sol=100 tech:threads=2 pricing:stabilization=1 pricing:maxcolsround=50 pricing:eagerfreq=5 pricing:sorting=d det:maxnclasses=10 det:maxrounds=1 gcg:mode=0 heu:settings=1 pre:settings=0 sol:poollimit=3 tech:outlevnative=0" },
+    "solvers": ["gcg"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "Check_Rejected_Param_Value GCG",
+    "tags" : ["linear", "continuous"],
+    "files" : ["diet.mod", "diet.dat"],
+    "comment": "Value outside the GCG parameter range: abort before solving, the message names the AMPL option and the range",
+    "options": { "gcg_options": "lim:maxsol=0" },
+    "solvers": ["gcg"],
+    "values": {
+      "solve_result_num": 500,
+      "solve_exitcode":   0,
+      "solve_message": { "contains": "lim:maxsol=0" }
+    }
+  },
+  {
+    "name" : "knap_40 BARON ASL options",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "BARON options written to the OPTIONS block by the ASL driver, incl. the generic param keyword",
+    "options": { "baron_options": "epsa=1e-7 epsr=1e-7 absconfeastol=1e-7 absintfeastol=1e-6 nodesel=1 brvarstra=1 pdo=0 numloc=0 cutoff=600 maxiter=1000 maxtime=100 param=DeltaTerm=0 param=NOutIter:3 threads=1 seed=7" },
+    "solvers": ["baronasl"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 BARONMP options",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "Documented BARON options with their MP-style names, and a native parameter",
+    "options": { "baronmp_options": "alg:epsa=1e-7 alg:epsr=1e-7 alg:feastol=1e-7 mip:intfeastol=1e-6 mip:nodesel=1 branch:var=1 pre:pdo=0 alg:numloc=0 alg:cutoff=600 lim:iter=1000 lim:time=100 tech:optionnative 'DeltaTerm 0' tech:threads=1 tech:seed=7" },
+    "solvers": ["baronmp"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 BARONMP numsol best solution",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "With several solutions requested, the best one is reported (BARON lists them in its own order)",
+    "options": { "baronmp_options": "tech:numsol=3" },
+    "solvers": ["baronmp"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
+    }
+  },
+  {
+    "name" : "knap_40 64-bit option value",
+    "tags" : ["linear", "integer"],
+    "files" : ["knap_40.mod"],
+    "comment": "lim:nodes is a 64-bit parameter (SCIP_Longint); values above 2^31 are accepted",
+    "options": { "ANYSOLVER_options": "lim:nodes=5000000000" },
+    "solvers": ["scip", "gcg"],
+    "objective": 1044,
+    "values": {
+      "solve_result_num": 0
     }
   }
 ]

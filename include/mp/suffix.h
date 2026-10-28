@@ -28,6 +28,7 @@
 #include <cstddef>     // for std::size_t
 #include <algorithm>   // for std::fill_n
 #include <iterator>
+#include <functional>
 #include <set>
 #include <string>      // for std::char_traits
 #include <memory>
@@ -120,11 +121,12 @@ class SuffixBase {
   /// Or's the kind with a given int argument
   void or_kind(int flg) { impl_->kind |= flg; }
 
+  /// Size
   int num_values() const { return impl_->num_values; }
 
-  /// Don't use
+  /// Use for int or double
   template <class T>
-  ArrayRef<T> get_values() const { assert(0); return {}; }
+  ArrayRef<T> get_values() const;
 
   const SuffixTable& table() const { return impl_->table; }
 
@@ -177,6 +179,7 @@ class Suffix : private internal::SuffixBase {
   using SuffixBase::name;
   using SuffixBase::kind;
   using SuffixBase::num_values;
+  using SuffixBase::get_values;
   using SuffixBase::table;
   using SuffixBase::impl;
   using SuffixBase::operator SafeBool;
@@ -235,6 +238,7 @@ class BasicSuffix : private internal::SuffixBase {
 
   using SuffixBase::name;
   using SuffixBase::kind;
+  using SuffixBase::kind_pure;
   using SuffixBase::or_kind;
   using SuffixBase::num_values;
   using SuffixBase::operator SafeBool;
@@ -519,6 +523,18 @@ class SuffixManager {
     Check(kind);
     return suffixes_[kind];
   }
+
+  /// Returns the set of suffix names for all kinds
+  std::set<std::string> suffixnames() const {
+    std::set<std::string> result;
+    for (int kind=0; kind<internal::NUM_SUFFIX_KINDS; ++kind) {
+      const auto& sufset = suffixes((suf::Kind)kind);
+      for (const auto& isuf: sufset) {
+        result.insert(isuf.name());
+      }
+    }
+    return result;
+  }
 };
 
 
@@ -544,11 +560,21 @@ public:
 };
 
 
-/// Description of a suffix that can exist for several itme types
+/// Description of a suffix that can exist for several item types
 /// (vars, cons, objs, problem).
 /// The \a kind parameter should be a bitwise OR of suf::Kind::..._BIT's.
 template <class T>
 using ModelSuffixDef = SuffixDef<T>;
+
+
+/// Suffix getter and setter
+struct SuffixGetterSetter {
+  std::function<ArrayRef<int>(const SuffixDef<int>& )> sgi_;
+  std::function<ArrayRef<double>(const SuffixDef<double>& )> sgd_;
+  std::function<void(const SuffixDef<int>& , ArrayRef<int>)> ssi_;
+  std::function<void(const SuffixDef<double>& , ArrayRef<double>)> ssd_;
+  std::function <const SuffixSet& (suf::Kind)> ss_;
+};
 
 }  // namespace mp
 

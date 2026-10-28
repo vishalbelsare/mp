@@ -15,10 +15,18 @@ double XpressmpCommon::getDblAttr(int attr) const  {
 }
 
 int XpressmpCommon::NumLinCons() const {
+  return getIntAttr(XPRS_INPUTROWS);
+}
+
+int XpressmpCommon::NumLinConsOrig() const {
   return getIntAttr(XPRS_ORIGINALROWS);
 }
 
 int XpressmpCommon::NumVars() const {
+  return getIntAttr(XPRS_INPUTCOLS);  // not ORIGINALCOLS for NLP
+}
+
+int XpressmpCommon::NumVarsOrig() const {
   return getIntAttr(XPRS_ORIGINALCOLS);
 }
 
@@ -36,6 +44,14 @@ int XpressmpCommon::NumSOSCons() const {
 
 int XpressmpCommon::NumIndicatorCons() const {
   return getIntAttr(XPRS_ORIGINALINDICATORS);
+}
+
+int XpressmpCommon::NumPWLs() const {
+  return getIntAttr(XPRS_ORIGINALPWLS);
+}
+
+int XpressmpCommon::NumGenCons() const {
+  return getIntAttr(XPRS_ORIGINALGENCONS);
 }
 
 void XpressmpCommon::GetSolverOption(int key, int &value) const {
@@ -57,9 +73,12 @@ void XpressmpCommon::SetSolverOption(int  key, double value) {
 void XpressmpCommon::GetSolverOption(int  key, std::string &value) const {
   int l;
   XPRESSMP_CCALL(XPRSgetstringcontrol(lp(), key, nullptr, 0, &l));
-  std::vector<char> s(l);
-  XPRESSMP_CCALL(XPRSgetstringcontrol(lp(), key, s.data(), l, &l));
-  value.assign(s.data());
+  if (l) {
+    std::vector<char> s(l);
+    XPRESSMP_CCALL(XPRSgetstringcontrol(lp(), key, s.data(), l, &l));
+    value.assign(s.data());
+  } else
+    value.clear();
 }
 
 void XpressmpCommon::SetSolverOption(int  key, const std::string& value) {

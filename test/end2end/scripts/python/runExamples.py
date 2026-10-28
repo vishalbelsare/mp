@@ -1,111 +1,189 @@
 from sys import platform
 import argparse
+import os
 
-from runModels import runModels
+from runModels import runModels,writeModels
 import Exporter
 import Solver
 import SolverCollection
+import multiprocessing
 
 
 class Tester:
-    def __init__(self):
-        self._parser = argparse.ArgumentParser(description='AMPL solver testing script.')
-
-    def runTests(self):
-        self.parseOptions()
-        self.initSolvers()
-        if self._args.printsolvers:
+    def runTestsAPI(self, ampl: str, solvers: list, lpmethod: str = None, nlpmethod: str = None,
+                    options: str = None, bin_path: str= "", reportstub: str=None,printsolvers:bool = False,
+                    timeout: float = 2400, nthreads: int = 8, dir: str="", 
+                    benchmark: bool = False, junit: bool=False, nonrecursive: bool=False,
+                    allfiles: bool=False, prefer_nl: bool = False, export_lp: bool = False,
+                    just_nl: bool = False, keep_logs: bool = False, verbose: bool = False,
+                    exporter = None, export_ampl = None):
+        self.initSolvers(timeout, nthreads, ampl, bin_path, lpmethod, nlpmethod, export_lp)
+        if printsolvers:
             self.printSolvers()
             return
-        self.collectAndRunCases()
+        self.collectAndRunCases(solvers, lpmethod, nlpmethod, options, bin_path, reportstub, 
+                                timeout, nthreads, dir,
+                                benchmark, junit, nonrecursive,
+                                allfiles, prefer_nl, export_lp, 
+                                just_nl, keep_logs, verbose, exporter)
+    def exportModelsAPI(self, ampl, directory, modelList=True, justNL=False, recursive=False,
+                        preferAMPLModels=False, writeMPS=False):
+        writeModels(ampl, directory, modelList, justNL, recursive, preferAMPLModels, writeMPS)
 
+    def run_from_command_line(self):
+        args = self.parseOptions()
+        args= vars(args)
+        if args["export_ampl"]:
+            MPS = args["export_ampl"]=="mps"
+            print("export_ampl option specified, will only export the models")
+            self.exportModelsAPI(args["ampl"], args["dir"], not args["allfiles"], args["just_nl"], not args["nonrecursive"],
+                                 not args["prefer_nl"], MPS)
+        else:
+            self.runTestsAPI(
+                         args["ampl"],
+                         args["solvers"],
+                         args["lpmethod"],
+                         args["nlpmethod"],
+                         args["options"],
+                         args["bin_path"],
+                         args["reportstub"],
+                         args["printsolvers"],
+                         args["timeout"],
+                         args["nthreads"],
+                         args["dir"],
+                         args["benchmark"],
+                         args["junit"],
+                         args["nonrecursive"],
+                         args["allfiles"],
+                         args["prefer_nl"],
+                         args["export_lp"],
+                         args["just_nl"],
+                         args["keep_logs"],
+                         args["verbose"])
+        
     def parseOptions(self):
-        self._parser.add_argument("solvers", metavar="solver", type=str, nargs="+",
+        parser = argparse.ArgumentParser(description='AMPL solver testing script.')
+        parser.add_argument("solvers", metavar="solver", type=str, nargs="+",
                             help="a solver to test")
 
-        self._parser.add_argument("--lpmethod", type=str, metavar="", default="",
-                            help="algorithm for lp: SIMPLEX or BARRIER")
-
-        self._parser.add_argument("--options", type=str, metavar="", default="",
+        parser.add_argument("--lpmethod", type=str, metavar="", default="",
+                            help="algorithm for lp: SIMPLEX, BARRIER or PDLP")
+        parser.add_argument("--nlpmethod", type=str, metavar="", default="",
+                            help="nl support: REFORMULATION, NATIVE or NATIVEPL")
+        parser.add_argument("--options", type=str, metavar="", default="",
                             help="extra solver options")
-        self._parser.add_argument("--binPath", type=str, metavar="", default="",
+        parser.add_argument("--ampl", type=str, metavar="", default="ampl",
+                            help="path to AMPL executable")
+        parser.add_argument("--bin_path", type=str, metavar="", default="",
                             help="default path to look for solver executables")
-        self._parser.add_argument("--reportstub", type=str, metavar="", default="report",
+        parser.add_argument("--reportstub", type=str, metavar="", default="report",
                             help="stub for CSV test report filename, e.g., /tmp/report, default: report")
-        self._parser.add_argument("--printsolvers", action="store_true",
+        parser.add_argument("--printsolvers", action="store_true",
                             help="print available solvers and exit")
-        self._parser.add_argument("--timeout", type=int, metavar="T", default=2400,
+        parser.add_argument("--timeout", type=float, metavar="T", default=2400,
                         help="timeout per instance, seconds")
-        self._parser.add_argument("--nthreads", type=int, metavar="N", default=8,
+        parser.add_argument("--nthreads", type=int, metavar="N", default=8,
                         help="number of threads in a solver")
-        self._parser.add_argument("--dir", type=str, metavar="path", default="",
+        parser.add_argument("--dir", type=str, metavar="path", default="",
                         help="path to the test case folder")
-        self._parser.add_argument("--benchmark", action="store_true",
+        parser.add_argument("--benchmark", action="store_true",
                         help="benchmark file output")
-        self._parser.add_argument("--nonrecursive", action="store_true",
+        parser.add_argument("--junit", action="store_true",
+                help="Junit test file output")
+        parser.add_argument("--nonrecursive", action="store_true",
                         help="non-recursive case collection")
-        self._parser.add_argument("--allfiles", action="store_true",
+        parser.add_argument("--allfiles", action="store_true",
                         help="collect all .mod, .nl files; otherwise local modellist.json only. " +
                                   "If modellist.json is to be used for comparison data, each case name" +
                              "'s first word should match the file stem unless 'files' are specified")
-        self._parser.add_argument("--preferNL", action="store_true",
+        parser.add_argument("--prefer_nl", action="store_true",
                         help="prefer NL models if both AMPL and NL are present")
-        self._parser.add_argument("--exportLP", action="store_true",
+        parser.add_argument("--export_lp", action="store_true",
                                   help="Export solver-level LP file")
-        self._parser.add_argument("--justNL", action="store_true",
+        parser.add_argument("--just_nl", action="store_true",
                         help="only run NL models. Useful when AMPL executable is not available")
-        self._parser.add_argument("-k", "--keepLogs", action="store_true",
+        parser.add_argument("-k", "--keep_logs", action="store_true",
                         help="keep log files for each run, filenames: {model}.{solver}.log")
-        self._parser.add_argument("-v", "--verbose", action="store_true",
+        parser.add_argument("-v", "--verbose", action="store_true",
                         help="print solver output")
+        parser.add_argument("-e", "--export_ampl", choices=["mps", "nl"],
+                        help="export model at AMPL level, possible values are 'mps' or 'nl'")
 
-        self._args = self._parser.parse_args()
+        return parser.parse_args()
 
-    def initSolvers(self):
+    def initSolvers(self,  timeout: float, nthreads: int, ampl: str = None, bin_path:str = None,
+                    lpmethod: str = None, nlpmethod: str = None,
+                    export_lp: bool = False):
+        self._ampl = ampl
+        # Cases tagged 'cd' and scripts change AMPL's directory
+        # for the rest of the session: a relative path would break.
+        if bin_path:
+            bin_path = os.path.abspath(bin_path)
         self._solvers = SolverCollection.SolverCollection()
-        SolverCollection.addStdSolvers(self._solvers, self._args.binPath)
-        self.setSolverParameters()
-
-    def setSolverParameters(self):
+        SolverCollection.addStdSolvers(self._solvers, bin_path)
         for name, slv in self._solvers.getSolvers():
-            slv.setTimeout(self._args.timeout)
-            slv.setNThreads(self._args.nthreads)
-            if self._args.lpmethod:
-                slv.setLPMethod(self._args.lpmethod)
-            if self._args.exportLP:
-                slv.setExportLP(True)
-            else:
-                slv.setExportLP(False)
-
+            slv.setTimeout(timeout)
+            slv.setNThreads(nthreads)
+            if lpmethod:
+                slv.setLPMethod(lpmethod)
+            if nlpmethod:
+                slv.setNLPMethod(nlpmethod)
+            slv.setExportLP(export_lp)
+            
     def printSolvers(self):
         print("Available solvers:\n  * ", end='')
         print(*(self._solvers.getSolverNames()), sep="\n  * ")
+        
+    def create_report_file_suffix(self, lpmethod, nlpmethod):
+        suffixes = []
+        if lpmethod:
+            suffixes.append(lpmethod)
+        if nlpmethod:
+            suffixes.append(nlpmethod) 
+        if len(suffixes)==0:
+            return ""
+        else: return "-".join(suffixes)
+        
+    def collectAndRunCases(self,
+                    solvers: list, lpmethod: str = None, nlpmethod: str = None,
+                    options: str = None, binPath: str= None, reportstub: str=None,
+                    timeout: float = 2400, nthreads: int = 8, dir: str="",
+                    benchmark: bool = False, junit: bool=False, nonrecursive: bool=False,
+                    allfiles: bool=False, prefer_nl: bool = False, exportLP: bool = False,
+                    just_nl: bool = False, keep_logs: bool = False, verbose: bool = False,
+                    exporter: Exporter.Exporter=None):
+        
+        if not exporter:
+            if benchmark:
+                from BenchmarkExporter import BenchmarkExporter
+                exporter = BenchmarkExporter()
+            elif junit:
+                from JunitExporter import JunitExporter
+                exporter = JunitExporter()
+            else:
+                exporter = Exporter.CSVTestExporter()
 
-    def collectAndRunCases(self):
-        if self._args.benchmark:
-            from BenchmarkExporter import BenchmarkExporter
-            exporter = BenchmarkExporter()
-        else:
-            exporter = Exporter.CSVTestExporter()
-
-        runModels(self._args.dir,
-                  self._solvers.getSolversByNames(self._args.solvers),
-                  solverOptions=self._args.options,
-                  exportFile=self._args.reportstub,
+        runModels(dir,
+                  self._ampl,
+                  self._solvers.getSolversByNames(solvers),
+                  solverOptions=options,
+                  exportFile=reportstub,
                   exporter=exporter,
-                  recursive=not self._args.nonrecursive,
-                  modellist=not self._args.allfiles,
-                  preferAMPLModels=not self._args.preferNL,
-                  justNL=self._args.justNL,
-                  keepLogs=self._args.keepLogs,
-                  verbose=self._args.verbose)
-
+                  recursive=not nonrecursive,
+                  modellist=not allfiles,
+                  preferAMPLModels=not prefer_nl,
+                  justNL=just_nl,
+                  keepLogs=keep_logs,
+                  verbose=verbose, 
+                  defaultReportSuffix=self.create_report_file_suffix(lpmethod, nlpmethod))
 
 def runTester():
     tester = Tester()
-    tester.runTests()
+    tester.run_from_command_line()
+    
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     runTester()
 
 # Write NL files

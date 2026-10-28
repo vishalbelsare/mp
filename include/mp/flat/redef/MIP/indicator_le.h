@@ -20,12 +20,13 @@ public:
   using ItemType = IndicatorConstraintLinLE;
 
   /// Conversion
-  void Convert(const ItemType& indc, int ) {
+  Context Convert(const ItemType& indc, int ) {
     auto binvar=indc.get_binary_var();
     auto bnds = GetMC().ComputeBoundsAndType(
           indc.get_constraint().GetBody());
     ConvertImplicationLE(binvar, indc.get_binary_value(),
                          bnds.ub(), indc.get_constraint());
+    return Context::CTX_ROOT;
   }
 
 protected:
@@ -45,15 +46,21 @@ protected:
             "or use option cvt:bigM (with caution).\n"
             "See more: mp.ampl.com/modeling-numerics.html");
     }
-    if (body_ub != con.rhs()) {
-      if (0==val)                                // left condition is b==0
-        con.GetBody().add_term(-body_ub+con.rhs(), b);
-      else {
-        con.GetBody().add_term(body_ub-con.rhs(), b);
-        con.set_rhs(body_ub);
-      }
-      GetMC().AddConstraint(con);                // Big-M constraint
+    if (body_ub == con.rhs()) {
+      // Implied by the best-known bounds. Unless the solver
+      // receives such bounds, keep the plain row (no big-M).
+      if (GetMC().ub_subm_body(con.GetBody()) > con.rhs())
+        GetMC().AddConstraint(con);
+      return;
     }
+    if (0==val)                                // left condition is b==0
+      con.GetBody().add_term(-body_ub+con.rhs(), b);
+    else {
+      con.GetBody().add_term(body_ub-con.rhs(), b);
+      con.set_rhs(body_ub);
+    }
+    con.GetBody().sort_terms();
+    GetMC().AddConstraint(con);                // Big-M constraint
   }
 
 };

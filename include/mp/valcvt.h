@@ -9,6 +9,9 @@
 #include <unordered_set>
 #include <functional>
 
+#include "mp/utils-string.h"
+#include "mp/util-json-write.hpp"
+
 #include "valcvt-node.h"
 #include "valcvt-link.h"
 #include "mp/flat/converter_model_base.h"
@@ -58,11 +61,8 @@ public:
 /// between the original model and the presolved one.
 class ValuePresolverImpl : public BasicValuePresolver {
 public:
-  /// Exporter functor type
-  using ExporterFn = std::function< void (const char*) >;
-
   /// Constructor
-  ValuePresolverImpl(Env& env, ExporterFn bts={}) :
+  ValuePresolverImpl(Env& env, BasicLogger& bts) :
     BasicValuePresolver(env), bts_(bts) { }
 
   /// Source nodes of the conversion graph, const
@@ -86,11 +86,8 @@ public:
     }
   }
 
-  /// Switch exporting on/off.
-  void SetExport(bool onoff) { f_export_=onoff; }
-
   /// Want Export?
-  bool GetExport() const { return f_export_; }
+  bool GetExport() const { return bts_.IsOpen(); }
 
   /// Finish exporting entries, if exporting=ON.
   /// This should be called after model conversions are finished,
@@ -107,13 +104,15 @@ public:
 #define PRESOLVE_KIND(name, ValType) \
   MVOverEl<ValType> \
     Presolve ## name ( \
-      const MVOverEl<ValType> & mv) override { \
-    return RunPresolve(&BasicLink::Presolve ## name, mv); \
+      const MVOverEl<ValType> & mv, \
+      ValueResolution vr = ValueResolution::ValResDefault) override { \
+    return RunPresolve(&BasicLink::Presolve ## name, mv, vr); \
   } \
   MVOverEl<ValType> \
     Postsolve ## name ( \
-      const MVOverEl<ValType> & mv) override { \
-    return RunPostsolve(&BasicLink::Postsolve ## name, mv); \
+      const MVOverEl<ValType> & mv, \
+      ValueResolution vr = ValueResolution::ValResDefault) override { \
+    return RunPostsolve(&BasicLink::Postsolve ## name, mv, vr); \
   }
 
   LIST_PRESOLVE_METHODS
@@ -134,25 +133,27 @@ public:
 
 protected:
   /// Helper type: virtual member function pointer
-  using LinkFn = void (BasicLink::*)(LinkIndexRange);
+  using LinkFn = void (BasicLink::*)(LinkIndexRange, ValueResolution);
 
   /// Generic value presolve loop: forward
   template <class ModelValues>
-  ModelValues RunPresolve(LinkFn fn, const ModelValues& mv) const {
+  ModelValues RunPresolve(LinkFn fn, const ModelValues& mv,
+                          ValueResolution vr) const {
     CleanUpValueNodes();
     src_ = mv;
     for (const auto& br: brl_)
-      (br.b_.*fn)(br.ir_);
+      (br.b_.*fn)(br.ir_, vr);
     return dest_;
   }
 
   /// Generic value postsolve loop: backward
   template <class ModelValues>
-  ModelValues RunPostsolve(LinkFn fn, const ModelValues& mv) const {
+  ModelValues RunPostsolve(LinkFn fn, const ModelValues& mv,
+                           ValueResolution vr) const {
     CleanUpValueNodes();
     dest_ = mv;
     for (auto rit=brl_.rbegin(); rit!=brl_.rend(); ++rit) {
-      (rit->b_.*fn)(rit->ir_);
+      (rit->b_.*fn)(rit->ir_, vr);
     }
     return src_;
   }
@@ -191,37 +192,31 @@ protected:
     if (GetExport()) {
       ln.ExportEntryItems(entry_items_, i_entry);
       fmt::MemoryWriter wrt;
-      wrt.write("{} ", '{');
-      wrt.write("\"link_index\": [{}, {}], ", i_exported_, i_entry);
-      wrt.write("\"link_type\": \"{}\", ", ln.GetTypeName());
-      wrt.write("\"source_nodes\": [");
-        WriteNodes(wrt, entry_items_.src_items_);
-      wrt.write(" ], ");                      // end source nodes
-      wrt.write("\"dest_nodes\": [ ");
-        WriteNodes(wrt, entry_items_.dest_items_);
-      wrt.write(" ]");                        // end dest nodes
-      wrt.write(" {}\n", '}');                      // with EOL
+      {
+        MiniJSONWriter jw(wrt);
+        jw["link_index"] = std::make_tuple(i_exported_, i_entry);
+        jw["link_type"] = ln.GetTypeName();
+        WriteNodes(jw["src_nodes"], entry_items_.src_items_);
+        WriteNodes(jw["dest_nodes"], entry_items_.dest_items_);
+      }
       /// Export record
-      assert(bts_);
-      bts_(wrt.c_str());
+      wrt.write("\n");                     // EOL
+      bts_.Append(wrt);
     }
   }
 
   /// Write a vector of nodes
-  void WriteNodes(fmt::MemoryWriter& wrt, const std::vector<NodeRange>& nodes) {
+  template <class JSON>
+  void WriteNodes(JSON jw, const std::vector<NodeRange>& nodes) {
     for (size_t i=0; i<nodes.size(); ++i) {
       const auto& nd = nodes[i];
+      auto jelement = ++jw;       // jw is an array of dict's
       if (nd.IsSingleIndex())
-        wrt.write("{} \"{}\": {} {}",
-                  '{', nd.GetValueNode()->GetName(), (int)nd, '}');
+        jelement[nd.GetValueNode()->GetName()] = (int)nd;
       else
-        wrt.write("{} \"{}\": [{}, {}] {}",
-                  '{', nd.GetValueNode()->GetName(),
-                  nd.GetIndexRange().beg_,
-                  nd.GetIndexRange().end_-1,     // print the exact last value
-                  '}');
-      if (i != nodes.size()-1)
-        wrt.write(",");
+        jelement[nd.GetValueNode()->GetName()]
+            << nd.GetIndexRange().beg_
+            << (nd.GetIndexRange().end_-1);  // print the exact last value
     }
   }
 
@@ -237,11 +232,8 @@ private:
   /// The link ranges
   LinkRangeList brl_;
 
-  /// Export on/off
-  bool f_export_ { false };
-
   /// Exporter functor
-  ExporterFn const bts_{};
+  BasicLogger& bts_;
 
   /// 1-after-last exported entry
   int i_exported_=0;
@@ -250,7 +242,8 @@ private:
   BasicLink::EntryItems entry_items_;
 };
 
-
+/// Pre-postsolver callback
+using PrePostsolverType = std::function<void(MVOverEl<double>&)>;
 /// How to call a solution checker
 using SolCheckerCall = bool(
     ArrayRef<double> x,
@@ -266,14 +259,18 @@ using SolCheckerType = std::function<SolCheckerCall>;
 class ValuePresolver : public ValuePresolverImpl {
 public:
   ValuePresolver(BasicFlatModel& m, Env& env,
-                 ExporterFn bts={}, SolCheckerType sc={})
-    : ValuePresolverImpl(env, bts), model_(m), solchk_(sc) { }
+                 BasicLogger& bts,
+                 SolCheckerType sc={}, PrePostsolverType pps={})
+      : ValuePresolverImpl(env, bts), model_(m), solchk_(sc), preposts_(pps) { }
 
   /// Override PresolveSolution().
-  /// Move warm start values into the bounds.
+  /// Update warm start values to fit into their bounds.
+  /// @param vr: ignored for simplicity
   MVOverEl<double> PresolveSolution (
-      const MVOverEl<double>& mv) override {
-    auto result = ValuePresolverImpl::PresolveSolution(mv);
+      const MVOverEl<double>& mv,
+      ValueResolution  = ValueResolution::ValResLast) override {
+    auto result = ValuePresolverImpl::PresolveSolution(
+        mv, ValueResolution::ValResLast);
     auto& x = result.GetVarValues()();
     const auto& lbs = model_.GetVarLBs();
     const auto& ubs = model_.GetVarUBs();
@@ -289,29 +286,37 @@ public:
     return result;
   }
 
-  /// Override PostsolveSolution().
-  /// Check solution if checker provided.
-  /// mv's ExtraData() is passed to the checker.
+  /// Override PostsolveSolution(). As follows:
+  /// 1. Call preposts_() if provided.
+  /// 2. Check solution if checker provided.
+  /// 3. mv's ExtraData() is passed to the checker.
+  /// @param vr: ignored
   MVOverEl<double> PostsolveSolution (
-      const MVOverEl<double>& mv) override {
+      const MVOverEl<double>& mv,
+      ValueResolution  = ValueResolution::ValResLast) override {
+    auto mv_copy = mv;
+    if (preposts_)
+      preposts_(mv_copy);
     if (solchk_) {
-      const auto& mx = mv.GetVarValues();
-      const auto& mo = mv.GetObjValues();
+      const auto& mx = mv_copy.GetVarValues();
+      const auto& mo = mv_copy.GetObjValues();
       if (mx.IsSingleKey()
           && mx().size()) {          // solution available
         ArrayRef<double> objs;
         if (mo.IsSingleKey())
           objs = mo();
-        solchk_(mx(), mv.GetConValues(), objs, mv.ExtraData());
+        solchk_(mx(), mv_copy.GetConValues(), objs, mv_copy.ExtraData());
       }
     }
-    return ValuePresolverImpl::PostsolveSolution(mv);
+    return ValuePresolverImpl::PostsolveSolution(
+        mv_copy, ValueResolution::ValResLast);
   }
 
 
 private:
   BasicFlatModel& model_;
   SolCheckerType solchk_;
+  PrePostsolverType preposts_;
 };
 
 

@@ -2,6 +2,7 @@
 #define VALUE_PRESOLVE_NODE_H
 
 #include <cmath>
+#include <unordered_set>
 
 #include "valcvt-base.h"
 
@@ -85,6 +86,15 @@ private:
 };
 
 
+/// NameChunk, added to con/var name during redefinitions.
+/// Should be default-constructible
+using NameChunk = const char*;
+
+/// Is NameChunk an empty string?
+inline
+bool IsEmptyString(NameChunk nc) { return !nc || !*nc; }
+
+
 /// Value node, a node of the conversion graph.
 /// Stores arrays of int's, double's, and VCString's
 /// corresponding to variables, or a constraint type, or objectives.
@@ -97,7 +107,11 @@ public:
   /// Constructor.
   /// Need ValuePresolver to register itself.
   ValueNode(BasicValuePresolver& pre, std::string nm={}) :
-    pre_(pre), name_(nm) { RegisterMe(); }
+      pre_(pre), name_(std::move(nm))
+  {
+    SetNameChunk(name_);
+    RegisterMe();
+  }
 
   /// Move constructor
   ValueNode(ValueNode&& vn) : pre_(vn.pre_) {
@@ -106,6 +120,7 @@ public:
     vStr_ = std::move(vn.vStr_);
     sz_ = std::move(vn.sz_);
     name_ = std::move(vn.name_);
+    SetNameChunk( vn.nc_default_ );
     RegisterMe();
   }
 
@@ -116,6 +131,7 @@ public:
     vStr_ = (vn.vStr_);
     sz_ = (vn.sz_);
     name_ = (vn.name_);
+    SetNameChunk( vn.nc_default_ );
     RegisterMe();
   }
 
@@ -133,11 +149,41 @@ public:
   /// Declared size (what is being used by links)
   size_t Size() const { return sz_; }
 
+  /// Reset local counter.
+  /// Usually this starts a group of new items
+  /// created by another redefinition
+  void ResetLocalCounter() { localcounter_ = 0; }
+
+  /// Set default name chunk.
+  /// Name chunks are chained up during name presolve.
+  /// @return old one.
+  /// @note "name" means var/con/obj name being presolved
+  ///   along this node.
+  NameChunk SetNameChunk(const std::string& nc) {
+    auto it = nc_dfl_set_.insert(nc).first;
+    auto old = nc_default_;
+    nc_default_ = it->c_str();
+    return old;
+  }
+
+  /// Assign name chunk to an existing entry
+  NameChunk ReplaceNameChunk(int pos, const std::string& nc) {
+    if (pos < 0)            // pos=-1 =>
+      pos = sz_+pos;        // pos = last
+    auto old = namechunks_[pos];
+    auto it = nc_dfl_set_.insert(nc).first;
+    namechunks_[pos] = it->c_str();
+    return old;
+  }
+
   /// Create entry (range) pointer: add n elements
   NodeRange Add(int n=1) {
     NodeRange nr;
     nr.Assign(this, {(int)sz_, (int)sz_+n});
     sz_ += n;
+    for (int i=n; i--; )
+      localcounts_.insert(localcounts_.end(), ++localcounter_);
+    namechunks_.insert(namechunks_.end(), n, nc_default_);
     return nr;
   }
 
@@ -145,18 +191,18 @@ public:
   /// pos=-1 means last
   NodeRange Select(int pos, int n=1) {
     NodeRange nr;
-    if (pos<0)              // pos=-1 =>
+    if (pos < 0)            // pos=-1 =>
       pos = sz_+pos;        // pos = last
-    assert(pos>=0);
+    assert(pos >= 0);
     nr.Assign(this, {pos, pos+n});
-    if ((int)sz_<pos+n)
-      sz_ = pos+n;
+    if ((int)sz_ < pos+n)
+      Add(pos + n - sz_);   // old: sz_ = pos+n;
     return nr;
   }
 
   /////////////////////// Access value vectors ///////////////////////
 
-  /// Assign from ArrayRef<int>. Always copy the values.
+  /// Assign from vector<int>.
   /// Some (target) node assignments can be longer vectors:
   /// e.g., Gurobi adds variables for FeasRelax.
   ValueNode& operator=(std::vector<int> ai)
@@ -208,15 +254,18 @@ public:
   /// Retrieve whole vector<VCString&>&
   operator const std::vector<VCString>& () const { return vStr_; }
 
-  /// Retrieve whole vector<VCString&>&
+  /// Retrieve whole const vector<VCString&>&
   const std::vector<VCString>& GetStrVec() const { return vStr_; }
+
+  /// Retrieve whole vector<VCString&>&
+  std::vector<VCString>& GetStrVec() { return vStr_; }
 
 
   /////////////////////// Access individual values ///////////////////////
 
   /// Retrieve T, dummy version
   template <class T>
-  const T& GetVal(size_t ) const { return {}; }
+  const T& GetVal(size_t ) const { assert(false); return {}; }
 
   /// Set T, dummy version
   template <class T>
@@ -256,6 +305,25 @@ public:
     assert(i<Size());   // index into the originally declared suffix size
     if (vStr_.size()<=i)  // can happen after CopySrcDest / CopyDestSrc
       vStr_.resize(Size());
+    assert(localcounts_.size() == Size());
+    assert(localcounts_[i]);
+    assert(namechunks_.size() == Size());
+    if (!IsEmptyString(namechunks_[i])) {   // Add "_exp1" etc.
+      v += '_';
+      v += namechunks_[i];
+      if (i<Size()-1) {      // not the last item
+        if (localcounts_[i] != localcounts_[i+1]) {
+          v += std::to_string(localcounts_[i]);
+          v += '_';
+        } else {
+          assert(1 == localcounts_[i]);
+          assert(1 == localcounts_[i+1]);
+        }
+      } else if (localcounts_[i]>1) {       // not the 1st element
+        v += std::to_string(localcounts_[i]);
+        v += '_';
+      }
+    }
     vStr_[i] = std::move(v);
   }
 
@@ -329,37 +397,50 @@ private:
   std::vector<double> vd_;
   std::vector<VCString> vStr_;
   size_t sz_=0;
+  /// Can be used as name chunk
   std::string name_ = "default_value_node";
+  /// Probably don't need to copy:
+  /// \brief Current local item counter (for subnodes of a parent)
+  int localcounter_=0;
+  std::vector<int> localcounts_;  // counter value for each entry
+
+  /// Collection of default name chunks.
+  /// We remember old ones because we use them as pointers
+  std::unordered_set<std::string> nc_dfl_set_;
+  /// Default name chunk, applied to new entries.
+  /// Initialized to ShortTypeName in the main constructor.
+  NameChunk nc_default_ {"nc_not_init"};
+  std::vector<NameChunk> namechunks_;
 };
 
 
 template <>
-std::vector<double>& ValueNode::GetValVec<double>() { return vd_; }
+inline std::vector<double>& ValueNode::GetValVec<double>() { return vd_; }
 
 template <>
-std::vector<int>& ValueNode::GetValVec<int>() { return vi_; }
+inline std::vector<int>& ValueNode::GetValVec<int>() { return vi_; }
 
 template <>
-std::vector<VCString>& ValueNode::GetValVec<VCString>() { return vStr_; }
+inline std::vector<VCString>& ValueNode::GetValVec<VCString>() { return vStr_; }
 
 template <>
-const double& ValueNode::GetVal<double>(size_t i) const { return GetDblRef(i); }
+inline const double& ValueNode::GetVal<double>(size_t i) const { return GetDblRef(i); }
 
 template <>
-const int& ValueNode::GetVal<int>(size_t i) const { return GetIntRef(i); }
+inline const int& ValueNode::GetVal<int>(size_t i) const { return GetIntRef(i); }
 
 template <>
-const VCString& ValueNode::GetVal<VCString>(size_t i) const
+inline const VCString& ValueNode::GetVal<VCString>(size_t i) const
 { return GetStr(i); }
 
 template <>
-void ValueNode::SetVal<double>(size_t i, double v) { SetDbl(i, v); }
+inline void ValueNode::SetVal<double>(size_t i, double v) { SetDbl(i, v); }
 
 template <>
-void ValueNode::SetVal<int>(size_t i, int v) { SetInt(i, v); }
+inline void ValueNode::SetVal<int>(size_t i, int v) { SetInt(i, v); }
 
 template <>
-void ValueNode::SetVal<VCString>(size_t i, VCString v)
+inline void ValueNode::SetVal<VCString>(size_t i, VCString v)
 { SetStr(i, std::move(v)); }
 
 
@@ -379,7 +460,7 @@ ValueNode CreateArray(BasicValuePresolver& vp) { return ValueNode{vp}; }
 /// @return always true currently
 template <class Vec>
 inline
-bool CopyRange(Vec& src, Vec& dest, NodeIndexRange ir, int i1) {
+bool CopyRange(const Vec& src, Vec& dest, NodeIndexRange ir, int i1) {
   assert(ir.end_ <= (int)src.size());
   assert(i1 + ir.Size() <= (int)dest.size());
   std::copy(src.begin()+ir.beg_, src.begin()+ir.end_,

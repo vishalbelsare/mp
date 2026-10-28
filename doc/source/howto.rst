@@ -36,7 +36,7 @@ Recommended setup
 ~~~~~~~~~~~~~~~~~~~~~
 
 The recommended driver structure is to use the
-:ref:`Backend class hierarchy with FlatModelAPI <recommended-driver-logic>`.
+:ref:`Backend class hierarchy with FlatModelAPI or ExprModelAPI <recommended-driver-logic>`.
 Examples: :ref:`flat-solvers`.
 
 
@@ -203,6 +203,89 @@ the following:
    void AddConstraint(const LinConEQ& lc);
    ACCEPT_CONSTRAINT(LinConGE, Recommended, CG_Linear)
    void AddConstraint(const LinConGE& lc);
+
+   /// NEW: expression trees
+   //////////////////////////// EXPRESSION TREES ////////////////////////////
+   /// Handle expression trees: inherit basic API
+   USE_BASE_EXPRESSION_HANDLERS(BaseModelAPI)
+
+   /// Overall switch
+   ACCEPT_EXPRESSION_INTERFACE(Recommended);
+
+   /// GetVarExpression(\a i): expression representing variable 0<=i<n_var.
+   /// Only called for 'nonlinear' variables.
+   Expr GetVarExpression(int i) { return MakeVarExpr(i); }
+
+   /// GetZeroExpr(): constant 0.0 expression.
+   /// Can be used to represent empty expression in an NLConstraint.
+   Expr GetZeroExpression() { return MakeEmptyExpr(); }
+
+   /// Gurobi 12 has no classical NL range constraint
+   ACCEPT_CONSTRAINT(NLConstraint, NotAccepted, CG_Algebraic)
+
+   /// NLAssignEQ: algebraic expression expicifier.
+   /// Meaning: var == expr.
+   /// @note Accessors: GetName(), GetExpression(nle), GetVariable(nle).
+   ACCEPT_CONSTRAINT(NLAssignEQ, Recommended, CG_General)
+   void AddConstraint(const NLAssignEQ& nle);
+   /// NLAssignLE: algebraic expression expicifier in positive context.
+   /// Meaning: var <= expr.
+   /// @note Accessors: GetName(), GetExpression(nle), GetVariable(nle).
+   ACCEPT_CONSTRAINT(NLAssignLE, Recommended, CG_General)
+   void AddConstraint(const NLAssignLE& nle);
+   /// NLAssignGE: algebraic expression expicifier in negative context.
+   /// Meaning: var >= expr.
+   /// @note Accessors: GetName(), GetExpression(nle), GetVariable(nle).
+   ACCEPT_CONSTRAINT(NLAssignGE, Recommended, CG_General)
+   void AddConstraint(const NLAssignGE& nle);
+
+   /// @brief Accept NLAffineExpr.
+   /// @note Use accessors, not methods;
+   /// - GetLinSize(le), GetLinCoef(le, i), GetLinTerm(le, i);
+   ///   GetConstTerm(le).
+   ACCEPT_EXPRESSION(NLAffineExpression, Recommended);
+   Expr AddExpression(const NLAffineExpression& le);
+
+   /// Accept NLQuadExpr.
+   /// @note Use accessors, not methods;
+   /// - GetLinSize(le), GetLinCoef(le, i), GetLinTerm(le, i);
+   ///   GetQuadSize(le), GetQuadCoef(le, i),
+   ///   GetQuadTerm1(le, i), GetQuadTerm2(le, i);
+   ///   GetConstTerm(le).
+   ACCEPT_EXPRESSION(NLQuadExpression, Recommended);
+   Expr AddExpression(const NLQuadExpression& le);
+
+   /// Each expression can be accepted as a proper expression,
+   /// or as a flat functional constraint var <=/==/>= expr
+   /// (in this case, with variables as arguments).
+   /// The uequality/inqeuality type of the flat constraint is
+   /// determied by GetContext().
+   ///
+   /// @note Use accessor: GetArgExpression(ee, 0)
+   /// - don't AbsExpression's methods.
+   ///
+   /// Similar for other expression types.
+
+
+   ACCEPT_EXPRESSION(ExpExpression, Recommended)
+   Expr AddExpression(const ExpExpression& );
+   ACCEPT_EXPRESSION(ExpAExpression, Recommended)
+   Expr AddExpression(const ExpAExpression& );
+   ACCEPT_EXPRESSION(LogExpression, Recommended)
+   Expr AddExpression(const LogExpression& );
+   ACCEPT_EXPRESSION(LogAExpression, Recommended)
+   Expr AddExpression(const LogAExpression& );
+   /// @note Use accessor: GetParameter(pe, 0)
+   ///   - don't use PowExpression's methods.
+   ACCEPT_EXPRESSION(PowExpression, Recommended)
+   Expr AddExpression(const PowExpression& );
+   ACCEPT_EXPRESSION(SinExpression, Recommended)
+   Expr AddExpression(const SinExpression& );
+   ACCEPT_EXPRESSION(CosExpression, Recommended)
+   Expr AddExpression(const CosExpression& );
+
+   ACCEPT_EXPRESSION(DivExpression, Recommended)
+   Expr AddExpression(const DivExpression& );
 
 
 Note that after `InitProblemModificationPhase()` has been called,
@@ -476,6 +559,114 @@ do the following:
    to their optimal values and solve the resulting LP; subsequent calls
    to `GetBasis()`, as well as dual solution and sensitivity information should
    correspond to that LP solution.
+
+For linear algebraic models, COPT, MOSEK, HiGHS, and SCIP implement this
+operation by emulation. The shared ``FlatBackend`` helper validates input
+eligibility, publishes fixed-LP results only after successful extraction,
+and handles supplementary failures without replacing the MIP outcome.
+Driver implementations of ``SolveFixedLP()`` live in their backend source
+files and create separate continuous models. They apply
+``fixed_model_time_limit()`` and ``fixed_model_iter_limit()`` to those
+models, leaving MIP limits unchanged. Their basis accessors use
+``FixedLPBasis()`` for postsolve mapping; solution accessors select the
+fixed result when available. Drivers must check incumbent feasibility
+before fixing values and respect their solver's integrality tolerance.
+
+
+Plateau stop (:ref:`plateauStop`, :ref:`plateauStopBound`)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+All the timing/tolerance bookkeeping for this feature lives in
+`MIPBackend` already; a driver only needs to wire its native
+callback(s) to it, in a single overridden method.
+
+1. In your `Backend` class, declare:
+
+   .. code-block:: c++
+
+      ALLOW_STD_FEATURE( PLATEAU_STOP, true )
+
+2. Override `SetupPlateauCallbacks()` to register whatever native
+   callback(s) you need (this is called once, only if
+   ``mip:plateau:time`` is set, right where the interrupter is set up):
+
+   .. code-block:: c++
+
+      void GurobiBackend::SetupPlateauCallbacks() {
+        GRB_CALL( GRBsetcallbackfunc(
+            model(), &GurobiBackend::DoPlateauCallback, this) );
+      }
+
+   From within the native callback, call `ReportIncumbentForPlateau()`
+   with each new incumbent objective value; if it returns ``true``,
+   terminate the native solve right there (the same call your
+   `SetInterrupter()` implementation already uses for Ctrl-C, e.g.
+   ``GRBterminate``):
+
+   .. code-block:: c++
+
+      int __stdcall GurobiBackend::DoPlateauCallback(
+          GRBmodel* model, void* cbdata, int where, void* usrdata) {
+        auto* backend = static_cast<GurobiBackend*>(usrdata);
+        if (GRB_CB_MIPSOL == where) {
+          double obj = 0.0;
+          if (!GRBcbget(cbdata, where, GRB_CB_MIPSOL_OBJBST, &obj)
+              && backend->ReportIncumbentForPlateau(obj))
+            GRBterminate(model);
+        }
+        return 0;
+      }
+
+3. If the solver can also cheaply report the MIP gap from the same
+   (or another) native callback, additionally declare:
+
+   .. code-block:: c++
+
+      ALLOW_STD_FEATURE( PLATEAU_STOP_BOUND, true )
+
+   and, from wherever `SetupPlateauCallbacks()` gives you a
+   gap-bearing callback, call `ReportGapForPlateau(absgap, relgap)`
+   with the current absolute and relative MIP gap.
+
+   Not every solver hands you a ready-made gap value the way HiGHS
+   does (``mip_gap``, relative, populated for free); a driver without
+   that convenience derives both values itself from whatever
+   incumbent/bound values its own callback already provides. Gurobi's
+   ``GRB_CB_MIP`` (periodic, independent of new incumbents) is a
+   worked example:
+
+   .. code-block:: c++
+
+      // Inside GurobiBackend::DoPlateauCallback(), GRB_CB_MIP branch:
+      double bound = 0.0, objbst = 0.0;
+      bool haveBound = !GRBcbget(cbdata, where, GRB_CB_MIP_OBJBND, &bound);
+      if (haveBound && !GRBcbget(cbdata, where, GRB_CB_MIP_OBJBST, &objbst)) {
+        double absgap = std::fabs(objbst - bound);
+        double relgap = absgap / std::max(1e-10, std::fabs(objbst));
+        if (backend->ReportGapForPlateau(absgap, relgap))
+          GRBterminate(model);
+      }
+
+  
+4. If the solver has a native callback context that fires
+   independently of both incumbents and gap updates (e.g. Gurobi's
+   ``GRB_CB_POLLING``, a generic always-on context with no MIP-specific
+   data attached), call `CheckTimeoutForPlateau()` from it instead --
+   it evaluates the same shared stop condition (including the warmup
+   gate) without needing a fresh value to report:
+
+   .. code-block:: c++
+
+      // Inside GurobiBackend::DoPlateauCallback(), GRB_CB_POLLING branch:
+      else if (GRB_CB_POLLING == where) {
+        if (backend->CheckTimeoutForPlateau())
+          GRBterminate(model);
+      }
+
+   This keeps the plateau clock being checked even during long
+   stretches with no new incumbent and no gap channel active, rather
+   than only ever re-evaluating the stop condition as a side effect of
+   `ReportIncumbentForPlateau()`/`ReportGapForPlateau()`.
 
 
 .. _implement-custom-features:

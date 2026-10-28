@@ -2,7 +2,7 @@
   {
     "name": "warmstart_01 warmstart=2",
     "tags": [ "linear", "warmstart"],
-    "options": { "ANYSOLVER_options": "warmstart=2 debug=1" },
+    "options": { "mp_options": "warmstart=2 debug=1" },
     "values": {
       "Buy['BEEF'].test_ini_pri": -10,
       "Buy['MTL'].test_ini_pri": 50,
@@ -12,12 +12,105 @@
  {
     "name": "mipstart_01",
     "tags": [ "linear", "mipstart"],
-    "options": { "ANYSOLVER_options": "warmstart=1 debug=1" },
+    "options": { "mp_options": "warmstart=1 debug=1" },
     "objective": 1,
     "values": {
       "x.test_ini_mip": 1,
       "y.test_ini_mip": 0,
       "z.test_ini_mip": 1
     }
+  },
+  {
+    "name": "mipstart_01 mip:start:effort=4 CPLEX",
+    "tags": [ "linear", "mipstart"],
+    "options": {
+      "mp_options": "warmstart=1 debug=1",
+      "cplex_options": "mip:start:effort=4"
+    },
+    "solvers": ["cplex"],
+    "objective": 1,
+    "values": {
+      "x.test_ini_mip": 1,
+      "y.test_ini_mip": 0,
+      "z.test_ini_mip": 1
+    }
+  },
+  {
+    "name": "knap_40_pstart partial MIP start native",
+    "tags": [ "linear", "integer", "mipstart"],
+    "comment": "HiGHS completes the partial start itself (mip:start=1); with lim:nodes=0 the completed start (766) stays the incumbent",
+    "solvers": ["highs"],
+    "options": {
+      "mp_options": "warmstart=1 lim:nodes=0 mip:heureff=0 pre:solve=off",
+      "highs_options": "mip:start=1 tech:outlev=1"
+    },
+    "objective": 766,
+    "output": [ "MIP start solution is feasible, objective value is 766" ]
+  },
+  {
+    "name": "knap_40_pstart partial MIP start legacy",
+    "tags": [ "linear", "integer", "mipstart"],
+    "comment": "Driver-side completion (mip:start=2): fix the given values, solve, unfix, pass the complete start; no node limit because the completion sub-solve inherits it",
+    "solvers": ["highs"],
+    "options": {
+      "mp_options": "warmstart=1 mip:heureff=0 pre:solve=off",
+      "highs_options": "mip:start=2 tech:outlev=1"
+    },
+    "objective": 1044,
+    "output": [ "MIP start solution is feasible, objective value is 766" ]
+  },
+  {
+    "name": "knap_40_pstart partial MIP start maxstartnodes=0",
+    "tags": [ "linear", "integer", "mipstart"],
+    "comment": "The start cannot be completed within 0 nodes and is dropped; with lim:nodes=0 no incumbent results",
+    "solvers": ["highs"],
+    "options": {
+      "mp_options": "warmstart=1 lim:nodes=0 mip:heureff=0 pre:solve=off",
+      "highs_options": "mip:start=1 mip:maxstartnodes=0"
+    },
+    "values": {
+      "solve_result": "limit",
+      "solve_message": { "contains": "no solution" }
+    }
+  },
+  {
+    "name": "nlp_warmstart_01",
+    "files": [ "nlp_warmstart_01.run" ],
+    "tags": [ "nonlinear", "continuous", "warmstart", "sstatus" ],
+    "comment": "The 2nd solve allows no major iterations: 'solved' only if the warm start is accepted",
+    "solvers": [ "snopt777" ],
+    "objective": 17.0140173,
+    "values": { "solve_result_num": 0 }
+  },
+  {
+    "name": "nlp_warmstart_01 cold start",
+    "files": [ "nlp_warmstart_01.run" ],
+    "tags": [ "nonlinear", "continuous", "warmstart", "sstatus" ],
+    "comment": "Negative control: without the incoming basis and point the 2nd solve hits the limit",
+    "solvers": [ "snopt777" ],
+    "options": { "snopt777_options": "alg:start=0" },
+    "values": { "if solve_result_num >= 400 and solve_result_num < 500 then 1 else 0": 1 }
+  },
+  {
+    "name": "ws_hint_01",
+    "tags": [ "integer", "logical", "mipstart" ],
+    "objective": 62
+  },
+  {
+    "name": "ws_hint_01 fixed to hints CP-SAT",
+    "files": [ "ws_hint_01.mod" ],
+    "tags": [ "integer", "logical", "mipstart" ],
+    "solvers": [ "cpsat" ],
+    "options": { "cpsat_options": "params='fix_variables_to_their_hinted_value:true'" },
+    "objective": 25
+  },
+  {
+    "name": "ws_hint_01 alg:start=0 fixed to hints CP-SAT",
+    "files": [ "ws_hint_01.mod" ],
+    "tags": [ "integer", "logical", "mipstart" ],
+    "comment": "Negative control: no hints, so nothing is fixed",
+    "solvers": [ "cpsat" ],
+    "options": { "cpsat_options": "alg:start=0 params='fix_variables_to_their_hinted_value:true'" },
+    "objective": 62
   }
 ]

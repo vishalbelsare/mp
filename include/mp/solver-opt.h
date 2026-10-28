@@ -2,21 +2,26 @@
 #define SOLVEROPT_H
 
 #include <set>
+#include <functional>
 #include <cstdint>
 #include <cassert>
 #include <typeinfo>
+#include <variant>
 
 #include "mp/error.h"
 #include "mp/format.h"
+#include "mp/utils-string.h"
 
 
 namespace mp {
 
 /// Information about a possible option value.
 struct OptionValueInfo {
-  const char *value;
+  const char *value;       // This is presented to the user
   const char *description;
-  intptr_t data;  // Solver-specific data associated with this value.
+  /// Solver-specific data associated with this value.
+  /// This is actually given to / taken from the solver.
+  std::variant<intptr_t, const char*> data;
 };
 
 /// A reference to an array of OptionValueInfo objects.
@@ -71,9 +76,7 @@ template <>
 struct OptionHelper<fmt::LongLong> {
   typedef fmt::LongLong Arg;
   static void Write(fmt::Writer &w, Arg value) { w << value; }
-  static fmt::LongLong Parse(const char *&s, bool splitString=false) {
-    return OptionHelper<int>::Parse(s, splitString);
-  }
+  static fmt::LongLong Parse(const char *&s, bool splitString=false);
   static fmt::LongLong CastArg(fmt::LongLong value) { return value; }
 };
 
@@ -102,7 +105,18 @@ inline OptionError OptionTypeError(fmt::StringRef name, fmt::StringRef type) {
 }  // namespace internal
 
 
+/// Formats and return the string (possibly containing RST markup).
+/// Useful for formatting error messages to fit a predetermined terminal width
+/// Placed here to avoid polluting utils-string with unnecessary includes.
+template <class Str> std::string format_error(const Str& str) {
+  fmt::MemoryWriter writer;
+  internal::FormatRST(writer, str);
+  return writer.str();
+}
+
+
 /// A solver option.
+/// @note description "HIDDEN" means the option is not printed
 class SolverOption {
 public:
   /// Constructs a SolverOption object.
@@ -145,25 +159,35 @@ public:
   { return inline_synonyms_; }
   /// Add additional "inline" synonyms
   void add_synonyms_front(const char* names_list);
+  /// Add "inline" synonyms to the back
   void add_synonyms_back(const char* names_list);
+
+  /// Is hidden?
+  bool is_hidden() const { return "HIDDEN"==description_; }
 
   /// Wildcards
   bool is_wildcard() const { return wc_headtails_.size(); }
   /// Checks if matches, then saves key & body
   bool wc_match(const std::string& key);
+  /// Wildcard head
   const std::string& wc_head() const
   { assert(is_wildcard()); return wc_headtails_[0].first; }
+  /// Wildcard tail
   const std::string& wc_tail() const
   { assert(is_wildcard()); return wc_headtails_[0].second; }
+  /// Last wildcard key
   const std::string& wc_key_last() const { return wc_key_last_; }
+  /// Last wildcard keybody
   const std::string& wc_keybody_last() const { return wc_body_last_; }
   /// Printing last parsed wc key in std form
   std::string wc_key_last__std_form() const
   { return wc_head() + wc_body_last_ + wc_tail(); }
 
-  /// Return/set the option description.
+  /// Option description.
   const char *description() const { return description_.c_str(); }
+  /// Set option description
   void set_description(const char* d) { description_=d; }
+  /// Add to option description
   void add_to_description(const char* d) { description_ += d; }
 
   /// Append the formatted description to the writer
@@ -198,7 +222,7 @@ public:
     GetValue(value);
     if (value < std::numeric_limits<int>::min() ||
         value > std::numeric_limits<int>::max()) {
-      throw Error("Value {} doesn't fit in int", value);
+      throw Error(fmt::format("Value {} doesn't fit in int", value));
     }
     int_value = static_cast<int>(value);
   }
@@ -212,7 +236,7 @@ public:
 
   /// Sets the option value or throws InvalidOptionValue if the value is invalid.
   virtual void SetValue(fmt::LongLong) {
-    throw internal::OptionTypeError(name_, "int");
+    throw internal::OptionTypeError(name_, "long long");
   }
   virtual void SetValue(double) {
     throw internal::OptionTypeError(name_, "double");
@@ -289,7 +313,7 @@ private:
   template <typename T>
   static std::string Format(fmt::StringRef name, T value, fmt::StringRef msg) {
     if (0!=msg.size())
-      return fmt::format("Invalid value \"{}\" for option \"{}\", {}",
+      return fmt::format("Invalid value \"{}\" for option \"{}\": {}",
                          value, name, msg);
     else
       return fmt::format("Invalid value \"{}\" for option \"{}\"", value, name);
@@ -305,6 +329,8 @@ public:
     : OptionError(Format(opt.name(), value, msg)) {}
 };
 
+
+/// Typed solver option
 template <typename T>
 class TypedSolverOption : public SolverOption {
 public:
@@ -324,11 +350,15 @@ public:
   ///                     monolithic, space separated and quotes have to be considered.
   void Parse(const char *&s, bool splitString=false) override {
     const char *start = s;
-    T value = internal::OptionHelper<T>::Parse(s, splitString);
-    if (*s && !std::isspace(*s)) {
-      do ++s;
-      while (*s && !std::isspace(*s));
-      throw InvalidOptionValue(name(), std::string(start, s - start));
+    T value;
+    try {
+      value = internal::OptionHelper<T>::Parse(s, splitString);
+    } catch (const std::exception& exc) {
+      // undocumented: we accept next option after a numeric option
+      s = SkipNonSpaces(s);
+      throw InvalidOptionValue(name(),
+                               std::string(start, s - start),
+                               exc.what());
     }
     SetValue(value);
   }
@@ -342,15 +372,12 @@ public:
       return Option_Type::STRING;
     throw std::runtime_error("Type not found!");
   }
-
 };
 
 
-/// A collection of solver options.
+/// A collection of solver options
 class SolverOptionManager {
-
 public:
-
   /// Returns the number of options.
   int num_options() const { return static_cast<int>(options_.size()); }
 
@@ -362,7 +389,49 @@ public:
     return opt;
   }
 
-  /// Handler should be a class derived from BasicSolver that will receive
+
+  /// Option with generic get/set functors.
+  template <typename T, typename AccessorT = T>
+  class DirectOption : public TypedSolverOption<T> {
+    using Getter = std::function<AccessorT (void)>;
+    using Setter = std::function<
+        void (typename internal::OptionHelper<AccessorT>::Arg)>;
+
+    Getter getter_;
+    Setter setter_;
+
+  public:
+    /// Construct
+    DirectOption(const char *name, const char *description,
+                   Getter get, Setter set, ValueArrayRef values = ValueArrayRef())
+        : TypedSolverOption<T>(name, description, values),
+        getter_(get), setter_(set) {}
+
+    /// Implement GetValue
+    void GetValue(T &value) const override { value = (T)getter_(); }
+    /// Implement SetValue
+    void SetValue(typename internal::OptionHelper<T>::Arg value)
+        override {
+      setter_(internal::OptionHelper<AccessorT>::CastArg(value));
+    }
+  };
+
+  /// Simple direct option.
+  /// @note description "HIDDEN" means the option is not printed
+  template <class Value>
+  void AddOption(const char *name, const char *description,
+      std::function<Value ()> get,
+      std::function<
+          void (typename internal::OptionHelper<Value>::Arg)> set,
+      ValueArrayRef values = ValueArrayRef()) {
+    AddOption(OptionPtr(
+        new DirectOption<Value>(
+            name, description, get, set, values)));
+  }
+
+
+  /// Handler should be, e.g.,
+  /// a class derived from BasicSolver that will receive
   /// notifications about parsed options.
   template <typename Handler, typename T, typename AccessorT = T>
   class ConcreteOption : public TypedSolverOption<T> {
@@ -388,6 +457,9 @@ public:
                        internal::OptionHelper<AccessorT>::CastArg(value));
     }
   };
+
+
+  /// @tparam InfoArg: e.g., solver parameter key
   template <typename Handler, typename T,
             typename Info, typename InfoArg = Info, typename AccessorT = T>
   class ConcreteOptionWithInfo : public TypedSolverOption<T> {
@@ -421,6 +493,41 @@ public:
     }
   };
 
+
+	/// Flag option
+	/// @param Handler is a class (derived from BasicSolver?)
+	template <class Handler>
+	class FlagOption : public SolverOption {
+		typedef bool (Handler::*Get)(const SolverOption &) const;
+		typedef void (Handler::*Set)(
+				const SolverOption &, bool );
+
+		Handler &handler_;
+		Get get_;
+		Set set_;
+
+	public:
+		/// Construct
+		FlagOption(const char* name, const char* descr,
+							 Handler* s, Get get, Set set)
+			: SolverOption(name, descr, ValueArrayRef(),
+																					true),    // true: for flag
+			handler_(*s), get_(get), set_(set) {}
+
+		void Write(fmt::Writer& w)
+		{ w << ((handler_.*get_)(*this) ? "true" : "false"); }
+		void Parse(const char*&, bool b)
+		{ (handler_.*set_)(*this, b); }
+		Option_Type type() {
+			return Option_Type::BOOL;
+		}
+    void GetValue(int &v) const override { v = (handler_.*get_)(*this); }
+    /// For retrieving of int options via the base class
+    void GetValue(fmt::LongLong &v) { v = (handler_.*get_)(*this); }
+    void SetValue(int v) override { (handler_.*set_)(*this, v); }
+  };
+
+
   /// Sets a text to be displayed before option descriptions.
   void set_option_header(const char *header) { option_header_ = header; }
 
@@ -453,13 +560,13 @@ public:
 
   /// Returns the value of an integer option.
   /// Throws OptionError if there is no such option or it has a different type.
-  fmt::LongLong GetIntOption(const char *name) const {
-    return GetOption(name)->GetValue<fmt::LongLong>();
+  int GetIntOption(const char *name) const {
+    return GetOption(name)->GetValue<int>();
   }
 
   // Sets the value of an integer option.
   // Throws OptionError if there is no such option or it has a different type.
-  void SetIntOption(const char *name, fmt::LongLong value) {
+  void SetIntOption(const char *name, int value) {
     GetOption(name)->SetValue(value);
   }
 
@@ -502,11 +609,19 @@ public:
         value_(v) {}
 
     void GetValue(Value &v) const override { v = value_; }
+    /// For retrieving of int options via the base class
+    void GetValue(fmt::LongLong &v) const override {
+      if constexpr (std::is_integral_v<Value>)
+        v = (fmt::LongLong)value_;
+      else
+        MP_RAISE("Requested integral value of a non-integer option");
+    }
     void SetValue(typename internal::OptionHelper<Value>::Arg v) override
     { value_ = v; }
   };
 
   /// Simple stored option referencing a variable
+  /// @note description "HIDDEN" means the option is not printed
   template <class Value>
   void AddStoredOption(const char *name, const char *description,
                        Value& value, ValueArrayRef values = ValueArrayRef()) {
@@ -517,8 +632,9 @@ public:
 
   /// Simple stored option referencing a variable; min, max values
   /// (they are unused but to deduce type;
-  /// we aree too lazy to maintain correct min/max
+  /// we are too lazy to maintain correct min/max
   /// between solver versions.)
+  /// @note description "HIDDEN" means the option is not printed
   template <class Value>
   void AddStoredOption(const char *name, const char *description,
                        Value& value, Value , Value ) {
@@ -528,6 +644,7 @@ public:
   }
 
   /// Same: stored option referencing a variable; min, max values
+  /// @note description "HIDDEN" means the option is not printed
   template <class Value>
   void AddOption(const char *name, const char *description,
                  Value& value, Value lb, Value ub) {
@@ -549,14 +666,17 @@ public:
       : mp::TypedSolverOption<value_type>(
           name_list, description, values), value_(v) {}
 
-    void GetValue(value_type &v) const override
-    { assert(value_.size()); v = value_.back(); }
+    void GetValue(value_type &v) const override {
+      if (value_.size())
+        v = value_.back();
+    }
     void SetValue(
         typename internal::OptionHelper<value_type>::Arg v) override
     { value_.push_back(v); }
   };
 
   /// Add list option referencing a container
+  /// @note description "HIDDEN" means the option is not printed
   template <class Value>
   void AddListOption(const char *name, const char *description,
                        Value& value, ValueArrayRef values = ValueArrayRef()) {
@@ -569,6 +689,7 @@ public:
   /// (they are unused but to deduce type;
   /// we aree too lazy to maintain correct min/max
   /// between solver versions.)
+  /// @note description "HIDDEN" means the option is not printed
   template <class Value>
   void AddListOption(const char *name, const char *description,
                        Value& value,
@@ -615,12 +736,14 @@ public:
   /// string literals).
   /// The arguments get and set should be pointers to member functions in the
   /// solver class. They are used to get and set an option value respectively.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Int>
   void AddIntOption(const char *name,
                     const char *description, Int (Handler::*get)(const SolverOption &) const,
-                    void (Handler::*set)(const SolverOption &, Int)) {
+                    void (Handler::*set)(const SolverOption &, Int),
+                    ValueArrayRef values = ValueArrayRef()) {
     AddOption(OptionPtr(new ConcreteOption<Handler, fmt::LongLong, Int>(
-                          name, description, this, get, set)));
+                          name, description, this, get, set, values)));
   }
 
   /// Adds an integer option with additional information.
@@ -629,6 +752,7 @@ public:
   /// string literals).
   /// The arguments get and set should be pointers to member functions in the
   /// solver class. They are used to get and set an option value respectively.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Info>
   void AddIntOption(const char *name, const char *description,
                     int (Handler::*get)(const SolverOption &, const Info &) const,
@@ -640,6 +764,7 @@ public:
   }
 
   /// The same as above but with Info argument passed by value.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Info>
   void AddIntOption(const char *name_list, const char *description,
                     int (Handler::*get)(const SolverOption &, Info) const,
@@ -655,6 +780,7 @@ public:
   /// string literals).
   /// The arguments get and set should be pointers to member functions in the
   /// solver class. They are used to get and set an option value respectively.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler>
   void AddDblOption(const char *name, const char *description,
                     double (Handler::*get)(const SolverOption &) const,
@@ -669,6 +795,7 @@ public:
   /// string literals).
   /// The arguments get and set should be pointers to member functions in the
   /// solver class. They are used to get and set an option value respectively.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Info>
   void AddDblOption(const char *name, const char *description,
                     double (Handler::*get)(const SolverOption &, const Info &) const,
@@ -680,6 +807,7 @@ public:
   }
 
   /// The same as above but with Info argument passed by value.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Info>
   void AddDblOption(const char *name, const char *description,
                     double (Handler::*get)(const SolverOption &, Info) const,
@@ -694,6 +822,7 @@ public:
   /// string literals).
   /// The arguments get and set should be pointers to member functions in the
   /// solver class. They are used to get and set an option value respectively.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler>
   void AddStrOption(const char *name, const char *description,
                     std::string (Handler::*get)(const SolverOption &) const,
@@ -709,6 +838,7 @@ public:
   /// string literals).
   /// The arguments get and set should be pointers to member functions in the
   /// solver class. They are used to get and set an option value respectively.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Info>
   void AddStrOption(const char *name, const char *description,
                     std::string (Handler::*get)(const SolverOption &, const Info &) const,
@@ -720,6 +850,7 @@ public:
   }
 
   /// The same as above but with Info argument passed by value.
+  /// @note description "HIDDEN" means the option is not printed
   template <typename Handler, typename Info>
   void AddStrOption(const char *name, const char *description,
                     std::string (Handler::*get)(const SolverOption &, Info) const,
@@ -728,6 +859,21 @@ public:
     AddOption(OptionPtr(new ConcreteOptionWithInfo<Handler, std::string, Info>(
                           name, description, this, get, set, info, values)));
   }
+
+	/// Adds a flag option.
+	/// The option stores pointers to the name and the description so make
+	/// sure that these strings have sufficient lifetimes (normally these are
+	/// string literals).
+	/// The arguments get and set should be pointers to member functions in the
+	/// solver class. They are used to get and set an option value respectively.
+	/// @note description "HIDDEN" means the option is not printed
+	template <typename Handler>
+	void AddFlagOption(const char *name, const char *description,
+										bool (Handler::*get)(const SolverOption &) const,
+										void (Handler::*set)(const SolverOption &, bool)) {
+		AddOption(OptionPtr(new FlagOption<Handler>(
+													name, description, (Handler*)this, get, set)));
+	}
 
 private:
   struct OptionNameLess {

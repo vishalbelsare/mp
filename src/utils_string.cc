@@ -38,4 +38,16 @@ std::vector<std::string> split_string(
   return result;
 }
 
+bool begins_with(std::string_view fullString, std::string_view start) {
+  if (fullString.length() >= start.length())
+    return (0 == fullString.compare(0, start.length(), start));
+  return false;
+}
+
+bool ends_with(std::string_view fullString, std::string_view ending) {
+  if (fullString.length() >= ending.length())
+    return (0 == fullString.compare(fullString.length() - ending.length(), ending.length(), ending));
+  return false;
+}
+
 }  // namespace mp

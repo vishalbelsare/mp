@@ -52,7 +52,7 @@
 #include <limits.h> /* Needed for g++ -m32 on MacOSX. */
 #include <string>
 
-#include "mp/clock.h"
+#include "mp/utils-clock.h"
 #include "mp/solver.h"
 
 namespace mp {
@@ -87,6 +87,7 @@ class IlogCPSolver : public SolverImpl<Problem> {
     DEBUGEXPR,
     USENUMBEROF,
     SOLUTION_LIMIT,
+    IIS_FIND,
     NUM_OPTIONS
   };
 
@@ -108,6 +109,21 @@ class IlogCPSolver : public SolverImpl<Problem> {
   };
 
   std::string filenames_[NUM_FILES];
+
+  // CP Optimizer defaults of the parameters shared with the CPLEX path,
+  // recorded at construction: only changed values are forwarded to CPLEX.
+  struct CPDefaults {
+    IloNum opttol, relopttol;
+    IloInt seed;
+  } cp_defaults_;
+
+  // Apply the options that have a CPLEX counterpart to the CPLEX optimizer.
+  void ApplyCommonOptionsToCPLEX();
+  // Run the conflict refiner of the given optimizer and report the IIS
+  // through suffixes and the message writer.
+  template <typename Alg>
+  void ReportConflict(Problem &p, Alg alg, const MPToConcertConverter &converter,
+                      fmt::MemoryWriter &writer, bool with_var_bounds);
 
   std::string GetOptimizer(const SolverOption &) const;
   void SetOptimizer(const SolverOption &opt, fmt::StringRef value);
@@ -144,7 +160,7 @@ class IlogCPSolver : public SolverImpl<Problem> {
   void SetCPLEXIntOption(const SolverOption &opt, int value, int param);
 
   struct Stats {
-    steady_clock::time_point time;
+    std::chrono::steady_clock::time_point time;
     double setup_time;
     double solution_time;
   };

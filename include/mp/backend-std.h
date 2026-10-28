@@ -21,11 +21,17 @@
 #ifndef STD_BACKEND_H_
 #define STD_BACKEND_H_
 
+#include <chrono>
 #include <cmath>
+#include <limits>
+#include <cstdio>
 #include <functional>
+#include <variant>
+#include <unordered_map>
 
-#include "mp/clock.h"
 #include "mp/backend-with-mm.h"
+#include "mp/backend-slvoptmap.h"
+#include "mp/util-json-write.h"
 
 /// Issue this if you redefine std feature switches
 #define USING_STD_FEATURES using BaseBackend::STD_FEATURE_QUERY_FN
@@ -61,20 +67,28 @@ DEFAULT_STD_FEATURES_TO( false )
 #endif
 
 
-
 namespace mp {
 
-/// Solution (postsolved)
-struct Solution {
-  /// primal
-  std::vector<double> primal;
-  /// dual
-  std::vector<double> dual;
-  /// objective values
-  std::vector<double> objvals;
-  /// Sparsity, if solver wants it
-  ArrayRef<int> spars_primal;
+/// Multiobjective pass information.
+/// Every array should be either empty,
+/// or have NumObj entries.
+/// Numeric statistics are NaN for objectives
+/// that were not processed or have no such value.
+struct MultiobjPassStats {
+  std::vector<int>
+      objpass_,                   // 1-base indexing, 0 for unprocessed
+      objpass_result_;            // Should be sol::UNKNOWN for unprocessed
+  std::vector<double>
+      objpass_mipgap_,
+      objpass_objval_,
+      objpass_objbound_,
+      objpass_runtime_,
+      objpass_work_,
+      objpass_itercount_,
+      objpass_nodecount_,
+      objpass_opennodecount_;
 };
+
 
 /// StdBackend: the standard solver API wrapper
 ///
@@ -129,7 +143,9 @@ protected:
   virtual void ObjPriorities(ArrayRef<int>)
   { MP_UNSUPPORTED("Backend::ObjPriorities"); }
   /// Placeholder: set objective weights.
-  /// Presolve the values if needed
+  /// Presolve the values if needed.
+  /// @note The weights are provided in the format common for many solver APIs,
+  /// corresponding to the legacy setting of the option obj:multi:weight.
   virtual void ObjWeights(ArrayRef<double>) { }
   /// Placeholder: set objective abs tol
   /// Presolve the values if needed
@@ -137,14 +153,30 @@ protected:
   /// Placeholder: set objective rel tol
   /// Presolve the values if needed
   virtual void ObjRelTol(ArrayRef<double>) { }
-
+  /// Set multi-objective options natively
+  virtual void SetMultiobjOptions(BasicObjOptionSetter* pS) {
+    if (pS->GetPassesWithOptions().size())
+      AddWarning("MultiobjOptionsNotImplemented",
+                 "See obj:multi:options.");
+  }
+  /// Fill native multi-objective pass information
+  virtual MultiobjPassStats GetMultiobjPassStats() {
+    AddWarning("MOPassStats",
+               "Multiobjective pass statistics\n"
+               "not implemented for this solver.\n"
+               "Use multi-objective emulator\n"
+               "(obj:multi=2).");
+    return {};
+  }
 
   /**
-   * MULTISOL support
-   * No API to overload,
-   *  Impl should check need_multiple_solutions()
-   *  and call ReportIntermediateSolution({x, pi, objvals}) for each
-   *  (postsolve the values if needed)
+   * MULTISOL support.
+   *  Impl can implement ReportSolutionPool()
+   *  and call the supplied function with ({x, pi, objvals}) for each
+   *  (postsolve the values if needed.)
+   *
+   *  Alternatively, if (need_multiple_solutions()),
+   *  call ReportIntermediateSolution() during solve.
    **/
   DEFINE_STD_FEATURE( MULTISOL )
   ALLOW_STD_FEATURE( MULTISOL, false )
@@ -155,6 +187,13 @@ protected:
   ALLOW_STD_FEATURE( KAPPA, false )
   /// Placeholder: retrieve Kappa
   virtual double Kappa() { return 0.0; }
+  /**
+  * Kappa exact
+  **/
+  DEFINE_STD_FEATURE( KAPPA_EXACT )
+  ALLOW_STD_FEATURE( KAPPA_EXACT, false )
+  /// Placeholder: retrieve KappaExact
+  virtual double KappaExact() { return 0.0; }
   /**
   * FeasRelax
   * No API to overload,
@@ -180,12 +219,17 @@ protected:
   ALLOW_STD_FEATURE(WRITE_PROBLEM, false)
   FEATURE_API_TO_IMPLEMENT(WRITE_PROBLEM,
                            void DoWriteProblem(const std::string& ))
-      /// Redefine this if you want some extensions
-      /// to be written after solving instead.
-      /// This is for compatibility wiht ASL drivers
-      /// where 'writeprob' was used for native-format model
-      /// and solution output #218.
-      virtual std::set<std::string> NativeResultExtensions() const
+
+  /// Typedef set of result format extensions
+  using ResultExtensionsSet = std::set<std::string>;
+
+  /// Redefine this if you want some extensions, if asked,
+  /// to be written after solving.
+  /// This is for compatibility with ASL drivers
+  /// where 'writeprob' was used both for native-format model
+  /// and solution output #218.
+
+  virtual ResultExtensionsSet NativeResultExtensions() const
   { return {".sol", ".ilp", ".mst", ".hnt", ".bas", ".json"}; }
 
       /**
@@ -212,21 +256,25 @@ public:
   /// This is called from BackendApp.
   void RunFromNLFile(const std::string& nl_filename,
                      const std::string& filename_no_ext) override {
+    set_stub(nl_filename.c_str());
     ReadNL(nl_filename, filename_no_ext, GetArgvOptions());
     InputExtras();
-
+    
     SetupTimerAndInterrupter();
-    if (exportFileMode() > 0)
+    if (exportFileMode() > 0) {
       ExportModel(export_file_names());
+      RecordOutputTime();
+    }
 
     // exportFileMode == 2 -> do not solve, just export
     if (exportFileMode() != 2) 
     {
-      Solve();
+      RunSolveIterations();
       RecordSolveTime();
 
       Report();
     }
+    
   }
 
   /// Detailed steps for AMPLS C API
@@ -240,21 +288,26 @@ public:
               const std::string& filename_no_ext,
               char** opts) override {
     GetMM().ReadNLModel(nl_filename, filename_no_ext,
-                        GetCallbacks().check,
-                        [this, opts](){        // options parser lambda
-      this->ParseSolverOptions(opts, GetOptionFlags());
+      GetCallbacks().check,
+      [this, opts](char* additional) {        // options parser lambda
+        this->ParseSolverOptions(opts, GetOptionFlags(), nullptr, additional);
     });
   }
 
   /// Input warm start, suffixes, and all that can modify the model.
-  /// This is used by the AMPLS C API
+  /// Usually overloaded by user and calls this one at last.
+  /// This is used by the AMPLS C API.
   void InputExtras() override {
     InputStdExtras();
   }
+
+  /// Set solution file name
   void SetSolutionFileName(const std::string& filename) {
     GetMM().SetSolutionFileName(filename);
   }
-  /// Report results
+
+  /// Report results.
+  /// Usually overloaded by user and calls this one at last.
   void ReportResults() override {
     ReportSuffixes();
     ReportSolution();
@@ -262,10 +315,110 @@ public:
 
 
 protected:
-  /// Solve, no model modification any more.
-  /// Can report intermediate results via ReportIntermediateSolution() during this,
-  /// otherwise in ReportResults()
+  /// Solve, to be overloaded by the solver.
+  /// No model modification any more.
+  /// @note If using STD_FEATURE( MULTISOL ),
+  /// can report intermediate results
+  /// via ReportIntermediateSolution() during this or after
+  /// (check if (need_multiple_solutions()).)
   virtual void Solve() override = 0;
+
+  /// Our solving procedure.
+  void RunSolveIterations() override {
+    auto get_stt = [this]() {          // to be called before GetSolution()
+      auto sr = GetSolveResult();
+      SetStatus( sr );
+      return (sol::Status)sr.first;
+    };
+    auto get_sol = [this]() {
+      return GetSolution();
+    };
+    i_solve_=0;
+    StartRecordingMOPassStats();
+    while ((SetupPlateau(),            // Save plateau options before MO options
+        GetMM().PrepareSolveIteration(get_stt, get_sol))) {
+      if (++i_solve_==storedOptions_.writemodel_index_
+          && exportFileMode() > 0)
+        ExportModel(export_file_names());
+      std::fflush(stdout);
+      std::fflush(stderr);     // fmt::print() doesn't
+      Solve();
+      RecordMOPassStats();
+    }
+  }
+
+  /// Start recording MO pass stats
+  void StartRecordingMOPassStats() {
+    if (GetMM().IsMOEmulationOn()) {
+      tp_moe_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  /// Record multiobjective pass results
+  void RecordMOPassStats() {
+    if (GetMM().IsMOEmulationOn()) {
+      auto& stats = mo_pass_stats__per_pass_;
+      RecordMOPassValue(stats.objpass_, i_solve_);   // 1-based
+      RecordMOPassValue(stats.objpass_result_, GetSolveResult().first);
+      auto obj_vals = GetObjectiveValues();
+      if (obj_vals.size())
+        RecordMOPassValue(stats.objpass_objval_, obj_vals[0]);
+      auto tp_new = std::chrono::steady_clock::now();
+      // Important to cast
+      std::chrono::duration<double> dur1 = tp_new - tp_moe_;
+      double tm_diff = dur1.count();
+      RecordMOPassValue(stats.objpass_runtime_, tm_diff);
+      tp_moe_ = tp_new;
+
+      RecordMOPassMIPStats(stats);
+
+      ExtractStandardSolStats(stats);
+    }
+  }
+
+  /// Record a statistic of the current MO Emulator pass.
+  /// Earlier passes without this statistic get NaN,
+  /// so that vector index == pass index.
+  template <class Value>
+  void RecordMOPassValue(std::vector<Value>& vec, Value val) {
+    assert(i_solve_ >= 1);
+    assert((int)vec.size() < i_solve_);
+    vec.resize(i_solve_-1, MOPassNoValue<Value>());
+    vec.push_back(val);
+  }
+
+  /// Value of a numeric pass statistic for passes
+  /// not run or not providing it
+  template <class Value>
+  static Value MOPassNoValue() {
+    if constexpr (std::numeric_limits<Value>::has_quiet_NaN)
+      return std::numeric_limits<Value>::quiet_NaN();
+    else
+      return 0;
+  }
+
+  /// MIP gap, dual bound
+  virtual void RecordMOPassMIPStats(MultiobjPassStats& ) = 0;
+
+  /// Extract solver stats available for the current pass.
+  /// The set of stats can differ between passes.
+  void ExtractStandardSolStats(MultiobjPassStats& stats) {
+    auto sol_stats = SolutionStats();
+    auto extract_val = [this,&sol_stats](
+                           const char* name, std::vector<double>& vector) {
+      auto it = sol_stats.find(name);
+      if (sol_stats.end() != it) {
+        if (std::holds_alternative<int>(it->second))
+          RecordMOPassValue(vector, (double)std::get<int>(it->second));
+        else if (std::holds_alternative<double>(it->second))
+          RecordMOPassValue(vector, std::get<double>(it->second));
+      }
+    };
+    extract_val("simplex_iterations", stats.objpass_itercount_);
+    extract_val("work", stats.objpass_work_);
+    extract_val("node_count", stats.objpass_nodecount_);
+    extract_val("open_node_count", stats.objpass_opennodecount_);
+  }
 
   /// Report
   virtual void Report() {
@@ -273,22 +426,29 @@ protected:
 //    if (verbose_mode())
 //    if (!ampl_flag())     // otherwise to solve_message
 //      PrintWarnings();
-    if ( timing() )
-      PrintTimingInfo();
   }
+
+  /// User to implement
+  virtual std::pair<int, std::string> GetSolveResult() = 0;
 
   /// Standard extras
   virtual void InputStdExtras() {
-    if (multiobj()) {
-      ObjPriorities( ReadSuffix(suf_objpriority) );
-      ObjWeights( ReadSuffix(suf_objweight) );
-      ObjAbsTol( ReadSuffix(suf_objabstol) );
-      ObjRelTol( ReadSuffix(suf_objreltol) );
+    if (multiobj()==1 && multiobj_has_native()) {   // multiobj native
+      if (auto suf = ReadSuffix(suf_objpriority))
+        ObjPriorities( suf );
+      if (auto suf = GetMM().GetObjWeightsAdapted())
+        ObjWeights( suf );
+      if (auto suf = ReadSuffix(suf_objabstol))
+        ObjAbsTol( suf );
+      if (auto suf = ReadSuffix(suf_objreltol))
+        ObjRelTol( suf );
+      SetMultiobjOptions(GetObjOptionSetter());
     }
     if (feasrelax())
       InputFeasrelaxData();
   }
 
+  virtual void SetupPlateau() { }
   /// Timer, interrupter
   virtual void SetupTimerAndInterrupter() {
     SetupInterrupter();
@@ -303,14 +463,116 @@ protected:
   /// Placeholder for interrupt notifier in Impl
   virtual void SetInterrupter(mp::Interrupter*) = 0;
 
-  /// Record setup time
-  virtual void RecordSetupTime() {
-    stats_.setup_time = GetTimeAndReset(stats_.time);
+
+  /// Return all solution stats as name-value pairs
+  virtual std::map<std::string,
+                   std::variant<int, double, std::string>>
+  SolutionStats() { return {}; }
+
+
+  virtual void ReportSolutionStats() {
+    fmt::MemoryWriter wrt;
+    MiniJSONWriter jw(wrt);
+    {
+      auto jsonstats = jw["stats"];
+      int dummyint[]{ 0 };
+      double dummydbl[]{ 0.0 };
+      for (const auto& [key, val] : SolutionStats()) {
+        if (std::holds_alternative<int>(val)) {
+          dummyint[0] = std::get<int>(val);
+          if (solution_stats() & 1)
+            jsonstats[key.c_str()] = dummyint[0];
+          if (solution_stats() & 2) {
+            SuffixDef<int> intsuf = { key.c_str(), suf::PROBLEM | suf::OUTONLY };
+            ReportSuffix(intsuf, dummyint);
+          }
+        }
+        else if (std::holds_alternative<double>(val)) {
+          dummydbl[0] = std::get<double>(val);
+          if (solution_stats() & 1)
+            jsonstats[key.c_str()] = dummydbl[0];
+          if (solution_stats() & 2) {
+            SuffixDef<double> dblsuf = { key.c_str(), suf::PROBLEM | suf::OUTONLY };
+            ReportSuffix(dblsuf, dummydbl);
+          }
+        }
+        else {
+          if (solution_stats() & 1)
+            jsonstats[key.c_str()] = std::get<std::string>(val);
+        }
+      }
+    }
+    if (timing()>0 && (solution_stats() & 1))
+    {
+      auto times = jw["times"];
+      times["solver"] = stats().solution_time;
+      times["setup"] = stats().setup_time;
+      times["total"] = stats().solution_time + stats().setup_time + stats().output_time;
+      if (timing() > 1) {
+        times["read"] = stats().read_time;
+        times["conversion"] = stats().conversion_time;
+        times["output"] = stats().output_time;
+      }
+    }
+    jw.Close();
+    if (solution_stats() & 1) {
+      // Return 0 JSON object stripped of spaces
+      std::string toret = wrt.str();
+      toret.erase(std::remove(toret.begin(), toret.end(), ' '), toret.end());
+      toret = "0 " + toret;
+      SuffixDef<int> sufStats = { "stats", suf::PROBLEM | suf::OUTONLY, toret };
+      int dummy[]{ 0 };
+      ReportSuffix(sufStats, dummy);
+    }
   }
 
-  /// Record solve time
-  virtual void RecordSolveTime() {
-    stats_.solution_time = GetTimeAndReset(stats_.time);
+  virtual void ReportTimes() {
+    // First of all record solution output time
+    RecordOutputTime();
+    
+
+    // time_read
+    // time_conversion
+    // time_solver
+    // time_setup = time_read + time_conversion + ...
+    // time_output = sol file write
+    // time = total in the driver = time_setup+time_solver+time_output
+
+    double output_time[]{ stats().output_time };
+    if (timing() > 1) {
+      SuffixDef<double> sufTimeRead = { "time_read", suf::PROBLEM | suf::OUTONLY };
+      SuffixDef<double> sufTimeConversion = { "time_conversion", suf::PROBLEM | suf::OUTONLY };
+      SuffixDef<double> sufTimeOutput = { "time_output", suf::PROBLEM | suf::OUTONLY };
+
+      double read_time[]{ stats().read_time };
+      double conversion_time[]{ stats().conversion_time };
+      
+      ReportSuffix(sufTimeRead, read_time);
+      ReportSuffix(sufTimeConversion, conversion_time);
+      ReportSuffix(sufTimeOutput, output_time);
+    }
+
+    SuffixDef<double> sufTimeSolver = { "time_solver", suf::PROBLEM | suf::OUTONLY };
+    SuffixDef<double> sufTimeSetup = { "time_setup", suf::PROBLEM | suf::OUTONLY };
+    SuffixDef<double> sufTime = { "time", suf::PROBLEM | suf::OUTONLY };
+  
+    double solver_time[]{ stats().solution_time };
+    double setup_time[]{ stats().setup_time };
+    double time[]{ stats().solution_time + stats().setup_time + stats().output_time};
+    ReportSuffix(sufTimeSolver, solver_time);
+    ReportSuffix(sufTimeSetup, setup_time);
+    ReportSuffix(sufTime, time);
+
+    AddToSolverMessage(
+      fmt::format("Setup time = {:.6f}s\n", setup_time[0]));
+    AddToSolverMessage(
+      fmt::format("Solver time = {:.6f}s\n", solver_time[0]));
+    if (timing() > 1) {
+      AddToSolverMessage(
+        fmt::format("Output time = {:.6f}s\n", output_time[0]));
+    }
+    AddToSolverMessage(
+      fmt::format("Total time = {:.6f}s\n", time[0]));
   }
 
   /// Input feasrelax data
@@ -347,18 +609,113 @@ protected:
 
   /// Report standard suffixes
   virtual void ReportStandardSuffixes() {
-    if (IsProblemSolved() && exportKappa()) {
-      ReportKappa();
+    if (multiobj() && report_obj_passes()) {
+      ReportMultiobjPasses();
     }
+    if (IsProblemSolved() && exportKappa()) { 
+    	ReportKappa(); 
+    }
+    if (IsProblemSolved() && exportKappaExact()) { 
+      ReportKappaExact();
+    }
+    if (timing()) {
+      	ReportTimes();
+    }
+    if (solution_stats()) {
+        ReportSolutionStats();
+    }
+  }
+
+  /// Report multiobj passes
+  virtual void ReportMultiobjPasses() {
+    assert(multiobj());
+    MultiobjPassStats stats;
+    if (GetMM().IsMOEmulationOn()) {
+      stats = GetMOEPassStats();
+    } else {
+      stats = GetMultiobjPassStats();
+    }
+    auto report = [this](const char* name, const auto& vals) {
+      // vals.resize(GetMM().GetSuffixSize(suf::OBJ));
+      if (vals.size())
+        this->ReportSuffix({name, suf::OBJ}, vals);
+    };
+    report("objpass", stats.objpass_);                   // 1-base indexing
+    report("objpass_result", stats.objpass_result_);
+    report("objpass_itercount", stats.objpass_itercount_);
+    report("objpass_nodecount", stats.objpass_nodecount_);
+    report("objpass_opennodecount", stats.objpass_opennodecount_);
+    report("objpass_runtime", stats.objpass_runtime_);
+    report("objpass_work", stats.objpass_work_);
+    report("objpass_mipgap", stats.objpass_mipgap_);
+    report("objpass_objval", stats.objpass_objval_);
+    report("objpass_objbound", stats.objpass_objbound_);
+  }
+
+  /// Fill MO Emulator's pass stats.
+  /// Objectives whose pass was not run
+  /// (e.g., after an infeasible or unbounded pass)
+  /// get .objpass=0, .objpass_result=sol::UNKNOWN,
+  /// and NaN for numeric stats.
+  MultiobjPassStats GetMOEPassStats() {
+    MultiobjPassStats result;
+    const auto pass_map = GetMM().GetMultiobjPasses();
+    const auto& stats_per_pass = mo_pass_stats__per_pass_;
+
+    auto move_values = [pass_map,&result,&stats_per_pass](
+                          auto MultiobjPassStats::* pMbr, auto no_value) {
+      const auto& vec2 = stats_per_pass.*pMbr;
+      if (vec2.size()) {
+        auto& vec1 = result.*pMbr;
+        vec1.resize(pass_map.size());
+        for (auto i=vec1.size(); i--; ) {
+          auto i_pass = pass_map[i];
+          vec1[i] = (i_pass >= 0 && i_pass < (int)vec2.size())
+              ? vec2[i_pass] : no_value;
+        }
+      }
+    };
+    const auto nan = MOPassNoValue<double>();
+
+    move_values(&MultiobjPassStats::objpass_, 0);
+    move_values(&MultiobjPassStats::objpass_result_, (int)sol::UNKNOWN);
+    move_values(&MultiobjPassStats::objpass_itercount_, nan);
+    move_values(&MultiobjPassStats::objpass_nodecount_, nan);
+    move_values(&MultiobjPassStats::objpass_opennodecount_, nan);
+    move_values(&MultiobjPassStats::objpass_runtime_, nan);
+    move_values(&MultiobjPassStats::objpass_work_, nan);
+    move_values(&MultiobjPassStats::objpass_mipgap_, nan);
+    move_values(&MultiobjPassStats::objpass_objval_, nan);
+    move_values(&MultiobjPassStats::objpass_objbound_, nan);
+
+    return result;
   }
 
   /// Report Kappa
   virtual void ReportKappa() {
-    if (exportKappa() && 2)
+    if (exportKappa() & 2)
     {
-      double value = Kappa();
-      ReportSingleSuffix(suf_objkappa, value);
-      ReportSingleSuffix(suf_probkappa, value);
+      try {
+        double value = Kappa();
+        ReportSingleSuffix(suf_objkappa, value);
+        ReportSingleSuffix(suf_probkappa, value);
+      } catch (const std::exception& exc) {
+        AddWarning("KAPPA", exc.what());
+      }
+    }
+  }
+
+  /// Report KappaExact
+  virtual void ReportKappaExact() {
+    if (exportKappaExact() & 2)
+    {
+      try {
+        double value = KappaExact();
+        ReportSingleSuffix(suf_objkappa, value);
+        ReportSingleSuffix(suf_probkappa, value);
+      } catch (const std::exception& exc) {
+        AddWarning("KAPPA_EXACT", exc.what());
+      }
     }
   }
 
@@ -392,7 +749,7 @@ protected:
     const auto& scw0 = GetWarning(GetSolCheckWarningKey(false));
     const auto& scw1 = GetWarning(GetSolCheckWarningKey(true));
     if (scw0.second.size() || scw1.second.size()) {
-      ++ stats_.n_altern_sol_checks_failed_;
+       stats().n_altern_sol_checks_failed_= stats().n_altern_sol_checks_failed_+1;
       ClearWarning(GetSolCheckWarningKey(false));
       ClearWarning(GetSolCheckWarningKey(true));
     }
@@ -413,10 +770,12 @@ protected:
   /// to AMPL via SOL file
   virtual void ReportSolution2AMPL() {
     double obj_value = std::numeric_limits<double>::quiet_NaN();
-    auto sol = GetSolution();             // even if just dual
+    auto sol = GetSolution();             // even if just dual or infeasible
     fmt::MemoryWriter writer;
     writer.write("{}: {}", MP_DISPATCH( long_name() ), SolveStatus());
-    if (IsProblemSolvedOrFeasible()) {
+    if (IsProblemSolvedOrFeasible()
+        || IsProblemMaybeSolved()
+        || (report_uncertain_sol() && IsProblemStatusUnknown())) {
       if (sol.objvals.size()) {
         if (sol.objvals.size() > 1)
         {
@@ -438,11 +797,21 @@ protected:
                          FormatObjValue(feasrelax().orig_obj_value_));
         }
       }
-      if (round() && MPD(IsMIP()))
-        RoundSolution(sol.primal, writer);
     }
-    if (exportKappa() && 1)
-      writer.write("\nkappa value: {}", Kappa());
+    try {
+      if (round() && MPD(IsMIP()) && sol.primal.size())
+        RoundSolution(sol.primal, writer);
+    } catch (const std::exception& exc) {
+      AddWarning("SOL_ROUNDING", exc.what());
+    }
+    try {
+      if (exportKappa() & 1)
+        writer.write("\nkappa value: {}", Kappa());
+      if (exportKappaExact() & 1)
+        writer.write("\nkappa exact value: {}", KappaExact());
+    } catch (const std::exception& exc) {
+      AddWarning("KAPPA", exc.what());
+    }
     if (solver_msg_extra_.size()) {
       writer.write("\n");
       writer.write(solver_msg_extra_);
@@ -463,10 +832,10 @@ protected:
                      kIntermSol_,
                      solution_stub(), solution_stub(),
                      kIntermSol_);
-      if (stats_.n_altern_sol_checks_failed_)
+      if (stats().n_altern_sol_checks_failed_)
         writer.write(
               "{} alternative solution checks failed.\n",
-              stats_.n_altern_sol_checks_failed_);
+              stats().n_altern_sol_checks_failed_);
     }
     auto wrn = GetWarnings();
     if (wrn.size())
@@ -480,15 +849,6 @@ protected:
   /// Abort
   virtual void Abort(int solve_code_now, std::string msg) {
     MP_RAISE_WITH_CODE(solve_code_now, msg);
-  }
-
-  /// Final timing info
-  virtual void PrintTimingInfo() {
-    double output_time = GetTimeAndReset(stats_.time);
-    MP_DISPATCH( Print("Setup time = {:.6f}s\n"
-                       "Solution time = {:.6f}s\n"
-                       "Output time = {:.6f}s\n",
-                       stats_.setup_time, stats_.solution_time, output_time) );
   }
 
   /// MIP solution rounding. Better use solver's capabilities
@@ -538,71 +898,54 @@ protected:
   //////////////////////// SOLUTION STATUS ACCESS ///////////////////////////////
 
   /// Solve result number
-  virtual int SolveCode() const { return status_.first; }
+  virtual sol::Status SolveCode() const {
+    assert(IsSolStatusRetrieved());
+    return sol::Status(status_.first);
+  }
   /// Solver result message
   const char* SolveStatus() const { return status_.second.c_str(); }
   /// Set solve result
   void SetStatus(std::pair<int, std::string> stt) { status_=stt; }
 
   //////////////////////// SOLUTION STATUS ADAPTERS ///////////////////////////////
-  /** Following the taxonomy of the enum sol, returns true if
+  /// Problem status unknown
+  virtual bool IsProblemStatusUnknown() const
+  { return sol::IsProblemStatusUnknown(SolveCode()); }
+
+  /** Following the taxonomy of the enum sol::Status, returns true if
       we have an optimal solution or a feasible solution for a
       satisfaction problem */
-  virtual bool IsProblemSolved() const {
-    assert(IsSolStatusRetrieved());
-    return sol::SOLVED<=SolveCode()
-        && SolveCode()<=sol::SOLVED_LAST;
-  }
-  /// Solved or feasible
-  virtual bool IsProblemSolvedOrFeasible() const {
-    assert( IsSolStatusRetrieved() );
-    return
-        (sol::SOLVED_LAST>=SolveCode() &&
-         sol::SOLVED<=SolveCode())
-        ||
-        (sol::LIMIT_FEAS>=SolveCode() &&
-         sol::LIMIT_FEAS_LAST<=SolveCode())
-        ||
-        (sol::UNBOUNDED_FEAS>=SolveCode() &&
-         sol::UNBOUNDED_NO_FEAS_LAST<=SolveCode());
-  }
-  /// Undecidedly infeas or unbnd
-  virtual bool IsProblemIndiffInfOrUnb() const {
-    assert( IsSolStatusRetrieved() );
-    return sol::LIMIT_INF_UNB<=SolveCode()
-        && SolveCode()<=sol::LIMIT_INF_UNB_LAST;
-  }
-  /// Infeasible or unbounded
-  virtual bool IsProblemInfOrUnb() const {
-    assert( IsSolStatusRetrieved() );
-    auto sc = SolveCode();
-    return
-        (sol::INFEASIBLE<=sc
-         && sol::UNBOUNDED_NO_FEAS_LAST>=sc)
-        || IsProblemIndiffInfOrUnb();
-  }
-  virtual bool IsProblemInfeasible() const {
-    assert( IsSolStatusRetrieved() );
-    auto sc = SolveCode();
-    return sol::INFEASIBLE<=sc && sol::INFEASIBLE_LAST>sc;
-  }
-  virtual bool IsProblemUnbounded() const {
-    assert( IsSolStatusRetrieved() );
-    auto sc = SolveCode();
-    return sol::UNBOUNDED_FEAS<=sc
-        && sol::UNBOUNDED_NO_FEAS_LAST>=sc;
-  }
-  virtual bool IsSolStatusRetrieved() const {
-    return sol::NOT_SET!=SolveCode();
-  }
+  virtual bool IsProblemSolved() const
+  { return sol::IsProblemSolved(SolveCode()); }
 
-  struct Stats {
-    steady_clock::time_point time = steady_clock::now();
-    double setup_time = 0.0;
-    double solution_time = 0.0;
-    int n_altern_sol_checks_failed_ = 0;
-  };
-  Stats stats_;
+  /// Solved or feasible
+  virtual bool IsProblemSolvedOrFeasible() const
+  { return sol::IsProblemSolvedOrFeasible(SolveCode()); }
+
+  /// Maybe solved
+  virtual bool IsProblemMaybeSolved() const
+  { return sol::IsProblemMaybeSolved(SolveCode()); }
+
+  /// Undecidedly infeas or unbnd
+  virtual bool IsProblemIndiffInfOrUnb() const
+  { return sol::IsProblemIndiffInfOrUnb(SolveCode()); }
+
+  /// Infeasible or unbounded
+  virtual bool IsProblemInfOrUnb() const
+  { return sol::IsProblemInfOrUnb(SolveCode()); }
+
+  /// Problem infeasible?
+  virtual bool IsProblemInfeasible() const
+  { return sol::IsProblemInfeasible(SolveCode()); }
+
+  /// Problem unbounded?
+  virtual bool IsProblemUnbounded() const
+  { return sol::IsProblemUnbounded(SolveCode()); }
+
+  /// Is sol status retrieved?
+  virtual bool IsSolStatusRetrieved() const {
+    return sol::NOT_SET!=status_.first;
+  }
 
 
   /////////////////////////////// SOME MATHS ////////////////////////////////
@@ -640,6 +983,8 @@ private:
   std::string solver_msg_extra_;
 
 protected:
+  /// Add '\n' in the end if needed,
+  /// it is not added automatically.
   void AddToSolverMessage(const std::string& msg)
   { solver_msg_extra_ += msg; }
 
@@ -656,6 +1001,9 @@ private:
   using SlvOptionRecord = std::function<void(void)>;
   std::vector< SlvOptionRecord > slvOptionRecords_;
 
+  /// Solver option maps
+  SolverOptionMapManager solveroptmaps_;
+
 protected:
   // set to true in constructor to disable setting options 
   // while parsing them. They can be set later with ReplaySolverOptions
@@ -667,7 +1015,7 @@ protected:
   void RecordSolverOption(SlvOptionRecord sor)
   { slvOptionRecords_.push_back(sor); }
   void ReplaySolverOptions() {
-    for (auto f: slvOptionRecords_)
+    for (auto& f: slvOptionRecords_)
       f();
   }
 
@@ -683,7 +1031,13 @@ protected:
     /// Options setup
     Value get(const SolverOption& , Index i) const {
       Value v;
+      if constexpr (std::numeric_limits<Value>::has_quiet_NaN)
+        v = std::numeric_limits<Value>::quiet_NaN();
       backend_.GetSolverOption(i, v);
+      if constexpr (std::numeric_limits<Value>::has_quiet_NaN)
+        if (std::isnan(v))
+          MP_RAISE(
+              fmt::format("Failed to retrieve solver option {}", i));
       return v;
     }
     void set(const SolverOption& ,
@@ -714,25 +1068,94 @@ protected:
     { }
   };
 
+  /// Merge a generated option into the existing option for the same
+  /// solver parameter: the unprefixed generated names that are still free
+  /// become synonyms, the generated (vendor) description replaces the
+  /// existing one, and the existing text, if any, is kept as a trailing
+  /// note (use it for driver-specific remarks only).
+  void MergeSolverOption(
+      std::string name0, const char* name_list1, const char* descr) {
+    auto posspace = name0.find(' ');
+    if (std::string::npos != posspace)
+      name0.resize(posspace);
+    auto synonyms = UnregisteredNames(name_list1, false, true);
+    if (synonyms.size())
+      AddOptionSynonyms_Inline_Back(synonyms.c_str(), name0.c_str());
+    std::string note = FindOption(name0.c_str())->description();
+    ReplaceOptionDescription(name0.c_str(), descr);
+    if (note.size())
+      AddToOptionDescription(name0.c_str(), note.c_str());
+  }
+
+  /// The names of \a name_list that are not registered yet
+  /// @param keep_first: keep the first name even if registered
+  ///   (the primary name of a new option)
+  /// @param unprefixed_only: skip names containing ':'
+  std::string UnregisteredNames(
+      const char* name_list, bool keep_first, bool unprefixed_only) {
+    std::string result;
+    for (const auto& name: split_string(name_list)) {
+      bool keep = (keep_first && result.empty())
+          || ((!unprefixed_only || std::string::npos == name.find(':'))
+              && !FindOption(name.c_str()));
+      if (keep) {
+        if (result.size())
+          result += ' ';
+        result += name;
+      }
+    }
+    return result;
+  }
+
+
+public:
+  /// Adding solver options with merging
+  template <class KeyType, class ValueType, class... Args>
+  void AddSolverOption_MergeDuplicates(const char *name_list, const char *description,
+                       KeyType k, ValueType vMin, Args... args) {
+    if (const auto name_list0 = solveroptmaps_.FindOption<KeyType, ValueType>(k)) {
+      MergeSolverOption(name_list0, name_list, description);
+    } else {
+      auto names = UnregisteredNames(name_list, true, false);
+      AddSolverOption(names.c_str(), description, k, vMin, args...);
+    }
+  }
+
+  /// Adding solver options with merging: string
+  template <class KeyType>
+  void AddSolverOption_MergeDuplicates(const char *name_list, const char *description,
+                                       KeyType k) {
+    if (const auto name_list0 = solveroptmaps_.FindOption<KeyType, std::string>(k)) {
+      MergeSolverOption(name_list0, name_list, description);
+    } else {
+      auto names = UnregisteredNames(name_list, true, false);
+      AddSolverOption(names.c_str(), description, k);
+    }
+  }
+
+
+protected:
   /// Adding solver options of types int/double/string/...
-  /// The type is deduced from the two last parameters min, max
+  /// @warning The type is deduced from the two last parameters min, max
   /// (currently unused otherwise.)
-  /// If min/max omitted, assume ValueType=std::string
-  /// Assumes existence of Impl::Get/SetSolverOption(KeyType, ValueType(&))
+  /// @note If min/max omitted, assume ValueType=std::string
+  /// @note Assumes existence of Impl::Get/SetSolverOption(KeyType, ValueType(&))
   template <class KeyType, class ValueType=std::string>
   void AddSolverOption(const char *name_list, const char *description,
                        KeyType k,
                        ValueType , ValueType ) {
+    solveroptmaps_.AddOptionRef<KeyType, ValueType>(k, name_list);
     AddOption(SolverOptionManager::OptionPtr(
-                new ConcreteOptionWrapper<
-                ValueType, KeyType>(
-                  (Impl*)this, name_list, description, k)));
+        new ConcreteOptionWrapper<
+            ValueType, KeyType>(
+            (Impl*)this, name_list, description, k)));
   }
 
   /// String-valued option
   template <class KeyType, class ValueType = std::string>
   void AddSolverOption(const char* name_list, const char* description,
     KeyType k) {
+    solveroptmaps_.AddOptionRef<KeyType, ValueType>(k, name_list);
     AddOption(SolverOptionManager::OptionPtr(
       new ConcreteOptionWrapper<
       ValueType, KeyType>(
@@ -745,6 +1168,7 @@ protected:
   void AddSolverOption(const char* name_list, const char* description,
       KeyType k, ValueArrayRef values, ValueType defaultValue) {
     internal::Unused(defaultValue);
+    solveroptmaps_.AddOptionRef<KeyType, ValueType>(k, name_list);
     AddOption(SolverOptionManager::OptionPtr(
       new ConcreteOptionWrapper<
       ValueType, KeyType>(
@@ -758,6 +1182,7 @@ protected:
                        KeyType k, ValueArrayRef values,
                        const char* defaultValue) {
     internal::Unused(defaultValue);
+    solveroptmaps_.AddOptionRef<KeyType, std::string>(k, name_list);
     AddOption(SolverOptionManager::OptionPtr(
                 new ConcreteOptionWrapper<
                 std::string, KeyType>(
@@ -768,6 +1193,7 @@ protected:
 private:
   struct Options {
     int exportKappa_ = 0;
+    int exportKappaExact_ = 0;
 
     /// feasrelax penalty options
     double lbpen_=1.0, ubpen_=1.0, rhspen_=1.0;
@@ -775,8 +1201,11 @@ private:
     int round_=0;
     double round_reptol_=1e-9;
 
+    int report_obj_passes_ {0};
+
     /// For write prob
     std::vector<std::string> export_files_;
+    int writemodel_index_ = 0;
     std::vector<std::string> just_export_files_;
     /// For write sol
     std::vector<std::string> export_sol_files_;
@@ -811,9 +1240,17 @@ private:
     double orig_obj_value_ = 0.0;
   } feasRelaxIO_;
 
+  /// This one is per-pass, not per objective
+  MultiobjPassStats mo_pass_stats__per_pass_;
+  std::chrono::time_point<std::chrono::steady_clock> tp_moe_;
+  /// Solve iteration
+  int i_solve_ {};
+
 
 protected:  //////////// Option accessors ////////////////
   int exportKappa() const { return storedOptions_.exportKappa_; }
+  int exportKappaExact() const
+  { return storedOptions_.exportKappaExact_; }
 
   /// Feasrelax I/O data
   FeasrelaxIO& feasrelax() { return feasRelaxIO_; }
@@ -826,6 +1263,9 @@ protected:  //////////// Option accessors ////////////////
   { return IMPL_HAS_STD_FEATURE(WANT_ROUNDING) ? storedOptions_.round_ : 0; }
   /// MIP solution rounding reporting tolerance
   double round_reptol() const { return storedOptions_.round_reptol_; }
+
+  /// Report multiobj pass stats?
+  int report_obj_passes() const { return storedOptions_.report_obj_passes_; }
 
   /// Return 2 if we only need to write the problem, 1 if solution 
   /// and export are wanted, 0 if no export is needed or supported
@@ -851,69 +1291,111 @@ protected:
   virtual void InitStandardOptions() {
     if (IMPL_HAS_STD_FEATURE(KAPPA))
       AddStoredOption("alg:kappa kappa basis_cond",
-        "Whether to return the estimated condition number (kappa) of "
-        "the optimal basis (default 0): sum of 1 = report kappa in the result message; "
-        "2 = return kappa in the solver-defined suffix .kappa on the objective and "
-        "problem. The request is ignored when there is no optimal basis.",
-        storedOptions_.exportKappa_);
+                      "Whether to return the estimated condition number (kappa) of "
+                      "the optimal basis (default 0): sum of 1 = report kappa in the result message; "
+                      "2 = return kappa in the solver-defined suffix .kappa on the objective and "
+                      "problem. The request is ignored when there is no optimal basis.",
+                      storedOptions_.exportKappa_);
+
+    if (IMPL_HAS_STD_FEATURE(KAPPA_EXACT))
+      AddStoredOption("alg:kappa_exact kappa_exact basis_cond_exact",
+                      "Whether to return the exact condition number (kappa) of "
+                      "the optimal basis (default 0): sum of 1 = report kappa in the result message; "
+                      "2 = return kappa in the solver-defined suffix .kappa_exact on the objective and "
+                      "problem. The request is ignored when there is no optimal basis.\n\n"
+                      "The exact kappa may be hard to compute.",
+                      storedOptions_.exportKappaExact_);
 
     if (IMPL_HAS_STD_FEATURE(FEAS_RELAX)) {
       AddStoredOption("alg:feasrelax feasrelax",
-                      "Whether to modify the problem into a feasibility "
-                          "relaxation problem:\n"
-                          "\n"
-                          "| 0 = No (default)\n"
-                          "| 1 = Yes, minimizing the weighted sum of violations\n"
-                          "| 2 = Yes, minimizing the weighted sum of squared violations\n"
-                          "| 3 = Yes, minimizing the weighted count of violations\n"
-                          "| 4-6 = Same objective as 1-3, but also optimize the "
-                             "original objective, subject to the violation "
-                             "objective being minimized.\n"
-                      "\n"
-                      "Weights are given by suffixes .lbpen and .ubpen on variables "
-                      "and .rhspen on constraints (when nonnegative, default values = 0), "
-                      "else by keywords alg:lbpen, alg:ubpen, and alg:rhspen, respectively "
-                      "(default values = 1). Weights < 0 are treated as Infinity, allowing "
-                      "no violation.",
-          feasrelax().mode_);
+        "Whether to modify the problem into a feasibility "
+        "relaxation problem:\n"
+        "\n"
+        "| 0 = No (default)\n"
+        "| 1 = Yes, minimizing the weighted sum of violations\n"
+        "| 2 = Yes, minimizing the weighted sum of squared violations\n"
+        "| 3 = Yes, minimizing the weighted count of violations\n"
+        "| 4-6 = Same objective as 1-3, but also optimize the "
+        "original objective, subject to the violation "
+        "objective being minimized.\n"
+        "\n"
+        "Weights are given by suffixes .lbpen and .ubpen on variables "
+        "and .rhspen on constraints (when nonnegative, default values = 0), "
+        "else by keywords alg:lbpen, alg:ubpen, and alg:rhspen, respectively "
+        "(default values = 1). Weights < 0 are treated as Infinity, allowing "
+        "no violation.",
+        feasrelax().mode_);
       AddStoredOption("alg:lbpen lbpen", "See alg:feasrelax.",
-          storedOptions_.lbpen_);
+        storedOptions_.lbpen_);
       AddStoredOption("alg:ubpen ubpen", "See alg:feasrelax.",
-          storedOptions_.ubpen_);
+        storedOptions_.ubpen_);
       AddStoredOption("alg:rhspen rhspen", "See alg:feasrelax.",
-          storedOptions_.rhspen_);
+        storedOptions_.rhspen_);
     }
 
-    if (IMPL_HAS_STD_FEATURE( WANT_ROUNDING )) {
+    if (IMPL_HAS_STD_FEATURE(WANT_ROUNDING)) {
       AddStoredOption("mip:round round",
-                      "Whether to round integer variables to integral values before "
-                      "returning the solution, and whether to report that the solver "
-                      "returned noninteger values for integer values:  sum of\n"
-                      "\n"
-                      "|  1 ==> Round nonintegral integer variables\n"
-                      "|  2 ==> Modify solve_result\n"
-                      "|  4 ==> Modify solve_message\n"
-                      "\n"
-                      "Default = 0.  Modifications that were or would be made are "
-                      "reported in solve_result and solve_message only if the maximum "
-                      "deviation from integrality exceeded mip:round_reptol.",
-                    storedOptions_.round_);
+        "Whether to round integer variables to integral values before "
+        "returning the solution, and whether to report that the solver "
+        "returned noninteger values for integer values:  sum of\n"
+        "\n"
+        "|  1 ==> Round nonintegral integer variables\n"
+        "|  2 ==> Modify solve_result\n"
+        "|  4 ==> Modify solve_message\n"
+        "\n"
+        "Default = 0.  Modifications that were or would be made are "
+        "reported in solve_result and solve_message only if the maximum "
+        "deviation from integrality exceeded mip:round_reptol.",
+        storedOptions_.round_);
       AddStoredOption("mip:round_reptol round_reptol",
-                      "Tolerance for reporting rounding of integer variables to "
-                      "integer values; see \"mip:round\".  Default = 1e-9.",
-                    storedOptions_.round_reptol_);
+        "Tolerance for reporting rounding of integer variables to "
+        "integer values; see \"mip:round\".  Default = 1e-9.",
+        storedOptions_.round_reptol_);
     }
+
+    AddStoredOption("obj:multi:stats multiobjstats",
+                    "0*/1: Report multiobjective pass statistics "
+                    "in the following objective suffixes:\n"
+                    "\n"
+                    "- .objpass: index of the pass where this "
+                    "objective was solved, 0 if not solved due to a stop "
+                    "in a previous pass\n"
+                    "- .objpass_result: the solve_result of the pass "
+                    "where this objective was solved; -1 if not\n"
+                    "- .objpass_runtime, _mipgap, _objval, _objbound, "
+                    "_work, _itercount, _nodecount, _opennodecount if available.\n"
+                    "\n"
+                    "With MP's emulation (obj:multi=2), _objval and _objbound "
+                    "refer to the blended pass objective in the sense "
+                    "of the first objective, and _runtime is the wall-clock "
+                    "time of the pass including model updates; "
+                    "numeric statistics are NaN if not available for a pass. "
+                    "If the solver's native multiobjective mode "
+                    "does not report pass statistics, use obj:multi=2.\n"
+                    "\n"
+                    "See also tech:stats.",
+                    storedOptions_.report_obj_passes_);
 
     if (IMPL_HAS_STD_FEATURE(WRITE_PROBLEM)) {
-      AddListOption("tech:writemodel writeprob writemodel tech:exportfile",
+      AddListOption("tech:writemodel tech:writeprob writeprob writemodel tech:exportfile",
         "Specifies files where to export the model before "
         "solving (repeat the option for several files.) "
-        "File name extensions can be ``.lp[.7z]``, ``.mps``, etc.",
+        "File name extensions can be ``.lp[.7z]``, ``.mps``, etc."
+                    "\n"
+                    "To write a model during iterative solve (e.g., with obj:multi=2), "
+                    "use tech:writemodel:index.",
         storedOptions_.export_files_);
+
+      AddStoredOption("tech:writemodel:index tech:writeprob:index writeprobindex writemodelindex",
+                    "During iterative solve (e.g., with obj:multi=2), "
+                    "the iteration before which to write solver model. "
+                    "0 means before iteration is initialized; positive value - "
+                    "before solving that iteration. Default 0.",
+                    storedOptions_.writemodel_index_);
 
       AddListOption("tech:writemodelonly justwriteprob justwritemodel",
         "Specifies files where to export the model, no solving "
-                    "(option can be repeated.) "
+        "(option can be repeated.) "
         "File extensions can be ``.dlp``, ``.mps``, etc.",
         storedOptions_.just_export_files_);
     }
@@ -922,9 +1404,7 @@ protected:
       AddListOption("tech:writesolution writesol writesolution",
         "Specifies the names of files where to export the solution "
         "and/or other result files in solver's native formats. "
-        "Option can be repeated. "
-        "File name extensions can be "
-        "``.sol[.tar.gz]``, ``.json``, ``.bas``, ``.ilp``, etc.",
+        "Option can be repeated.",
         storedOptions_.export_sol_files_);
   }
 
@@ -936,12 +1416,16 @@ protected:
   //////////////////////////////////////////////////////////////////////////////
 private:
   const SuffixDef<int> suf_objpriority = { "objpriority", suf::OBJ | suf::INPUT };
-  const SuffixDef<double> suf_objweight = { "objweight", suf::OBJ | suf::INPUT };
   const SuffixDef<double> suf_objabstol = { "objabstol", suf::OBJ | suf::INPUT };
   const SuffixDef<double> suf_objreltol = { "objreltol", suf::OBJ | suf::INPUT };
 
   const SuffixDef<double> suf_objkappa = { "kappa", suf::OBJ | suf::OUTONLY };
   const SuffixDef<double> suf_probkappa = { "kappa", suf::PROBLEM | suf::OUTONLY };
+
+  const SuffixDef<double> suf_objkappa_exact
+      = { "kappa_exact", suf::OBJ | suf::OUTONLY };
+  const SuffixDef<double> suf_probkappa_exact
+      = { "kappa_exact", suf::PROBLEM | suf::OUTONLY };
 
 
   /////////////////////////////////////////////////////////////////////////////////
@@ -954,8 +1438,10 @@ public:
     int flg=0;
     if ( IMPL_HAS_STD_FEATURE(MULTISOL) )
       flg |= BasicSolver::MULTIPLE_SOL;
+    /// Allow native or emulated multiobj
+    flg |= BasicSolver::MULTIPLE_OBJ;
     if ( IMPL_HAS_STD_FEATURE(MULTIOBJ) )
-      flg |= BasicSolver::MULTIPLE_OBJ;
+      flg |= BasicSolver::MULTIPLE_OBJ_NATIVE;
     return flg;
   }
 
@@ -1051,11 +1537,6 @@ public:
               + fln
               + "' failed:\n"
               + exc.what();
-          if (IMPL_HAS_STD_FEATURE(WRITE_SOLUTION))
-            msg +=
-                "\n    Note: to export solutions and results\n"
-                "    in the solver's native formats,\n"
-                "    use option 'tech:writesolution'";
           MP_RAISE(msg);
         }
       }

@@ -12,8 +12,17 @@ class EExpr : public QuadraticExpr {
 public:
   /// Default constructor
   EExpr() = default;
+  /// Construct from LinTerms, QuadTerms, const_term
+  EExpr(LinTerms lt, QuadTerms qt, double ct)
+      : QuadraticExpr( {std::move(lt), std::move(qt) }, ct ) { }
   /// Construct from LinTerms
   EExpr(LinTerms lt): QuadraticExpr( {std::move(lt), {} }, 0.0 ) { }
+  /// Construct from QuadraticExpr
+  EExpr(QuadraticExpr qe) : QuadraticExpr(std::move(qe)) { }
+  /// Construct from AffineExpr
+  EExpr(AffineExpr ae)
+    : QuadraticExpr(
+  {std::move(ae.GetLinTerms()), {} }, ae.constant_term() ) { }
   /// Constructor from the Constant helper
   EExpr(Constant c) : QuadraticExpr(c) {}
   /// Construct from the Variable helper
@@ -21,6 +30,11 @@ public:
   /// Construct from c * var[i]
   EExpr(double c, int i) { add_term(c, i); }
 };
+
+/// Multiply out two EEXprs.
+/// Sort both factors (@todo only in Debug),
+/// then produce sorted result
+EExpr MultiplyOut(const EExpr& el, const EExpr& er);
 
 } // namespace mp
 

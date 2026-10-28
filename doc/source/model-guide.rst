@@ -13,12 +13,12 @@ Ever wondered how to model logical and non-linear constraints? For example:
 
 - Piecewise-linear approximation of *y = sin(x)*.
 
-MP automates many of such modeling tasks by reformulating AMPL nonlinear
-constraints suitably for the given solver.
+MP automates many of such modeling tasks by reformulating AMPL models
+suitably for the given solver.
+Moreover, MP supports :ref:`multiple-objectives`.
 A series of small modeling tasks like these are handled in the
-`MP Modeling Series <https://discuss.ampl.com/c/modeling/42>`_,
+`MP Modeling Series <https://ampl.com/streamlit/Modeling_Tips>`_,
 while below follows a comprehensive guide.
-
 
 .. toctree::
    :maxdepth: 2
@@ -26,7 +26,9 @@ while below follows a comprehensive guide.
    self
    modeling-overview
    modeling-expressions
+   modeling-mo
    modeling-efficiency
+   modeling-formulations
    modeling-numerics
    modeling-tools
    modeling-troublesh

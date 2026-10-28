@@ -1,16 +1,31 @@
 [
   {
+    "name": "airtrainee_infeas multiobj=1",
+    "files": ["airtrainee_base.mod",
+              "airtrainee_seniority_reverse_PBS.mod",
+              "airtrainee_infeas_200.dat"],
+    "tags": [ "linear", "multiobj"],
+    "comment" : "Check correct reporting of 'infeas' in MO Emulator (if applied)",
+    "options": {
+      "ANYSOLVER_options": "multiobj=1"
+    },
+    "values": {
+      "solve_result": "infeasible"
+    }
+  },
+  {
     "name": "infeas_int_01 iisfind=1",
     "tags": [ "linear", "iis"],
     "options": {
         "ANYSOLVER_options": "iisfind=1"
     },
+    "comment": "COPT reports the violated side of a constraint (low/upp) instead of mem",
     "values": {
       "x.iis": "non",
       "y.iis": "non",
-      "C1.iis": "mem",
-      "C2.iis": "mem",
-      "C3.iis": "mem"
+      "C1.iis": ["mem", "low"],
+      "C2.iis": ["mem", "upp"],
+      "C3.iis": ["mem", "upp"]
     }
   },
   {
@@ -24,8 +39,8 @@
     "values": {
       "x.iis": "upp",
       "y.iis": "non",
-      "C1.iis": "mem",
-      "C2.iis": "mem",
+      "C1.iis": ["mem", "low"],
+      "C2.iis": ["mem", "upp"],
       "C3.iis": "non"
     }
   },
@@ -46,7 +61,7 @@
   },
   {
     "name": "infeas_int_02_vars feasrelax=4 ubpen=300",
-    "tags": [ "linear", "feasrelax"],
+    "tags": [ "linear", "feasrelax", "feasrelax_modes"],
     "options": {
         "ANYSOLVER_options": "feasrelax=4 ubpen=300"
     },
@@ -54,7 +69,7 @@
   },
   {
     "name": "infeas_int_01 feasrelax=5",
-    "tags": [ "linear", "feasrelax"],
+    "tags": [ "linear", "feasrelax", "feasrelax_squared", "feasrelax_modes"],
     "options": {
         "ANYSOLVER_options": "feasrelax=5"
     },
@@ -62,11 +77,12 @@
   },
   {
     "name": "infeas_int_01 feasrelax=6",
-    "tags": [ "linear", "feasrelax"],
+    "tags": [ "linear", "feasrelax", "feasrelax_modes"],
     "options": {
         "ANYSOLVER_options": "feasrelax=6"
     },
-    "objective": -9.534910000000e+05
+    "comment": "Unbounded below once C1 is relaxed; the value depends on the solver's relaxation bound (Gurobi -953491, COPT -9.53e7)",
+    "objective": { "max": -9.0e+05 }
   },
 
   {
@@ -75,9 +91,11 @@
     "options": {
       "ANYSOLVER_options": "feasrelax=1"
     },
+    "comment": "C2 may not be relaxed; Gurobi relaxes C1 by 2, COPT relaxes C3 by 1",
     "values": {
-      "C1.slack": -2,
-      "C2.slack": 1
+      "C1.slack": [-2, 18],
+      "C2.slack": [1, 2],
+      "C3.slack": [20, -1]
     }
   },
   {
@@ -86,8 +104,9 @@
     "options": {
       "ANYSOLVER_options": "feasrelax=1"
     },
+    "comment": "Minimal total violation is 1; Gurobi relaxes C2, HiGHS C3",
     "values": {
-      "C2.slack": -1
+      "-min(0, C1.slack) - min(0, C2.slack) - min(0, C3.slack)": 1
     }
   },
   {
@@ -97,14 +116,31 @@
       "ANYSOLVER_options": "iis=1"
     },
     "values": {
-      "C2_lcon.iis": "mem"
+      "C2_lcon.iis": ["mem", "upp"]
+    }
+  },
+  {
+    "name": "infeas_lcon_08 iis=1",
+    "tags": [ "logical", "iis" ],
+    "solvers_exclude": ["xpress", "cplex"],
+    "comment": "Constraints sharing the constant 0 with the IIS are not in it. Fuel[1,3] can be: it shares the subexpression P[1,3]>=1 with Reserve[3]. Excluded: Xpress returns no IIS for this MIP (as for infeas_lcon_05); CPLEX 22.2.0's parallel conflict refiner stops with SIGTRAP (threads=1 works)",
+    "options": {
+      "ANYSOLVER_options": "iis=1"
+    },
+    "values": {
+      "Balance[3].iis": ["mem", "low", "upp"],
+      "Reserve[3].iis": ["mem", "low", "upp"],
+      "Fuel[1,1].iis": "non",
+      "Fuel[2,4].iis": "non",
+      "Reserve[1].iis": "non",
+      "Balance[1].iis": "non"
     }
   },
   {
     "name": "infeas_lcon_05 .funcpieces IN",
     "tags": [ "logical", "nonlinear", "funcpieces" ],
     "options": {
-      "ANYSOLVER_options": "debug=1"
+      "mp_options": "debug=1"
     },
     "values": {
       "Initial.test_funcpieces_presolved": 7
@@ -114,17 +150,18 @@
     "name": "infeas_lcon_05 .iis OUT",
     "tags": [ "logical", "nonlinear", "iis" ],
     "options": {
-      "ANYSOLVER_options": "iis=1"
+      "ANYSOLVER_options": "iis=1",
+      "highs_options": "iis=1 cvt:bigM=1e6 iis:strategy=22"
     },
     "values": {
-      "Flow4['ELLY', 2].iis": "mem"
+      "Flow4['ELLY', 2].iis": ["mem", "upp", "fix"]
     }
   },
   {
     "name": "infeas_lcon_06 .funcpieces IN",
     "tags": [ "logical", "nonlinear", "funcpieces" ],
     "options": {
-      "ANYSOLVER_options": "debug=1"
+      "mp_options": "debug=1"
     },
     "values": {
       "Initial.test_funcpieces_presolved": -2
@@ -134,10 +171,76 @@
     "name": "infeas_lcon_07 .funcpieces IN",
     "tags": [ "logical", "nonlinear", "funcpieces" ],
     "options": {
-      "ANYSOLVER_options": "debug=1"
+      "mp_options": "debug=1"
     },
     "values": {
       "Initial.test_funcpieces_presolved": 9
     }
+  },
+  {
+    "name": "infeas_int_01 feasopt=1 feasoptobj=1 CPLEX",
+    "tags": [ "linear", "feasrelax" ],
+    "comment": "cplexasl-compatible spelling of feasrelax=1",
+    "options": {
+      "cplex_options": "feasopt=1 feasoptobj=1"
+    },
+    "solvers": ["cplex"],
+    "values": {
+      "C2.slack": -1
+    }
+  },
+  {
+    "name": "infeas_lp_01 iisfind=1 presolve 0",
+    "tags": [ "linear", "continuous", "iis"],
+    "options": {
+        "ANYSOLVER_options": "iisfind=1",
+        "presolve": 0,
+        "comment": "LP whose IIS consists of a variable bound (x <= 0) and two rows"
+    },
+    "values": {
+      "x.iis": "upp",
+      "y.iis": "non",
+      "C1.iis": ["mem", "low"],
+      "C2.iis": ["mem", "upp"],
+      "C3.iis": "non"
+    }
+  },
+  {
+    "name": "IIS native indicators",
+    "files": [
+      "iis_indicators.mod"
+    ],
+    "tags": [
+      "logical",
+      "iis"
+    ],
+    "options": {
+      "ANYSOLVER_options": "iis=1",
+      "cplex_options": "iis=1 tech:threads=1"
+    },
+    "values": {
+      "solve_result": "infeasible",
+      "Cap.iis": [
+        "mem",
+        "upp"
+      ],
+      "WhenZero.iis": [
+        "mem",
+        "low"
+      ],
+      "WhenOne.iis": [
+        "mem",
+        "low"
+      ],
+      "Irrelevant.iis": "non"
+    },
+    "solvers": [
+      "cplex",
+      "gurobi",
+      "copt",
+      "xpress",
+      "scip"
+    ],
+    "comment": "Requires native indicators with free variables and IIS reporting; the first indicator is irrelevant."
   }
 ]

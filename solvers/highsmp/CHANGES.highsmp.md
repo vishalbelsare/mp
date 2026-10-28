@@ -2,6 +2,275 @@ Summary of recent updates to HiGHS for AMPL
 ===========================================
 
 
+## 20261101
+- Fix Windows Debug heap assertions when copying options to the fixed LP:
+  retain driver-owned option names instead of freeing names allocated by
+  a vendor library using a different C runtime.
+- A quadratic objective with integer variables (MIQP, which HiGHS
+  cannot solve) is reported as such, suggesting *cvt:quadobj=0*;
+  before, the message was "argument index out of range".
+- Emulate *mip:basis* for linear algebraic MIPs, with separate
+  *mip:basis:timelimit* and *mip:basis:iterlimit* options.
+- Options aligned with HiGHS 1.15.1: corrected value tables and
+  defaults of *alg:simplex* (2 = SIP, 3 = PAMI, default 1),
+  *alg:simplexscale* (0..4, default 2), *pre:pdlpscaling_mode*
+  (default 5), *iis:strategy* (4 = irreducible IIS, 8 = column
+  priority), *bar:crossover* (default on), *mip:ipmsolver*
+  (values choose/ipx/hipo); corrected ranges and descriptions
+  (*alg:kkt_tolerance* semantics, *tech:threads*, *mip:lpagelimit*,
+  scaling exponents, infinite-value thresholds).
+- A value rejected by HiGHS now aborts with a message naming the AMPL
+  option, the value and the HiGHS diagnostic (valid range);
+  *alg:method=hipo* reports clearly when the library lacks HiPO.
+- MP-style option names: *alg:kkttol*, *pdlp:scaling*, *pdlp:restart*,
+  *pdlp:restartmethod*, *pdlp:stepsize*, *pdlp:opttol*, *pdlp:ruiziter*,
+  *lim:pdlpiter*, *lim:qpiter*, *qp:nullspacelim*, *qp:regularization*,
+  *bar:hiposystem*, *bar:hipoparallel*, *bar:hipoordering*, *lim:iistime*,
+  *bar:centring*, *bar:maxcentringsteps*, *bar:centringratiotol*,
+  *mip:symmetry*; standard synonyms *lim:iter*, *bar:iterlim*, *lim:sol*.
+  All previous spellings remain accepted.
+- New options from HiGHS 1.15.1: *alg:primalrestol*, *alg:opttol*,
+  *alg:simplexupdatelim*, *alg:simplexminconcurrency*,
+  *alg:simplexmaxconcurrency*, *mip:restart*, *mip:maxstartnodes*,
+  *mip:poolagelimit*, *mip:nodecuts*, *mip:rootpresolveonly*,
+  *mip:heur:feasjump*, *mip:heur:rins*, *mip:heur:rens*,
+  *mip:heur:rootredcost*, *mip:heur:ziround*, *mip:heur:shifting*,
+  *tech:miplogfreq*, *tech:logtoconsole*, *tech:timelesslog*,
+  *bar:hipoblocksize*, *qp:hotstart*.
+- Partial MIP starts are passed to HiGHS natively, which completes
+  them by a limited MIP search (*mip:maxstartnodes*); *mip:start=2*
+  selects the previous driver-side completion by fixing and solving.
+  A start rejected by HiGHS gives a warning instead of aborting.
+- *mip:basis* emulation: the fixed LP is obtained with HiGHS's own
+  Highs_getFixedLp and solved with all user options copied (tolerances,
+  presolve, seed, ...), except the algorithm, limits and file output.
+- IIS computation (*iis:find=1*, suffix .iis) via HiGHS's IIS finder;
+  *iis:strategy* (default -1: true IIS, relaxation for MIPs) and
+  *lim:iistime* control it.
+- Sensitivity analysis (*alg:sens=1*, suffixes .sensobjlo/hi, .senslblo/hi,
+  .sensublo/hi, .sensrhslo/hi) via HiGHS ranging, for LPs solved to an
+  optimal basis and for the fixed LP of *mip:basis*.
+- Feasibility relaxation *alg:feasrelax=1* (weighted sum of violations,
+  penalties from *alg:lbpen/ubpen/rhspen* or suffixes .lbpen/.ubpen/.rhspen,
+  negative = no violation allowed) via Highs_feasibilityRelaxation;
+  the other modes are not available in HiGHS and are rejected.
+- Option *obj:blend* removed: it had no effect because HiGHS's native
+  multi-objective handling is not used (MP emulates multiple objectives).
+
+
+## 20260813
+- Updated to HiGHS 1.15.1
+    - First variant of parallel MIP solver
+- Options *mip:lpsolver* and *mip:ipmsolver* to 
+  fine control solvers used during MIP solves
+
+
+## 20260812
+- Fixed runtime issue on some containers
+
+
+## 20260806
+- Options *mip:plateau:...* control MIP
+  tailing-off.
+  Can be used in multi-objective solves,
+  see option *obj:multi:options*. 
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+  - The main driver code is separated into a shared
+    library and used commonly with AMPLS API.
+    
+
+
+## 20260611
+- Updated to HiGHS 1.14
+- Added HiPO algorithm, an advanced interior point method,
+  accessible with *alg:method=hipo*
+- Added HiPDLP on CPU and GPU (*alg:method=hipdlp* and 
+  *alg:method=hipdlp-gpu*)
+- Added active set algorithm for qp (*alg:method=qpasm*)
+- Added options to control those algorithms, see namespaces 
+  (*pdlp:*) and (*qp:*)
+
+  
+## 20260414
+- Changes in MP, in particular new naming for
+  auxiliaries.
+
+
+## 20251210
+- Change in MP: option *obj:multi:options*:
+  fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- Change in MP: new option *obj:multi:options*
+  to control
+  whether multi-objective option suffixes
+  are used.
+
+
+## 20251015
+- Changes in MP
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options cvt:pre:unnest, cvt:pre:sort).
+  - Option cvt:pre:boundlogarg (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    pre:feastolrel both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options cvt:compl, cvt:compl:eps control
+    complementarity reformulations.
+
+
+## 20250617
+- Updated to HiGHS 1.11
+- Renamed *pdlp_d_gap_tol* to *pdlpopttol* for consistency
+  with IPM
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250424
+- Changes in MP
+  - Option cvt:qp2pass (default even faster parsing
+    of quadratics)
+
+
+## 20250329
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250320
+- Updated to HiGHS 1.10, which include GPU support for cuPDLP-C, 
+  lifting for probing (see `mip:lifting`), and bug fixes
+- Added support for PDLP on NVIDIA GPU, accessible with `alg:method=pdlp-gpu`.
+  It requires Linux/Windows and NVIDIA CUDA toolkit.
+- Added options `tech:seed`, `alg:pdlperestartmethod`, `alg:dualrestol`
+- Disabled native multiobjective suppport, as it exhibited
+  a behaviour not consistent with the MO emulator. 
+  Multi objective problems can still be solved specifying option
+  *multiobj=1*, that will use MP's MO emulator.
+
+
+## 20250308
+- Updated to HiGHS 1.9.0.
+- Added native multiobjective suppport.
+
+
+## 20241119
+- Updated to HiGHS 1.8.1.
+- Options mip:gap (renamed from relgaptol), mip:gapabs
+  aligned to other MP solvers.
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240627
+- Updated to HiGHS 1.7.1
+- Added calculation of primal and dual rays.
+	See keyword `alg:rays`.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use 
+    MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
+## 20240307
+- *Updated* to HiGHS 1.7.0
+- Added solver pdlp (use option `alg:method` to specify it and
+  `alg:pdlpdgaptol`, `lim:pdlpnativetermination`, `pre:pdlpscaling` 
+  and `lim:pdlpiterationlimit`).
+- Added optional pre centring steps (see options `pre:centring`,
+  `pre:maxcentringsteps` and `pre:centringratiotolerance`).
+- Added options `pre:userboundscale`, `pre:usercostscale`, 
+  `lim:objectivebound` and `lim:objectivetarget`.
+
+
 ## 20240115
 - *Solve result codes*
   - List codes by running (solver) -!

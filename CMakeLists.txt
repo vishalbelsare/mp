@@ -1,13 +1,16 @@
-# CMake 3.3 or later is required for COMPILE_LANGUAGE.
+# CMake 3.30 or later is required for FindBoost.
 # It can be easily obtained and used without superuser privileges
 # even if the system has an older version of CMake installed.
-cmake_minimum_required(VERSION 3.3)
+cmake_minimum_required(VERSION 3.5...3.10)
 
 if (CMAKE_MAJOR_VERSION LESS 3)
   # CMake 3.0 is used for generator expressions in install(FILES).
   message(WARNING
     "MP: CMake version 3.0 or newer is required to install all targets")
 endif ()
+
+# Minimum MacOS target to enable C++17 std::filesystem
+set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15)
 
 # Set the path to CMake modules.
 set(MP_CMAKE_MODULE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/support/cmake)
@@ -27,8 +30,8 @@ include(init)
 
 project(MP)
 
-# Set the c++11 flag without GNU extensions.
-set(CMAKE_CXX_STANDARD 11)
+# Set the c++17 flag without GNU extensions.
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -42,6 +45,9 @@ if (POLICY CMP0054)
   cmake_policy(SET CMP0054 NEW)
 endif ()
 
+option(MP_GENERATE_EXPR_ONLY "Enable to just build MP and the expr-info file; useful before cross compiling" OFF)
+option(MP_CROSSCOMPILING "Set to override cross-compilation detection, as it does not detect compiling ARM-only on Intel Macs" OFF)
+option(MP_LINK_WITH_SHARED_LIB "Link solver drivers with shared library, if present" OFF)
 option(USE_PROFILER "Use Profiler" OFF)
 if(USE_PROFILER)
   SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pg")
@@ -49,7 +55,7 @@ if(USE_PROFILER)
   SET(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -pg")
 endif()
 
-# Sanitizers
+# Sanitizers. Might need `export ASAN_OPTIONS=detect_leaks=0`
 option(USE_SANITIZERS "Use Sanitizers" OFF)
 if(USE_SANITIZERS)
   if (WIN32)
@@ -77,7 +83,7 @@ else()
 endif()
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
-set(MP_VERSION 3.1.0)
+set(MP_VERSION 4.2.0)
 if (NOT MP_VERSION MATCHES "^([0-9]+).([0-9]+).([0-9]+)$")
   message(FATAL_ERROR "MP: invalid version format ${MP_VERSION}.")
 endif ()
@@ -230,7 +236,7 @@ endif()  ## NOT SKIP_BUILD_MP
 include_directories(include)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
-set(MP_DATE 20240115)
+set(MP_DATE 20261101)
 
 set(MP_SYSINFO "${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
 
@@ -258,7 +264,7 @@ function (add_mp_library name)
     PUBLIC ${add_mp_library_COMPILE_DEFINITIONS})
   target_include_directories(${name}
     PUBLIC ${add_mp_library_INCLUDE_DIRECTORIES})
-  set_property(TARGET ${name}  PROPERTY CXX_STANDARD 11)
+  set_property(TARGET ${name}  PROPERTY CXX_STANDARD 17)
   if (add_mp_library_DEPENDS)
     add_dependencies(${name} ${add_mp_library_DEPENDS})
   endif ()
@@ -301,6 +307,7 @@ endfunction ()
 add_mp_library(format OBJECT
 	include/mp/format.h include/mp/posix.h src/format.cc src/posix.cc)
 
+
 # gen-expr-info
 set(MP_EXPR_INFO_FILE ${MP_SOURCE_DIR}/src/expr-info.cc)
 set(MP_NL_OPCODES_FILE
@@ -317,14 +324,20 @@ if (CMAKE_HOST_UNIX AND WIN32)
 else ()
   set(WINE "")
 endif ()
-if (CMAKE_CROSSCOMPILING)
+
+if (CMAKE_CROSSCOMPILING OR MP_CROSSCOMPILING)
   # Produce a warning because expr-info.cc can be out of date but cannot be
   # re-generated because we are cross compiling.
-  add_custom_command(OUTPUT
-      ${MP_EXPR_INFO_FILE} ${MP_NL_OPCODES_FILE}
-    COMMAND ${CMAKE_COMMAND} -E echo
-    "warning: cannot re-generate '${MP_EXPR_INFO_FILE}' and '${MP_NL_OPCODES_FILE}'")
+  message(WARNING "Will not re-generate '${MP_EXPR_INFO_FILE}' and '${MP_NL_OPCODES_FILE}'")
 else ()
+  if (UNIX AND NOT APPLE)
+    add_custom_command(
+      TARGET gen-expr-info
+      POST_BUILD
+      COMMAND chmod +x $<TARGET_FILE:gen-expr-info>
+      COMMENT "Making sure gen-expr-info is executable")
+  endif ()
+
   add_custom_command(OUTPUT
       ${MP_EXPR_INFO_FILE} ${MP_NL_OPCODES_FILE}
     COMMAND ${WINE} $<TARGET_FILE:gen-expr-info>
@@ -338,36 +351,51 @@ add_to_folder(${MP_FOLDER_PREFIX}util gen-expr-info)
 add_prefix(MP_HEADERS include/mp/
   ampls-c-api.h ampls-cpp-api.h arrayref.h basic-expr-visitor.h
   backend-app.h backend-base.h backend-mip.h backend-std.h
+  backend-plateau-state.h
   backend-to-model-api.h backend-with-mm.h backend-with-valcvt.h
-  clock.h common.h converter-base.h
+  backend-slvoptmap.h
+  common.h converter-base.h
   easy-modeler.h
   env.h error.h expr.h expr-visitor.h
   model-mgr-base.h model-mgr-with-pb.h
   model-mgr-with-std-pb.h model-mgr-with-std-pb.hpp
   nl-header-c.h nl-header.h nl.h nl-reader.h
   option.h os.h problem.h problem-builder.h
+  obj-option-base.h
   valcvt-base.h valcvt-node.h valcvt-link.h valcvt.h
   rstparser.h safeint.h sol.h
   solver.h solver-opt.h solver-base.h solver-io.h solver-app-base.h solver-app.h
   suffix.h
-  utils-file.h utils-hash.h utils-hash-stream.h
-  utils-string.h utils-math.h)
+  utils-clock.h utils-file.h
+  util-json-write.h util-json-write.hpp
+  utils-hash.h utils-hash-stream.h
+  utils-string.h utils-math.h utils-matrix.h
+  utils-misc.h
+  utils-vec.h utils-templates.h)
 
 add_prefix(MP_FLAT_HEADERS include/mp/flat/
   backend_flat.h
+  constr_2_expr.h
   constr_base.h constr_eval.h constr_keeper.h constr_hash.h
   constr_std.h constr_static.h constr_functional.h
   constr_algebraic.h constr_general.h
   constr_prepro.h constr_prop_down.h
   context.h
+  converter_info.h
   converter.h converter_model.h converter_model_base.h
+  converter_multiobj.h
   convert_functional.h
-  eexpr.h expr_algebraic.h expr_affine.h expr_quadratic.h
+  eexpr.h expr_algebraic.h expr_alg_inline.h
+  expr_affine.h expr_quadratic.h
+  bucketaccum.h bucketaccum.hpp
   expr_bounds.h
+  item_keeper.h item_namer.h
   model_api_base.h model_api_connect.h
   model_info.h model_info.hpp
-  obj_std.h preprocess.h problem_flattener.h
-  sol_check.h)
+  obj_std.h preprocess.h prepro_prod.h
+  problem_flattener_base.h problem_flattener.h
+  qp2passes.h qp2passes.hpp
+  sol_check.h sol_check_data.h)
 
 add_prefix(MP_FLAT_REDEF_HEADERS include/mp/flat/redef/
   encodings.h redef_base.h)
@@ -375,8 +403,11 @@ add_prefix(MP_FLAT_REDEF_HEADERS include/mp/flat/redef/
 add_prefix(MP_FLAT_REDEF_STD_HEADERS include/mp/flat/redef/std/
   range_con.h)
 
-add_prefix(MP_FLAT_REDEF_STD_HEADERS include/mp/flat/redef/conic/
+add_prefix(MP_FLAT_REDEF_CONIC_HEADERS include/mp/flat/redef/conic/
   cones.h qcones2qc.h)
+
+add_prefix(MP_FLAT_REDEF_SDP_HEADERS include/mp/flat/redef/SDP/
+  sdp.h)
 
 add_prefix(MP_FLAT_REDEF_MIP_HEADERS include/mp/flat/redef/MIP/
   converter_mip.h redefs_mip_std.h abs.h alldiff.h
@@ -389,28 +420,35 @@ add_prefix(MP_FLAT_REDEF_MIP_HEADERS include/mp/flat/redef/MIP/
   logical_and.h logical_or.h logical_not.h
   min_max.h mul.h numberof_const.h numberof_var.h
   piecewise_linear.h
-  power_const.h sos2.h)
+  power.h sos2.h)
+
+add_prefix(MP_FLAT_NL_EXPR_HEADERS include/mp/flat/nl_expr/
+  model_api_base.h constr_nl.h)
 
 
 set(MP_ALL_HEADERS ${MP_HEADERS} ${MP_FLAT_HEADERS}
   ${MP_FLAT_REDEF_HEADERS}
-  ${MP_FLAT_REDEF_STD_HEADERS} ${MP_FLAT_REDEF_MIP_HEADERS})
+  ${MP_FLAT_REDEF_STD_HEADERS} ${MP_FLAT_REDEF_MIP_HEADERS}
+  ${MP_FLAT_REDEF_CONIC_HEADERS} ${MP_FLAT_REDEF_SDP_HEADERS}
+  ${MP_FLAT_NL_EXPR_HEADERS}
+)
 
 
 set(MP_SOURCES )
 add_prefix(MP_SOURCES src/
-  clock.cc expr.cc expr-writer.h nl-reader.cc option.cc os.cc
+  expr.cc expr-writer.h nl-reader.cc option.cc os.cc
   problem.cc rstparser.cc sol.cc solver.cc solver-c.h sp.h sp.cc
-  std_constr.cc
-  utils_file.cc utils_string.cc)
+  utils_file.cc utils_string.cc utils_clock.cc)
 
 set(MP_FLAT_SOURCES )
 add_prefix(MP_FLAT_SOURCES src/mp/flat/
+  std_constr.cc
   encodings.cpp piecewise_linear.cpp)
 
 
 if (NOT SKIP_BUILD_MP)
-	add_mp_library(mp ${MP_ALL_HEADERS}
+	add_mp_library(mp 
+  ${MP_ALL_HEADERS}
 		${MP_SOURCES} ${MP_FLAT_SOURCES} ${MP_EXPR_INFO_FILE}
 		COMPILE_DEFINITIONS MP_DATE=${MP_DATE} MP_SYSINFO="${MP_SYSINFO}"
 		INCLUDE_DIRECTORIES src include OBJECT_LIBRARIES format)
@@ -477,6 +515,96 @@ if (NOT SKIP_BUILD_MP)
 
 endif()   ## NOT SKIP_BUILD_MP
 
+# If we want to generate the op file only, we are done here.
+# Useful for a first native run before cross-compiling
+if(MP_GENERATE_EXPR_ONLY)
+  return()
+endif()
+
+# Xpress option headers.
+# solvers/xpress/optprm.h and nlprm.h are generated from the parameter
+# XML database shipped with the Xpress SDK (<SDK>/xml/optimizerparams.xml,
+# nonlinearparams.xml) by parse-xpress-options, which also verifies the
+# control types against the SDK headers (<SDK>/include/xprs.h, xslp.h).
+# The generated headers are committed, so the xpress driver builds without
+# the SDK database. Set XPRESS_PARAMS_XML_DIR to regenerate them whenever
+# the database or the parser changes; the files are copied into the source
+# tree only when they differ.
+# (A consuming project may set these as normal variables before adding MP;
+# the cache entries are created only when they are not defined, so that
+# an old CMake policy (CMP0126) does not discard the normal variables.)
+if (NOT DEFINED XPRESS_PARAMS_XML_DIR)
+  set(XPRESS_PARAMS_XML_DIR "" CACHE PATH
+    "Directory with the Xpress parameter database (optimizerparams.xml, nonlinearparams.xml); when set, solvers/xpress/optprm.h and nlprm.h are regenerated before the xpress driver is built")
+endif()
+if (NOT DEFINED XPRESS_PARAMS_INCLUDE_DIR)
+  set(XPRESS_PARAMS_INCLUDE_DIR "" CACHE PATH
+    "Directory with xprs.h and xslp.h used to verify control types; default: <XPRESS_PARAMS_XML_DIR>/../include")
+endif()
+option(BUILD_XPRESS_OPTION_PARSER
+  "Build the Xpress XML option parser even without XPRESS_PARAMS_XML_DIR" OFF)
+if (BUILD_XPRESS_OPTION_PARSER OR XPRESS_PARAMS_XML_DIR)
+  add_executable(parse-xpress-options
+    src/parse_xpress_options.cc
+    src/wrap_tinyxml2.cc
+    src/utils_string.cc
+    ${PROJECT_SOURCE_DIR}/thirdparty/tinyxml2/tinyxml2.cpp)
+  target_include_directories(parse-xpress-options PUBLIC
+    ${PROJECT_SOURCE_DIR}/thirdparty/tinyxml2)
+  set_property(TARGET parse-xpress-options PROPERTY CXX_STANDARD 17)
+  add_to_folder(${MP_FOLDER_PREFIX}util parse-xpress-options)
+endif()
+if (XPRESS_PARAMS_XML_DIR)
+  set(xpress_params_xml_opt ${XPRESS_PARAMS_XML_DIR}/optimizerparams.xml)
+  set(xpress_params_xml_nl  ${XPRESS_PARAMS_XML_DIR}/nonlinearparams.xml)
+  if (NOT EXISTS ${xpress_params_xml_opt} OR NOT EXISTS ${xpress_params_xml_nl})
+    message(FATAL_ERROR
+      "XPRESS_PARAMS_XML_DIR=${XPRESS_PARAMS_XML_DIR} must contain optimizerparams.xml and nonlinearparams.xml")
+  endif()
+  if (NOT XPRESS_PARAMS_INCLUDE_DIR)
+    get_filename_component(XPRESS_PARAMS_INCLUDE_DIR
+      ${XPRESS_PARAMS_XML_DIR}/../include ABSOLUTE)
+  endif()
+  set(xpress_params_hdrs
+    ${XPRESS_PARAMS_INCLUDE_DIR}/xprs.h ${XPRESS_PARAMS_INCLUDE_DIR}/xslp.h)
+  foreach (hdr ${xpress_params_hdrs})
+    if (NOT EXISTS ${hdr})
+      message(FATAL_ERROR "Xpress header ${hdr} not found; set XPRESS_PARAMS_INCLUDE_DIR")
+    endif()
+  endforeach()
+  set(xpress_params_src_dir ${PROJECT_SOURCE_DIR}/solvers/xpress)
+  set(xpress_params_gen_dir ${PROJECT_BINARY_DIR}/xpress-options)
+  file(MAKE_DIRECTORY ${xpress_params_gen_dir})
+  add_custom_command(OUTPUT ${xpress_params_gen_dir}/optprm.h
+    COMMAND parse-xpress-options ${xpress_params_xml_opt}
+      ${xpress_params_gen_dir}/optprm.h Optimizer XPRS ${xpress_params_hdrs}
+    DEPENDS parse-xpress-options ${xpress_params_xml_opt} ${xpress_params_hdrs}
+    COMMENT "Generating Xpress optimizer options (optprm.h)")
+  add_custom_command(OUTPUT ${xpress_params_gen_dir}/nlprm.h
+    COMMAND parse-xpress-options ${xpress_params_xml_nl}
+      ${xpress_params_gen_dir}/nlprm.h Nonlinear - --nonlinear ${xpress_params_hdrs}
+    DEPENDS parse-xpress-options ${xpress_params_xml_nl} ${xpress_params_hdrs}
+    COMMENT "Generating Xpress nonlinear options (nlprm.h)")
+  # The generated headers replace the committed ones only when they differ,
+  # so an unchanged database does not rebuild the driver.
+  add_custom_target(xpress-option-headers
+    DEPENDS ${xpress_params_gen_dir}/optprm.h ${xpress_params_gen_dir}/nlprm.h
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${xpress_params_gen_dir}/optprm.h ${xpress_params_src_dir}/optprm.h
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      ${xpress_params_gen_dir}/nlprm.h ${xpress_params_src_dir}/nlprm.h
+    COMMENT "Updating solvers/xpress/optprm.h and nlprm.h")
+  add_to_folder(${MP_FOLDER_PREFIX}util xpress-option-headers)
+  message(STATUS "MP: Xpress option headers regenerated from ${XPRESS_PARAMS_XML_DIR}")
+  # The xpress driver targets exist here only in a standalone MP build;
+  # a consuming project that creates them itself adds the same dependency.
+  foreach (tgt amplxpress-static xpress-lib xpress)
+    if (TARGET ${tgt})
+      add_dependencies(${tgt} xpress-option-headers)
+    endif()
+  endforeach()
+endif()
+
 # Option BUILD_EXAMPLES
 option(BUILD_EXAMPLES "Build examples: nl reader, nl writer" ON)
 
@@ -510,7 +638,8 @@ if (BUILD_EXAMPLES OR NLW2_LIB)
   set(NLW2_DOC_SRC ${NLW2_SRC})
   # Export library target names
   # for a calling CMake project
-	set(NLW2_LIB_NAME ${NLW2_LIB_NAME} PARENT_SCOPE)
+  set(NLW2_INCLUDE_PATH ${NLW2_INCLUDE_PATH} PARENT_SCOPE)
+  set(NLW2_LIB_NAME ${NLW2_LIB_NAME} PARENT_SCOPE)
 	set(NLW2_C_API_LIB_NAME ${NLW2_C_API_LIB_NAME} PARENT_SCOPE)
   # Add to folders to better organize project in IDEs
   add_to_folder(${MP_FOLDER_PREFIX}nlw nlw2 nlw2_c_api nl-writer-example-c nl-writer-example-cpp)
@@ -558,3 +687,9 @@ if (NOT SKIP_BUILD_MP)
 	endif()
 
 endif()  ## NOT SKIP_BUILD_MP
+
+############## Features summary ##############
+if(${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
+	include(FeatureSummary)
+	feature_summary(WHAT ALL)
+endif()

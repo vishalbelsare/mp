@@ -20,7 +20,10 @@
  Authors: Victor Zverovich, Gleb Belov
  */
 
+#include <map>
 #include <cctype>
+#include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +32,7 @@
 
 #include <algorithm>
 #include <stack>
+#include <charconv>
 
 #ifndef _WIN32
 # include <strings.h>
@@ -50,39 +54,19 @@
 #include "mp/os.h"
 #include "mp/utils-file.h"
 #include "mp/utils-string.h"
-#include "mp/clock.h"
 #include "mp/rstparser.h"
 
 #include "mp/ampls-cpp-api.h"
 
+#ifdef _WIN32
+#include <cstdlib>  // For _environ on Windows
+#define environ _environ
+#else
+extern char** environ;
+#endif
+
+
 namespace {
-
-const char *SkipSpaces(const char *s) {
-  while (*s && isspace(*s))
-    ++s;
-  return s;
-}
-
-const char *SkipNonSpaces(const char *s) {
-  while (*s && !isspace(*s))
-    ++s;
-  return s;
-}
-
-const char* SkipToEnd(const char* s) {
-  while (*s && (*s != '\n'))
-    ++s;
-  return s;
-}
-
-const char* SkipToMatchingQuote(const char* s) {
-  assert((*s == '\'') || (*s == '"'));
-  char quote = s[0];
-  ++s;
-  while (*s != quote)
-    ++s;
-  return ++s;
-}
 
 struct Deleter {
   void operator()(mp::SolverOption* p) const { delete p; }
@@ -236,7 +220,61 @@ void RSTFormatter::HandleDirective(const char *type) {
 
 }  // namespace
 
+
 namespace mp {
+
+const char *SkipSpaces(const char *s) {
+  while (*s && isspace(*s))
+    ++s;
+  return s;
+}
+
+const char *SkipNonSpaces(const char *s) {
+  while (*s && !isspace(*s))
+    ++s;
+  return s;
+}
+
+const char* SkipToEnd(const char* s) {
+  while (*s && (*s != '\n'))
+    ++s;
+  return s;
+}
+
+const char* SkipToMatchingQuote(const char* s) {
+  assert((*s == '\'') || (*s == '"'));
+  char quote = s[0];
+  ++s;
+  while (*s != quote)
+    ++s;
+  return ++s;
+}
+
+/// Namespace sol
+namespace sol {
+
+const char* GetStatusName(sol::Status stt) {
+  static const std::map<int, const char*> stt_map {
+      { INT_MIN, "wrong_status_code" },
+      { NOT_SET, "not_set" },
+      { UNKNOWN, "unknown" },
+      { SOLVED, "solved" },
+      { UNCERTAIN, "solved?" },
+      { INFEASIBLE, "infeasible" },
+      { UNBOUNDED, "unbounded" },
+      { LIMIT, "limit" },
+      { FAILURE, "failure" },
+      { NUMERIC, "numeric" },
+      { SPECIFIC, "failure" },
+      { FAILURE_LAST, "failure" },
+      { INT_MAX, "unspecified failure" }
+  };
+  auto it = stt_map.lower_bound(stt);
+  assert(stt_map.end() != it);
+  return it->second;
+}
+
+}
 
 namespace internal {
 
@@ -248,25 +286,57 @@ void FormatRST(fmt::Writer &w,
 }
 
 int OptionHelper<int>::Parse(const char *&s, bool) {
-  char *end = 0;
-  long value = std::strtol(s, &end, 10);
+  assert(!isspace(*s));
+  const char *end = SkipNonSpaces(s);
+  int value;
+  auto result = std::from_chars(s, end, value);
+  if (result.ec == std::errc()) {
+    s = result.ptr;
+    return value;
+  }
+  MP_ASSERT_ALWAYS(result.ec != std::errc::invalid_argument,
+                   "this is not a number");
+  MP_ASSERT_ALWAYS(result.ec != std::errc::result_out_of_range,
+                   "this number is larger than an int");
+  MP_RAISE("Unknown std::from_chars<int> result");
+}
+
+fmt::LongLong OptionHelper<fmt::LongLong>::Parse(const char *&s, bool) {
+  assert(!isspace(*s));
+  const char *end = SkipNonSpaces(s);
+  fmt::LongLong value;
+  auto result = std::from_chars(s, end, value);
+  if (result.ec == std::errc()) {
+    s = result.ptr;
+    return value;
+  }
+  MP_ASSERT_ALWAYS(result.ec != std::errc::invalid_argument,
+                   "this is not a number");
+  MP_ASSERT_ALWAYS(result.ec != std::errc::result_out_of_range,
+                   "this number is larger than a 64-bit integer");
+  MP_RAISE("Unknown std::from_chars<long long> result");
+}
+
+double OptionHelper<double>::Parse(const char *&s, bool) {
+  assert(!isspace(*s));
+  char *end = 0;        // Clang 16 still no from_chars<double>
+  double value = std::strtod(s, &end);
+  MP_ASSERT_ALWAYS(end != s,
+                   "this is not a number");
+  MP_ASSERT_ALWAYS(HUGE_VAL != value,
+                   "this number is larger than a double");
   s = end;
   return value;
 }
 
-double OptionHelper<double>::Parse(const char *&s, bool) {
-  char *end = 0;
-  double value = std::strtod(s, &end);
-  s = end;
-  return value;
-}
 bool quoted(const char* s) {
   return (*s == '\'' || *s == '"');
 }
+
 std::string OptionHelper<std::string>::Parse(const char *&s, bool splitString) {
   const char *start = s;
   if (splitString) // if the string has been already split (by the command line parser)
-  {
+  {                // @todo consider quotes here too?
     s = SkipToEnd(s);
     return std::string(start, s - start);
   }
@@ -275,12 +345,10 @@ std::string OptionHelper<std::string>::Parse(const char *&s, bool splitString) {
     s = SkipToMatchingQuote(s);
     return std::string(start + 1, s - start - 2);
   }
-  else
   {
     s = SkipNonSpaces(s);
     return std::string(start, s - start);
   }
-
 }
 
 SolverAppOptionParser::SolverAppOptionParser(BasicSolver &s)
@@ -368,14 +436,23 @@ bool SolverAppOptionParser::ShowSolverOptions(const char* param) {
     writer << '\n';
   solver_.Print("{}", writer.c_str());
   if(param)
-    solver_.Print("{} ", param);
+    solver_.Print("'{}' ", param);
   solver_.Print("Options:\n");
   const int DESC_INDENT = 6;
   for (Solver::option_iterator
     i = solver_.option_begin(), end = solver_.option_end(); i != end; ++i) {
-    if (param && strlen(param)>0)
-      if (!contains(i->name(), param))
-        continue;
+    if (i->is_hidden())
+      continue;
+    if (param && strlen(param)>0) {
+      if (!contains(i->name(), param)) {
+        bool found {};
+        for (const auto& syn: i->inline_synonyms())
+          if ((found = contains(syn.c_str(), param)))
+            break;
+        if (!found)
+          continue;
+      }
+    }
     writer.clear();
     writer << '\n' << i->name();
     const auto& syns = i->inline_synonyms();
@@ -572,85 +649,183 @@ BasicSolver::BasicSolver(
 }
 
 void BasicSolver::InitMetaInfoAndOptions(
-    fmt::CStringRef name, fmt::CStringRef long_name, long date, int flags) {
+  fmt::CStringRef name, fmt::CStringRef long_name, long date, int flags) {
   name_ = name.c_str();
   long_name_ = (long_name.c_str() ? long_name : name).c_str();
   date_ = date;
+  if (flags & MULTIPLE_OBJ_NATIVE)
+    multiobj_has_native_ = true;
 
   version_ = long_name_;
 
   struct VersionOption : SolverOption {
-    BasicSolver &s;
-    VersionOption(BasicSolver &s) : SolverOption("tech:version version",
-        "Single-word phrase: report version details "
-        "before solving the problem.", ValueArrayRef(), true), s(s) {}
+    BasicSolver& s;
+    VersionOption(BasicSolver& s) : SolverOption("tech:version version",
+      "Single-word phrase: report version details "
+      "before solving the problem.", ValueArrayRef(), true), s(s) {}
 
-    void Write(fmt::Writer &w) { w << ((s.bool_options_ & SHOW_VERSION) != 0); }
-    void Parse(const char *&, bool) { s.bool_options_ |= SHOW_VERSION; }
+    void Write(fmt::Writer& w) { w << ((s.bool_options_ & SHOW_VERSION) != 0); }
+    void Parse(const char*&, bool) { s.bool_options_ |= SHOW_VERSION; }
     Option_Type type() {
       return Option_Type::BOOL;
+    }
+    /// Returns the option value.
+    virtual void GetValue(fmt::LongLong &val) const {
+      val = s.bool_options_ & SHOW_VERSION;
     }
   };
   AddOption(OptionPtr(new VersionOption(*this)));
 
   AddStrOption(
-        "tech:optionfile optionfile option:file",
-        "Name of an AMPL solver option file to read "
-        "(surrounded by 'single' or "
-        "\"double\" quotes if the name contains blanks). "
-        "Lines that start with # are ignored.  Otherwise, each nonempty "
-        "line should contain \"name=value\", e.g., \"lim:iter=500\".",
-        &Solver::GetOptionFile, &Solver::UseOptionFile);
+    "tech:optionfile optionfile option:file",
+    "Name of an AMPL solver option file to read "
+    "(surrounded by 'single' or "
+    "\"double\" quotes if the name contains blanks). "
+    "Lines that start with # are ignored.  Otherwise, each nonempty "
+    "line should contain \"name=value\", e.g., \"lim:iter=500\".",
+    &Solver::GetOptionFile, &Solver::UseOptionFile);
 
 
   AddIntOption(
-        "tech:wantsol wantsol",
-        "In a stand-alone invocation (no ``-AMPL`` on the command line), "
-        "what solution information to write.  Sum of\n"
-        "\n"
-        "| 1 - Write ``.sol`` file\n"
-        "| 2 - Primal variables to stdout\n"
-        "| 4 - Dual variables to stdout\n"
-        "| 8 - Suppress solution message.",
-        &Solver::GetWantSol, &Solver::SetWantSol);
+    "tech:wantsol wantsol",
+    "In a stand-alone invocation (no ``-AMPL`` on the command line), "
+    "what solution information to write.  Sum of\n"
+    "\n"
+    "| 1 - Write ``.sol`` file\n"
+    "| 2 - Primal variables to stdout\n"
+    "| 4 - Dual variables to stdout\n"
+    "| 8 - Suppress solution message.",
+    &Solver::GetWantSol, &Solver::SetWantSol);
 
   AddIntOption(
-        "obj:no objno",
-        "Objective to optimize:\n"
-        "\n"
-        "| 0 - None\n"
-        "| 1 - First (default, if available)\n"
-        "| 2 - Second (if available), etc.\n",
-        &Solver::GetObjNo, &Solver::SetObjNo);
+    "obj:no objno",
+    "Objective to optimize:\n"
+    "\n"
+    "| 0 - None\n"
+    "| 1 - First (default, if available)\n"
+    "| 2 - Second (if available), etc.\n",
+    &Solver::GetObjNo, &Solver::SetObjNo);
 
+  /// IntOption
+  struct IntOption : TypedSolverOption<int> {
+    int& value_;
+    int min_, max_;
+    IntOption(
+        int& value, const char* name, const char* description,
+        int min = INT_MIN, int max = INT_MAX)
+      : TypedSolverOption<int>(name, description), value_(value),
+        min_(min), max_(max) { }
+
+    void GetValue(fmt::LongLong& value) const { value = value_; }
+    void SetValue(fmt::LongLong value) {
+      if (value < min_ || value > max_)
+        throw InvalidOptionValue(name(), value);
+      value_ = value;
+    }
+  };
+
+  /// BoolOption
   struct BoolOption : TypedSolverOption<int> {
-    bool &value_;
-    BoolOption(bool &value, const char *name, const char *description)
-    : TypedSolverOption<int>(name, description), value_(value) {}
+    bool& value_;
+    /// Construct
+    BoolOption(
+        bool& value, const char* name, const char* description)
+        : TypedSolverOption<int>(name, description), value_(value) { }
 
-    void GetValue(fmt::LongLong &value) const { value = value_; }
+    void GetValue(fmt::LongLong& value) const { value = value_ ? 1 : 0; }
     void SetValue(fmt::LongLong value) {
       if (value != 0 && value != 1)
         throw InvalidOptionValue(name(), value);
-      value_ = value != 0;
+      value_ = (value != 0);
     }
   };
 
 
-  AddOption(OptionPtr(new BoolOption(debug_, "tech:debug debug",
-                                     "0*/1: whether to assist testing & debugging, e.g., "
-                                     "by outputting auxiliary information.")));
+  AddOption(OptionPtr(
+      new BoolOption(verbose_, "tech:outlev_mp outlev_mp",
+                     "0*/1: whether to print MP model information.")));
 
+  AddOption(OptionPtr(new IntOption(
+      debug_, "tech:debug debug",
+      "0*/1: whether to assist testing & debugging, e.g., "
+      "by outputting auxiliary information (mostly via suffixes).")));
+
+  AddOption(OptionPtr(new BoolOption(
+      report_uncertain_sol_, "sol:report_uncertain report_uncertain_sol",
+      "0/1*: whether to report objective value(s) in solve_message "
+      "when solve_result is '?' (unknown).")));
+
+  static const mp::OptionValueInfo values_multiobj_[] = {
+      { "0", "Single objective, see option obj:no (default)", 0},
+      { "1", "Multi-objective, solver's native handling if available", 1},
+      { "2", "Multi-objective, force emulation", 2}
+  };
   if ((flags & MULTIPLE_OBJ) != 0) {
-    AddOption(OptionPtr(new BoolOption(multiobj_, "obj:multi multiobj",
-                                       "0*/1:  Whether to use multi-objective optimization. "
-                                       "If set to 1 multi-objective optimization is performed using "
-                                       "lexicographic method with the first objective treated as the most "
-                                       "important, then the second objective and so on.")));
+    AddStoredOption(
+        "obj:multi multiobj",
+        "Whether to use multi-objective optimization:\n"
+        "\n.. value-table::\n\n"
+        "When obj:multi>0 and several objectives are present, suffixes "
+        ".objpriority, .objweight, .objreltol, and .objabstol on the "
+        "objectives are relevant.  Objectives with greater .objpriority "
+        "values (integer values) have higher priority.  Objectives with "
+        "the same .objpriority are weighted by .objweight, "
+        "according to the option obj:multi:weight.\n"
+        "\n"
+        "Objectives "
+        "with positive .objabstol or .objreltol are allowed to be "
+        "degraded by lower priority objectives by amounts not exceeding "
+        "the .objabstol (absolute) and .objreltol (relative) limits.\n"
+        "\n"
+        "Note that with solver's native handling (when obj:multi=1 and supported), "
+        "some solvers might have special rules for the tolerances, especially for LP, "
+        "and only allow linear objectives. See the solver documentation "
+        "and options cvt:quadobj, cvt:nlobj.",
+        multiobj_, values_multiobj_);
+
+    static const mp::OptionValueInfo values_multiobjweight_[] = {
+        { "1", "relative to the sense of the 1st objective", 1},
+        { "2", "relative to its own sense (default)", 2}
+    };
+    AddStoredOption(
+        "obj:multi:weight multiobjweight obj:multi:weights multiobjweights",
+        "How to interpret each objective's weight sign:\n"
+        "\n.. value-table::\n\n"
+        "With the 1st option (legacy behaviour), negative .objweight "
+        "for objective i would make "
+        "objective i's sense the opposite of the model's 1st objective. "
+        "Otherwise, it would make objective i's sense the opposite to its sense "
+        "defined in the model.",
+        multiobj_weight_, values_multiobjweight_);
   }
 
-  AddOption(OptionPtr(new BoolOption(timing_, "tech:timing timing",
-      "0*/1: Whether to display timings for the run.")));
+  static const mp::OptionValueInfo values_techstats_[] = {
+        { "0", "Do not report statistics (default)", 0},
+        { "1", "Report statistics in JSON format in the problem suffix 'stats'", 1},
+        { "2", "Report statistics in suffixes", 2},
+        { "3", "Report statistics both in suffixes and the suffix 'stats'.", 3}
+  };
+
+  AddIntOption("tech:stats stats tech:report_stats solve_stats",
+      "Whether to return solve statistics and timings; the information will be "
+      "stored in the problem suffixes: 'simplex_iterations', 'barrier_iterations', 'nodes' and possibly "
+      "other solver-dependent suffixes. A JSON representation of the information above is returned in "
+      "the problem suffix `stats`.\n"
+      "Note that timing information will also be included in the JSON "
+      "representation if tech:timing>0. Values:\n\n"
+      ".. value-table::\n\n"
+               "See also obj:multi:stats.",
+	 
+      &Solver::GetSolutionStats, &Solver::SetSolutionStats, values_techstats_);
+
+
+  AddIntOption("tech:timing timing tech:report_times report_times",
+    "0*/1/2: Whether to print and return timings for the run, all times are wall "
+    "times. If set to 1, return the solution times in the problem suffixes "
+    "'time_solver', 'time_setup' and 'time', 'time'= time_solver+time_setup+time_output is a "
+    "measure of the total time spent in the solver driver. If set to 2, return "
+    "more granular times, including 'time_read', 'time_conversion' and 'time_output'.",
+    &Solver::GetTiming, &Solver::SetTiming);
 
   if ((flags & MULTIPLE_SOL) != 0) {
 
@@ -667,6 +842,23 @@ void BasicSolver::InitMetaInfoAndOptions(
           "file names are obtained by appending 1, 2, ... ``Current.nsol`` to "
           "``solutionstub``.",
           &Solver::GetSolutionStub, &Solver::SetSolutionStub);
+  }
+}
+
+void BasicSolver::set_warn_cb(AMPLS_Warning_Callback_T cb) {
+  assert(cb);
+  warn_cb_ = [cb](const char* info) {
+    const char *wt=0, *wd=0;
+    cb(info, &wt, &wd);
+    return std::pair {wt, wd};
+  };
+}
+
+void BasicSolver::warn_from_cb(const char *user_info) const {
+  if (warn_cb_) {
+    auto result = warn_cb_(user_info);
+    if (result.first && result.second)
+      AddWarning(result.first, result.second);
   }
 }
 
@@ -692,8 +884,8 @@ SolveResultRegistry::SolveResultRegistry()
   : registry_ {
 {   // Adding standard solver codes a priori
 { sol::SOLVED, sol::SOLVED_LAST,
-      "solved: optimal for an optimization problem, "
-      "feasible for a satisfaction problem " },
+      "solved: optimal for an optimization problem,\n"
+      "\t\tfeasible for a satisfaction problem " },
 { sol::UNCERTAIN, sol::UNCERTAIN_LAST,
       "solved? solution candidate returned but error likely " },
 { sol::INFEASIBLE, sol::INFEASIBLE_LAST,
@@ -706,7 +898,9 @@ SolveResultRegistry::SolveResultRegistry()
       "limit, feasible: "
       "stopped, e.g., on iterations or Ctrl-C " },
 { sol::LIMIT_INF_UNB, sol::LIMIT_INF_UNB_LAST,
-      "limit, problem is either infeasible or unbounded " },
+      "limit, problem is either infeasible or unbounded.\n"
+          "\t\tDisable dual reductions "
+          "or run IIS finder for definitive answer."         },
 { sol::LIMIT_NO_FEAS, sol::LIMIT_NO_FEAS_LAST,
       "limit, no solution returned " },
 { sol::FAILURE, sol::FAILURE_LAST,
@@ -751,7 +945,7 @@ BasicSolver::GetSolCheckWarningKey(bool f_recomp) const {
 }
 
 void BasicSolver::AddWarning(
-    std::string key, std::string msg, bool replace) {
+    std::string key, std::string msg, bool replace) const {
   auto& v = GetWarningsMap()[ std::move(key) ];
   if (!v.first++      // only remember the 1st detailed message
       || replace)     // unless asked to replace
@@ -760,7 +954,7 @@ void BasicSolver::AddWarning(
 
 /// Get a warning type
 const std::pair<int, std::string>&
-BasicSolver::GetWarning(const std::string& key) {
+BasicSolver::GetWarning(const std::string& key) const {
   static std::pair<int, std::string> dummy;
   const auto& wm = GetWarningsMap();
   if (wm.end() != wm.find(key))
@@ -768,7 +962,7 @@ BasicSolver::GetWarning(const std::string& key) {
   return dummy;
 }
 
-void BasicSolver::ClearWarning(const std::string& key) {
+void BasicSolver::ClearWarning(const std::string& key) const {
   GetWarningsMap().erase(key);
 }
 
@@ -808,8 +1002,9 @@ bool BasicSolver::ShowVersion() {
   Print(", MP({})\n", MP_DATE);
   if (!license_info_.empty())
     Print("{}\n", license_info_);
-  if (!this->set_external_libs().empty())
-    Print("External libraries:\n{}", this->set_external_libs());
+  auto sel = this->set_external_libs();
+  if (sel.size())
+    Print("External libraries:\n{}\n", sel);
   return false;
 }
 #else
@@ -837,7 +1032,7 @@ bool Solver::ShowVersion() {
 bool BasicSolver::ShowConstraintDescriptions() {
   Print("{}\n\n", constr_descr_header_);
   if (constr_descr_.empty())
-    Print("No constraint descrptions filled.\n");
+		Print("No constraint descriptions filled.\n");
   else {
     int i=0;
     for (const auto& cd: constr_descr_) {
@@ -971,7 +1166,7 @@ void BasicSolver::ParseOptionString(
       if (!next || std::isspace(next)) {
         ++s;
         if ((flags & NO_OPTION_ECHO) == 0) {
-          Print("  {}", opt->echo_with_value() + '\n');
+          Print("  {}\n", opt->echo_with_value());
         }
         continue;
       }
@@ -1004,12 +1199,64 @@ void BasicSolver::ParseOptionString(
   }
 }
 
-bool BasicSolver::ParseOptions(char **argv, unsigned flags, const ASLProblem *) {
+void WarnOnDifferentCapitalizations(const std::string& target_name) {
+  // Warn if we find multiple versions of the same environment variable
+  // that differ by capitalization (e.g. mp_options mP_opTions, ...)
+  std::string target_name_lower = target_name;
+  std::transform(target_name_lower.begin(), target_name_lower.end(), target_name_lower.begin(), ::tolower);
+
+  std::string first_seen_variant;
+  bool has_seen_variant = false;
+  bool printed_header = false;
+
+  for (char** env = environ; *env != nullptr; ++env) {
+    std::string env_entry = *env;
+    auto delimiter_pos = env_entry.find('=');
+
+    if (delimiter_pos != std::string::npos) {
+      std::string var_name = env_entry.substr(0, delimiter_pos);
+      // Convert the variable name to lowercase
+      std::string var_name_lower = var_name;
+      std::transform(var_name_lower.begin(), var_name_lower.end(), var_name_lower.begin(), ::tolower);
+
+      // Check if this environment variable matches the target name (case-insensitively)
+      if (var_name_lower == target_name_lower) {
+        // If this is the first variant seen, record it
+        if (!has_seen_variant) {
+          first_seen_variant = var_name;
+          has_seen_variant = true;
+        }
+        else if (var_name != first_seen_variant) {
+          if (!printed_header) {
+            fmt::print("\nWarning: Multiple capitalizations found for option {}:\n    {}\n", target_name,
+              first_seen_variant);
+            printed_header = true;
+          }
+          fmt::print("    {}\n", var_name);
+          std::fflush(stdout);
+        }
+      }
+    }
+  }
+  if (printed_header)
+    fmt::print("\n");
+}
+
+bool BasicSolver::ParseOptions(
+    char **argv, unsigned flags,
+    const ASLProblem *, char* additional_options) {
   has_errors_ = false;
   bool_options_ &= ~SHOW_VERSION;
   option_flag_save_ = flags;
+  // 0. If additional options are specified, parse only those
+  if (additional_options) {
+    ParseOptionString(additional_options, NO_OPTION_ECHO);
+    return false;
+  }
+  
   // 1. Try & parse 'mp_options'
   if (const char *s = std::getenv("mp_options")) {
+    WarnOnDifferentCapitalizations("mp_options");
     ParseOptionString(s, flags);
   }
   bool had_exe_name_option_var = false;
@@ -1026,6 +1273,7 @@ bool BasicSolver::ParseOptions(char **argv, unsigned flags, const ASLProblem *) 
     }
     if (const char *s
         = std::getenv((exe_basename + "_options").c_str())) {
+      WarnOnDifferentCapitalizations(exe_basename + "_options");
       ParseOptionString(s, flags);
       had_exe_name_option_var = true;
     }
@@ -1034,6 +1282,7 @@ bool BasicSolver::ParseOptions(char **argv, unsigned flags, const ASLProblem *) 
   // try '<solver_std_name>_options', such as 'gurobi_options'
   if (!had_exe_name_option_var)
   if (const char *s = std::getenv((name_ + "_options").c_str())) {
+    WarnOnDifferentCapitalizations(name_ + "_options");
     ParseOptionString(s, flags);
   }
   // 4. Proceed to command-line options
@@ -1043,6 +1292,7 @@ bool BasicSolver::ParseOptions(char **argv, unsigned flags, const ASLProblem *) 
       ParseOptionString(s, flags);
     }
   }
+  
   if ((bool_options_ & SHOW_VERSION) != 0)
     ShowVersion();
   return !has_errors_;
@@ -1118,17 +1368,24 @@ public:
   }
   SolverOption* getRealOption() const { return real_; }
 
-  virtual void Write(fmt::Writer& w) {
+  void GetValue(fmt::LongLong& v) const override { real_->GetValue(v); }
+  void GetValue(double& v) const override { real_->GetValue(v); }
+  void GetValue(std::string &v) const override { real_->GetValue(v); }
+  void SetValue(fmt::LongLong v) override { real_->SetValue(v); }
+  void SetValue(double v) override { real_->SetValue(v); }
+  void SetValue(fmt::StringRef v) override { real_->SetValue(v); }
+
+  virtual void Write(fmt::Writer& w) override {
     real_->Write(w);
   }
-  virtual void Parse(const char*& s, bool b) {
+  virtual void Parse(const char*& s, bool b) override {
     real_->Parse(s, b);
   }
 
-  virtual std::string echo() {
+  virtual std::string echo() override {
     return fmt::format("{} ({})", name(), real_->echo());
   }
-  Option_Type type() {
+  Option_Type type() override {
     return real_->type();
   }
 };
@@ -1213,7 +1470,7 @@ void AMPLSReadExtras(AMPLS_MP_Solver* slv) {
 
 void AMPLSSolve(AMPLS_MP_Solver* slv) {
   auto be = AMPLSGetBackend(slv);
-  be->Solve();
+  be->RunSolveIterations();      // as RunFromNLFile(), e.g., MO emulation
 }
 mp::BasicBackend* AMPLSGetBackend(AMPLS_MP_Solver* slv) {
   assert(slv->internal_info_);
@@ -1245,6 +1502,15 @@ int AMPLSReportResults(AMPLS_MP_Solver* slv, const char* solFileName = NULL) {
     // If solFileName is NULL, we scrap any previous override
     be->OverrideSolutionFile(solFileName == NULL ? "" : solFileName);
     be->ReportResults();
+  } );
+}
+
+int AMPLSReportError(AMPLS_MP_Solver* slv, int solve_result, const char* msg) {
+  return AMPLS__internal__TryCatchWrapper( slv, [=]() {
+    auto be = AMPLSGetBackend(slv);
+    be->set_ampl_flag();         // write the .sol file; otherwise exits
+    be->ReportError(solve_result,
+                    std::string(be->long_name()) + ": " + msg);
   } );
 }
 

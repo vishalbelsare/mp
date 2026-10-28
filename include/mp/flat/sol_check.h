@@ -16,12 +16,12 @@ namespace mp {
 template <class Impl>
 class SolutionChecker {
 public:
-  /// Check postsolved & unpostsolved solutions
+  /// Check postsolved & unpostsolved (with aux vars) solutions
   /// in various ways.
   /// @param p_extra: !=0 means known infeas solution
   bool CheckSolution(
         ArrayRef<double> x,
-        const pre::ValueMapDbl& duals,
+        const pre::ValueMapDbl& duals,   // unused
         ArrayRef<double> obj,
         void* p_extra) {
     bool fKnownInfeas = (bool)p_extra;
@@ -64,8 +64,9 @@ public:
         // a summary in the final solve message.
         // For now, do this via warnings?
         if (MPCD( sol_check_fail() ))
-          MP_RAISE_WITH_CODE(int(sol::MP_SOLUTION_CHECK),   // failure
-                             warn);
+          MP_RAISE_WITH_CODE(int(sol::MP_SOLUTION_CHECK),
+                             "Solution check failed - reporting as fatal:\n"
+                             + warn);
         else
           MPD( AddWarning(
                  MPD( GetEnv() ).GetSolCheckWarningKey(true),
@@ -91,32 +92,42 @@ public:
     return msgreal.empty() && msgidea.empty();
   }
 
+private:
   /// Functor to recompute auxiliary var \a i
   VarsRecomputeFn recomp_fn
   = [this](int i, const VarInfoRecomp& x) {
-    if (MPCD( HasInitExpression(i) )) {
+    if (MPCD( HasActiveOrInactiveInitExpression(i) )) {
       const auto& iexpr = MPCD( GetInitExpression(i) );
       auto pCK = iexpr.GetCK();
 #if __GNUC__ > 8            // manylinux2010 fails
       auto resvar = pCK->GetResultVar(iexpr.GetIndex());
       assert(resvar == i);
 #endif
-      if (!pCK->IsUnused(iexpr.GetIndex()))
-        return pCK->ComputeValue(iexpr.GetIndex(), x);
+      // Can check them, so not: if (!pCK->IsUnused(iexpr.GetIndex()))
+      auto val = pCK->ComputeValue(iexpr.GetIndex(), x);
+      return val;
     }
     return x.get_x().get_x()[i];  // no recomputation
   };
 
+public:
   /// Recompute auxiliary variables
-  ArrayRef<double> RecomputeAuxVars(ArrayRef<double> x) {
+  /// @param is_final: if provided, which vars are final
+  /// @param f_idealistic: compare exactly
+  ///   (otherwise within the feasibility tolerance,
+  ///   as conditional comparisons are evaluated
+  ///   for the solver's solution)
+  ArrayRef<double> RecomputeAuxVars(
+      ArrayRef<double> x, std::vector<bool> is_final={},
+      bool f_idealistic=true) {
     VarInfoRecomp vir {
       MPCD( sol_feas_tol() ),
-          true,        // currently not relevant for recomputation
-      {x, recomp_fn},
-      {},              // now raw values
+          f_idealistic,
+      {x, recomp_fn, is_final},
+      {},              // no raw values
       MPCD( GetModel() ).var_type_vec(),
-          MPCD( GetModel() ).var_lb_vec(),
-          MPCD( GetModel() ).var_ub_vec(),
+          MPCD( GetModel() ).var_lb_best_vec(),
+          MPCD( GetModel() ).var_ub_best_vec(),
           MPCD( sol_round() ), MPCD( sol_prec() )
     };
     vir.get_x().set_p_var_info(&vir);
@@ -125,7 +136,10 @@ public:
     return std::move(vir.get_x().get_x());
   }
 
+protected:
   /// Check single unpostsolved solution.
+  /// @param x_raw: for idealistic check,
+  ///   should contain auxiliary values from the solver.
   /// @param x_back: solution vector from realistic mode.
   /// It can be changed by the :round and :prec options.
   /// Its auxiliary vars are compared
@@ -138,9 +152,9 @@ public:
       std::vector<double>& x_back,
       bool if_recomp_vals) {
     SolCheck chk(x, duals, obj, x_raw,
-                 MPCD( GetModel() ).var_type_vec(),
-                 MPCD( GetModel() ).var_lb_vec(),
-                 MPCD( GetModel() ).var_ub_vec(),
+                 MPCD( GetModel() ).var_type_subm_vec(),
+                 MPCD( GetModel() ).var_lb_best_vec(),
+                 MPCD( GetModel() ).var_ub_best_vec(),
                  MPCD( sol_feas_tol() ),
                  MPCD( sol_feas_tol_rel() ),
                  MPCD( sol_round() ),
@@ -156,7 +170,7 @@ public:
     if (chk.check_mode() & 16)
       CheckObjs(chk);
     MPD( GenerateViolationsReport(chk, if_recomp_vals) );
-    x_back = chk.x_ext().get_x();   // to reuse 'realistic' vector
+    x_back = std::move(chk.x_ext().get_x()); // to reuse 'realistic' vector
     return chk.GetReport();
   }
 
@@ -174,7 +188,7 @@ public:
               {x - MPCD( ub(i) ), MPCD( ub(i) )},
               MPCD( sol_feas_tol() ), MPCD( sol_feas_tol_rel() ),
               MPCD( GetModel() ).var_name(i));
-        if (MPCD( is_var_integer(i) ))
+        if (var::INTEGER == MPCD( GetModel() ).var_type_subm(i))
           chk.VarViolIntty().at(aux).CheckViol(
                 { std::fabs(x - std::round(x)),
                   std::round(x) },
@@ -270,9 +284,13 @@ public:
     if (cvmap.size()) {
       for (const auto& cva: cvmap) {
         Gen1Viol(cva.second.at(0), wrt, !alg_log,
-                 0==cva.first.compare(0, 4, ":lin")
-                 ? "algebraic con(s)"
-                 : 0==cva.first.compare(0, 5, ":quad")
+                 0==cva.first.compare(0, 8, "_linfunc")
+                 ? "aux algebr con(s)"
+                 : 0==cva.first.compare(0, 4, "_lin")
+                   ? "algebraic con(s)"
+                 : 0==cva.first.compare(0, 9, "_quadfunc")
+                   ? "aux quadr con(s)"
+                 : 0==cva.first.compare(0, 5, "_quad")
                    ? "quadratic con(s)"
                  : "expr '"
                  + std::string(cva.first) + "'");

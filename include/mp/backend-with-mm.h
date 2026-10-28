@@ -5,9 +5,12 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
+#include <cctype>
 
 #include "mp/backend-base.h"
 #include "mp/model-mgr-base.h"
+
 
 namespace mp {
 
@@ -25,9 +28,13 @@ public:
   }
 
   void ReportError(int solve_result, fmt::CStringRef msg) override {
-    HandleSolution(solve_result,
+    HandleSolution(solve_result,   // prints if no -AMPL flag
                    GetWarnings() + msg.c_str(),
                    0, 0, 0.0);
+    std::fflush(stdout);
+    std::fflush(stderr);
+    if (!ampl_flag())
+      std::exit(EXIT_FAILURE);
   }
 
 
@@ -63,6 +70,8 @@ protected:
     GetMM().HandleFeasibleSolution(solve_code, msg, x, y, obj);
   }
 
+
+public:
   /// Variables' initial values
   virtual ArrayRef<double> InitialValues() {
     return GetMM().InitialValues();
@@ -82,6 +91,15 @@ protected:
   }
 
 
+  
+
+  SuffixSet& GetSuffixes(suf::Kind kind) {
+    return GetMM().GetSuffixes(kind);
+  }
+  /// Get suffix names
+  std::set<std::string> GetSuffixNames() {
+    return GetMM().GetSuffixNames();
+  }
 
   /// Read unpresolved suffix
   template <class N>
@@ -93,8 +111,11 @@ protected:
     return GetMM().ReadSuffix(suf);
   }
 
-  virtual ArrayRef<double> ReadDblSuffix(const SuffixDef<double>& suf) {
-    return GetMM().ReadSuffix(suf);
+  /// @param fint: if not NULL,
+  ///   is set to 1 iff the suffix was integer.
+  virtual ArrayRef<double> ReadDblSuffix(
+      const SuffixDef<double>& suf, int *fint=nullptr) {
+    return GetMM().ReadSuffix(suf, fint);
   }
 
   virtual size_t GetSuffixSize(int kind) {
@@ -108,14 +129,33 @@ protected:
                     ArrayRef<int> values) {
     GetMM().ReportSuffix(suf, values);
   }
+  /// Report dbl suffix
   virtual void ReportSuffix(const SuffixDef<double>& suf,
                     ArrayRef<double> values) {
     GetMM().ReportSuffix(suf, values);
   }
+
+  /// Report int or dbl suffix from int or dbl data.
+  /// kind & suf::FLOAT determines the resulting kind.
+  template <class Array>
+  void ReportSuffix(const std::string& name,
+                    int kind,
+                    const Array& vals,
+                    const std::string& suf_table = {}) {
+    if (kind & suf::FLOAT) {
+      ReportDblSuffix( {name, kind, suf_table}, vals);
+    } else {
+      ReportIntSuffix( {name, kind, suf_table},
+                      std::vector<int>{ vals.begin(), vals.end() });
+    }
+  }
+
+  /// Report int suffix
   virtual void ReportIntSuffix(const SuffixDef<int>& suf,
                        ArrayRef<int> values) {
     GetMM().ReportSuffix(suf, values);
   }
+  /// Report dbl suffix
   virtual void ReportDblSuffix(const SuffixDef<double>& suf,
                        ArrayRef<double> values) {
     GetMM().ReportSuffix(suf, values);
@@ -130,6 +170,23 @@ protected:
     GetMM().ReportSuffix(suf, values);
   }
 
+  /// Report a value for the first element of the suffix,
+  /// \a pad for the others.
+  /// For objective suffixes with several objectives (obj:multi).
+  template <class N>
+  void ReportFirstSuffixValue(const SuffixDef<N>& suf,
+                              N value, N pad = {}) {
+    std::vector<N> values(
+          std::max(GetMM().GetSuffixSize(suf.kind()), (size_t)1), pad);
+    values[0] = value;
+    GetMM().ReportSuffix(suf, values);
+  }
+
+  /// Get obj option setter
+  BasicObjOptionSetter* GetObjOptionSetter() {
+    return GetMM().GetObjOptionSetter();
+  }
+
   /// Access original (NL) model instance:
   /// integrality flags. Used in solution rounding.
   const std::vector<bool>& IsVarInt() const {
@@ -140,6 +197,37 @@ protected:
   /// has unfixed integer variables?
   bool HasUnfixedIntVars() const {
     return GetMM().HasUnfixedIntVars();
+  }
+
+
+protected:
+  /// Report options for debugging
+  void ReportOptions2Debug() override {
+    if (debug_mode()) {
+      for (auto oit = option_begin(); oit != option_end(); ++oit) {
+        auto type = oit->type();
+        auto name = std::string("option___") + oit->name();
+        std::replace_if(name.begin(), name.end(), [](unsigned char c) {
+          return !std::isalnum(c);
+        }, '_');
+        if (SolverOption::STRING == type) {
+          std::string val;
+          oit->GetValue(val);
+          ReportSingleSuffix(
+              {name, suf::PROBLEM | suf::OUTONLY}, (double)NAN );
+        } else if (SolverOption::DBL == type) {
+          double val;
+          oit->GetValue(val);
+          ReportSingleSuffix(
+              {name, suf::PROBLEM | suf::OUTONLY}, val );
+        } else {
+          int val;
+          oit->GetValue(val);
+          ReportSingleSuffix(
+              {name, suf::PROBLEM | suf::OUTONLY}, val );
+        }
+      }
+    }
   }
 
 

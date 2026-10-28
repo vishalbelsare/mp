@@ -8,7 +8,7 @@
  NL is a format for representing optimization problems such as linear,
  quadratic, nonlinear, complementarity and constraint programming problems
  in discrete or continuous variables. It is described in the technical report
- "Writing .nl Files" (http://www.cs.sandia.gov/~dmgay/nlwrite.pdf).
+ "Writing .nl Files" (https://ampl.github.io/nlwrite.pdf).
 
  Usage: recommended via mp::NLSOL class.
 
@@ -75,14 +75,16 @@ namespace mp {
     `~mp::NLFeeder` can be used as a base class for other feeders,
     or just be an interface prototype.
 
-    **Subclassed examples:**
+    **Subclassed interfaces and examples:**
       - Simplified (MI)QP interface via `~mp::NLModel`,
         `~mp::NLFeeder_Easy`
       - C API implementation class `~mp::NLW2_NLFeeder_C_Impl`
-      - Other examples/tests, e.g., see `ExampleNLFeeder`.
+      - Smaller examples/tests, e.g., see the example folder.
+      - MP2NL is a meta-driver interfacing the MP library
+        to external NL solvers.
 
     @param: *Impl* is the final CRTP type
-    derived from `~mp::NLFeeder`.
+    derived from `~mp::NLFeeder`. Currently unused.
 
     @param: *ExprType* is a type storing expressions from
     methods such as `~mp::NLFeeder::FeedExpr`. If not used,
@@ -353,7 +355,8 @@ public:
   /** Feed native expression.
      *  This method is recursively called from NLWriter,
      *  when Feeder uses ExprWriter::EPut().
-     *  Feeder should not call this method itself.
+     *  Feeder should not call this method
+     *  to write subtrees below the root expression.
      *
      *  Details of ExprWriter: see NLWriter2.
    */

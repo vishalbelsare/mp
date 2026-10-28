@@ -5,57 +5,47 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <functional>
 #include <utility>
 #include <typeinfo>
 
 #include "mp/format.h"
 #include "mp/error.h"
+#include "mp/common.h"
 
 #include "mp/flat/context.h"
-#include "mp/arrayref.h"
+#include "mp/flat/sol_check_data.h"
+#include "mp/flat/item_namer.h"
 
 namespace mp {
 
-/// Constraint/obj violation
-struct Violation {
-  double viol_;    // abs violation: >0 if really violated
-  double valX_;    // value compared to
-  /// Compute whether violated + relative violation.
-  /// Both absolute and relative should be violated
-  /// (relative only if refvar!=0.)
-  std::pair<bool, double> Check(
-      double epsabs, double epsrel) const {
-    double violRel {0.0};
-    if (viol_ > epsabs
-        && (0.0==std::fabs(valX_)
-            || (violRel=std::fabs(viol_/valX_))>epsrel))
-      return {true, violRel};
-    return {false, 0.0};
-  }
-};
-
-
-/// Custom constraints to derive from, so that overloaded default settings work
+/// Custom constraints to derive from, so that overloaded default settings work.
+/// @note Defaults to static constraint.
 class BasicConstraint {
 public:
-  /// Constraint type name for messages
-  static constexpr const char* GetTypeName()
-  { return "BasicConstraint"; }
   /// Constraint name
   const char* GetName() const { return name_.c_str(); }
   /// Constraint name
   const char* name() const { return GetName(); }
   /// Set constraint name
-  void SetName(std::string nm) { name_ = std::move(nm); }
+	void SetName(std::string nm) {
+		name_ = std::move(nm);
+	}
   /// Whether context is meaningful here
   static constexpr bool UsesContext() { return false; }
   /// Get context, if meaningful
   Context GetContext() const { return Context::CTX_NONE; }
   /// Set context, if meaningful
-  void SetContext(Context ) const { }
+  void SetContext(Context ) const { MP_RAISE("Setting context for static constraint"); }
   /// Add (merge) context, if meaningful
-  void AddContext(Context ) const { }
+  void AddContext(Context ) const { MP_RAISE("Adding context for static constraint"); }
+  /// Has result var (is functional)?
+  /// @note Any non-functional (i.e., static) constraint
+  /// should return false here.
+  bool HasResultVar() const { return false; }
   /// For functional constraints, result variable index
+  /// @note Any non-functional (i.e., static) constraint
+  /// should return -1 here.
   int GetResultVar() const { return -1; }
   /// Compute violation
   template <class VarInfo>
@@ -67,14 +57,35 @@ private:
 };
 
 
-/// A special constraint 'var=...', which defines a result variable
+/// Wrap (functional) constraint to represent it as an expression.
+///
+/// (Solver)ModelAPI should only inspect it via the
+/// BasicExprModelAPI<>::GetExpr... methods.
+template <class Con>
+class ExprWrapper {
+  Con con_flat_;
+public:
+  /// Construct
+  ExprWrapper(Con c) : con_flat_(std::move(c)) { }
+  /// Constraint type
+  using FlatConType = Con;
+  /// Type name
+  const char* GetTypeName() const { return con_flat_.GetTypeName(); }
+  /// Get const & (con)
+  const Con& GetFlatConstraint() const { return con_flat_; }
+  /// Get & (con)
+  Con& GetFlatConstraint() { return con_flat_; }
+};
+
+
+/// A special constraint 'var=...', which defines a result variable.
+/// @note Each functional constraint should derive from here.
+/// @note Each functional constraint should have context,
+/// either set explicitly, or via PropagateResult().
 class FunctionalConstraint : public BasicConstraint {
   int result_var_=-1;                // defined var is optional
   mutable Context ctx;               // always store context
 public:
-  /// Constraint type name for messages
-  static constexpr const char* GetTypeName()
-  { return "FunctionalConstraint"; }
   /// Constructor
   /// @param v: result variable
   FunctionalConstraint(int v=-1) : result_var_(v) {}
@@ -82,6 +93,9 @@ public:
   bool operator==(const FunctionalConstraint& dc) const {
     return result_var_==dc.result_var_;
   }
+  /// Has result var (is functional)?
+  /// We don't store this info in the type (yet.)
+  bool HasResultVar() const { return result_var_>=0; }
   /// Get result variable
   int GetResultVar() const { return result_var_; }
   /// Set result variable
@@ -93,12 +107,14 @@ public:
   /// Set it
   void SetContext(Context c) const { ctx=c; }
   /// Add context
-  void AddContext(Context c) { ctx.Add(c); }
+  void AddContext(Context c) const { ctx.Add(c); }
 };
 
 
 /// Possible argument arrays for CustomFunctionalConstraint
 
+/// Fixed argument array of 0 elements
+using VarArray0 = std::array<int, 0>;
 /// Fixed argument array of 1 element
 using VarArray1 = std::array<int, 1>;
 /// Fixed argument array of 2 elements
@@ -118,6 +134,7 @@ template <class Num, size_t N>
   using ParamArrayN = std::array<Num, N>;
 /// Empty parameter array
 using ParamArray0 = ParamArrayN<int, 0>;
+
 /// Fixed parameter array of 1 double
 using DblParamArray1 = ParamArrayN<double, 1>;
 /// Fixed parameter array of 2 double
@@ -127,16 +144,32 @@ using DblParamArray3 = ParamArrayN<double, 3>;
 /// Variable-length parameter array
 using DblParamArray = std::vector<double>;
 
+/// Fixed parameter array of 1 int
+using IntParamArray1 = ParamArrayN<int, 1>;
+/// Fixed parameter array of 2 int
+using IntParamArray2 = ParamArrayN<int, 2>;
+/// Fixed parameter array of 3 int
+using IntParamArray3 = ParamArrayN<int, 3>;
+/// Variable-length parameter array
+using IntParamArray = std::vector<int>;
 
-/// A functional constraint with given arguments
-/// and further info as parameters
+
+/// Sort
+void Sort(VarArray& args);
+
+/// Sort and eliminate duplicates
+/// @return true if reduced
+bool SortAndUnify(VarArray& args);
+
+
+/// Custom constraint data: given arguments
+/// and further info as parameters / ID
 /// @param Args: arguments type
 /// @param Params: parameters type
-/// @param NumOrLogic: base class defining a numeric or logic constraint
 /// @param Id: a struct with GetTypeName()
-template <class Args, class Params, class NumOrLogic, class Id>
-class CustomFunctionalConstraint :
-  public FunctionalConstraint, public NumOrLogic, public Id {
+template <class Args, class Params, class Id>
+class CustomConstraintData
+    : public Id {
   Args args_;
   Params params_;
 
@@ -144,29 +177,20 @@ public:
   /// Constraint type name for messages
   static const char* GetTypeName() { return Id::GetTypeName(); }
   /// Default constructor
-  CustomFunctionalConstraint() = default;
+  CustomConstraintData() = default;
   /// Arguments typedef
   using Arguments = Args;
   /// Parameters typedef
   using Parameters = Params;
   /// Construct from arguments only
-  CustomFunctionalConstraint(Arguments args) noexcept :
-    args_(std::move(args)) { }
+  CustomConstraintData(Arguments args) noexcept :
+      args_(std::move(args)) { }
   /// Construct from arguments and parameters
-  /// Might need to use explicit types when using initializer lists,
-  /// in order to distinguish from the next 2 constructors
-  CustomFunctionalConstraint(Arguments args, Parameters prm) noexcept :
-    args_(std::move(args)), params_(std::move(prm)) { }
-  /// Construct from resvar and arguments.
-  /// If Arguments = VarArray1, distinguish from the previous
-  /// constructor by putting first int in just one {}
-  CustomFunctionalConstraint(int varr, Arguments args) noexcept :
-     FunctionalConstraint(varr), args_(std::move(args)) { }
+  CustomConstraintData(Arguments args, Parameters prm) noexcept :
+      args_(std::move(args)), params_(std::move(prm)) { }
 
   /////////////////////////////////////////////////////////////////////
 
-  /// Reuse GetResultVar()
-  using FunctionalConstraint::GetResultVar;
   /// Get const Arguments&
   const Arguments& GetArguments() const { return args_; }
   /// Get Arguments&
@@ -175,11 +199,208 @@ public:
   const Parameters& GetParameters() const { return params_; }
   /// Get Parameters&
   Parameters& GetParameters() { return params_; }
+};
+
+
+/// A static constraint with given arguments
+/// and further info as parameters
+/// @param Args: arguments type
+/// @param Params: parameters type
+/// @param Id: a struct with GetTypeName()
+template <class Args, class Params, class Id>
+class CustomStaticConstraint
+    : public BasicConstraint,
+      public CustomConstraintData<Args, Params, Id> {
+  using BaseType = CustomConstraintData<Args, Params, Id>;
+public:
+  /// Default constructor
+  CustomStaticConstraint() = default;
+
+  /// Is logical? All logical flat cons are functional currently.
+  static bool IsLogical() { return false; }
+
+  /// Arguments typedef
+  using typename BaseType::Arguments;
+  /// Parameters typedef
+  using typename BaseType::Parameters;
+  /// Construct from arguments only
+  CustomStaticConstraint(Arguments args) noexcept :
+      BaseType(std::move(args)) { }
+  /// Construct from arguments and parameters
+  CustomStaticConstraint(Arguments args, Parameters prm) noexcept :
+      BaseType(std::move(args), std::move(prm)) { }
+
+  /////////////////////////////////////////////////////////////////////
+
+  /// Get (const) Arguments&
+  using BaseType::GetArguments;
+  /// Get (const) Parameters&
+  using BaseType::GetParameters;
 
   /// Compute violation
   template <class VarVec>
   Violation ComputeViolation(const VarVec& x) const;
 };
+
+
+/// A functional constraint with given arguments
+/// and further info as parameters
+/// @param Args: arguments type
+/// @param Params: parameters type
+/// @param NumOrLogic: base class defining a numeric or logic constraint
+/// @param Id: a struct with GetTypeName()
+template <class Args, class Params, class NumOrLogic, class Id>
+class CustomFunctionalConstraint
+    : public FunctionalConstraint,
+      public NumOrLogic,
+      public CustomConstraintData<Args, Params, Id> {
+  using BaseType = CustomConstraintData<Args, Params, Id>;
+public:
+  /// Default constructor
+  CustomFunctionalConstraint() = default;
+  /// Arguments typedef
+  using typename BaseType::Arguments;
+  /// Parameters typedef
+  using typename BaseType::Parameters;
+  /// Construct from arguments only
+  CustomFunctionalConstraint(Arguments args) noexcept :
+    BaseType(std::move(args)) { }
+  /// Construct from arguments and parameters
+  /// Might need to use explicit types when using initializer lists,
+  /// in order to distinguish from the next 2 constructors
+  CustomFunctionalConstraint(Arguments args, Parameters prm) noexcept :
+    BaseType(std::move(args), std::move(prm)) { }
+  /// Construct from resvar and arguments.
+  /// If Arguments = VarArray1, distinguish from the previous
+  /// constructor by putting first int in just one {}
+  CustomFunctionalConstraint(int varr, Arguments args) noexcept :
+     FunctionalConstraint(varr), BaseType(std::move(args)) { }
+
+  /////////////////////////////////////////////////////////////////////
+
+  /// Reuse GetResultVar()
+  using FunctionalConstraint::GetResultVar;
+  /// Get (const) Arguments&
+  using BaseType::GetArguments;
+  /// Get (const) Parameters&
+  using BaseType::GetParameters;
+
+  /// Compute violation
+  template <class VarVec>
+  Violation ComputeViolation(const VarVec& x) const;
+};
+
+/// Write flat expr/obj/con variables:
+/// vector/array
+template <class Writer, class Vec,
+          typename T = std::decay_t<
+              decltype(*begin(std::declval<Vec>()))> >
+inline void WriteModelItem(
+    Writer& wrt, const Vec& v,
+    ItemNamer& vnam) {
+  static_assert (
+  std::is_integral_v<typename Vec::value_type>, "Variable vector: need int's");
+  wrt << '[';
+  int n=-1;
+  for (const auto& el: v) {
+    if (++n)
+      wrt << ", ";
+    wrt << vnam.at(el);
+  }
+  wrt << ']';
+}
+
+/// Write flat expr/obj/con parameters:
+/// vector/array
+template <class Writer, class Vec,
+          typename T = std::decay_t<
+              decltype(*begin(std::declval<Vec>()))> >
+void WriteModelItemParameters(
+    Writer& wrt, const Vec& v) {
+  wrt << '[';
+  int n=-1;
+  for (const auto& el: v) {
+    if (++n)
+      wrt << ", ";
+    wrt << el;
+  }
+  wrt << ']';
+}
+
+/// Specialize WriteModelItem() for CustomFuncCon<>
+template <class Writer, class A, class P, class N, class I>
+inline void WriteModelItem(
+    Writer& wrt,
+    const CustomFunctionalConstraint<A,P,N,I>& cfc,
+    ItemNamer& vnam) {
+  if (cfc.HasResultVar())   // really functional
+    wrt << vnam.at(cfc.GetResultVar()) << " == ";
+  WriteModelItem(
+      wrt, (const CustomConstraintData<A, P, I>&)cfc, vnam);
+}
+
+/// Specialize WriteModelItem() for CustomCon<> and CustomConData<>
+template <class Writer, class A, class P, class I>
+inline void WriteModelItem(
+    Writer& wrt,
+    const CustomConstraintData<A,P,I>& cfc,
+    ItemNamer& vnam) {
+  wrt << cfc.GetTypeName();
+  wrt << '(';
+  WriteModelItem(wrt, cfc.GetArguments(), vnam);
+  wrt << ", ";
+  WriteModelItemParameters(wrt, cfc.GetParameters());
+  wrt << ')';
+}
+
+
+/// Very general template to write any flat constraint
+/// with name.
+template <class Writer, class Con>
+inline void WriteFlatCon(Writer& wrt, const Con& c,
+                  ItemNamer& vnam) {
+  wrt << c.name() << ": ";
+  WriteModelItem(wrt, c, vnam);
+}
+
+/// Write a CustomStaticConstraint<>
+template <class JW, class A, class P,class I>
+inline void WriteJSON(JW jw,
+                      const CustomStaticConstraint<A,P,I>& cfc) {
+  WriteJSON(jw["args"], cfc.GetArguments());
+  WriteJSON(jw["params"], cfc.GetParameters());
+}
+
+/// Write a CustomFunctionalConstraint<>
+template <class JW, class A, class P, class N, class I>
+inline void WriteJSON(JW jw,
+                      const CustomFunctionalConstraint<A,P,N,I>& cfc) {
+  jw["res_var"] = cfc.GetResultVar();
+  WriteJSON(jw["args"], cfc.GetArguments());
+  WriteJSON(jw["params"], cfc.GetParameters());
+}
+
+
+/// Argument container visitor: VarArrayN.
+/// Only 1 level.
+template <size_t N>    // Needs to appear before the generic template version, CLang 15
+inline void VisitArguments(const std::array<int, N>& cnt, std::function<void (int)> argv) {
+  for (auto v: cnt)
+    argv(v);
+}
+
+/// Generic constraint argument visitor
+template <class Item>
+inline void VisitArguments(const Item& item, std::function<void (int)> argv) {
+  VisitArguments(item.GetArguments(), argv);      // redirect to the arguments' visitor
+}
+
+/// Argument container visitor: VarArray
+template <>
+inline void VisitArguments(const std::vector<int>& cnt, std::function<void (int)> argv) {
+  for (auto v: cnt)
+    argv(v);
+}
 
 
 /// Dummy template: compute result of functional constraint.
@@ -250,13 +471,13 @@ struct CondConId {
   static const char* description() {
     static std::string descr =
       std::string("Conditional wrapper for constraint type ") +
-      typeid(Con).name();
+      Con::GetTypeName();
     return descr.c_str();
   }
   static const char* GetTypeName() {
     static std::string nm =
-      std::string("Conditional< ") +
-      typeid(Con).name() + " >";
+        std::string("Conditional< ") +
+        Con::GetTypeName() + " >";
     return nm.c_str();
   }
 };
@@ -336,15 +557,52 @@ public:
   }
 };
 
+/// Write ConditionalCon without name.
+template <class Writer, class Con>
+inline void WriteModelItem(Writer& wrt,
+                    const ConditionalConstraint<Con>& condc,
+                    ItemNamer& vnam) {
+  wrt << vnam.at(condc.GetResultVar()) << "==1 <==> ";
+  wrt << '(';
+  WriteModelItem(wrt, condc.GetArguments(), vnam);
+  wrt << ')';
+}
+
+/// Write a readable variable definition
+template <class Writer>
+void WriteVar(Writer& pr, const char* name,
+              double lb, double ub, var::Type ty);
+
+/// Write a CondCon
+template <class JW, class Con>
+inline void WriteJSON(JW jw,
+                      const ConditionalConstraint<Con>& condc) {
+  jw["res_var"] = condc.GetResultVar();
+  WriteJSON(jw["con"], condc.GetConstraint());
+}
+
+
 ////////////////////////////////////////////////////////////////////////
-/// Args is the argument type, e.g., array of variables, or an expression
-/// Params is the parameter type, e.g., array of numbers. Can be empty
+/// Args is the argument type, e.g., array of variables, or an expression.
+/// Params is the parameter type, e.g., array of numbers. Can be empty.
+#define DEF_CUSTOM_STATIC_CONSTR_WITH_PRM(Name, Args, Params, Descr) \
+  struct Name ## Id { \
+      static constexpr const char* description() { return Descr; } \
+      static constexpr const char* GetTypeName() { return #Name; } \
+  }; \
+  using Name ## Constraint = CustomStaticConstraint<Args, Params, Name ## Id>;
+
+////////////////////////////////////////////////////////////////////////
+/// Args is the argument type, e.g., array of variables, or an expression.
+/// Params is the parameter type, e.g., array of numbers. Can be empty.
 #define DEF_CUSTOM_FUNC_CONSTR_WITH_PRM(Name, Args, Params, NumLogic, Descr) \
   struct Name ## Id { \
     static constexpr const char* description() { return Descr; } \
     static constexpr const char* GetTypeName() { return #Name; } \
+    static constexpr const char* GetExprTypeName() { return #Name "Expression"; } \
   }; \
-  using Name = CustomFunctionalConstraint<Args, Params, NumLogic, Name ## Id>
+  using Name ## Constraint = CustomFunctionalConstraint<Args, Params, NumLogic, Name ## Id>; \
+  using Name ## Expression = ExprWrapper< Name ## Constraint >
 
 /// Custom numeric constraint without fixed parameters
 #define DEF_NUMERIC_FUNC_CONSTR(Name, Args, Descr) \
@@ -364,16 +622,15 @@ public:
 
 /// A wrapper on a static constraint making it conditional
 #define DEF_CONDITIONAL_CONSTRAINT_WRAPPER(Name, StaticConName) \
-  using Name = ConditionalConstraint< StaticConName >
+  using Name ## Constraint = ConditionalConstraint< StaticConName >; \
+  using Name ## Expression = ExprWrapper< Name ## Constraint >
 
 ////////////////////////////////////////////////////////////////////////
 /// STATIC CONSTRAINTS
-/// Workaround: defining as functional  constraint (result unused)
-/// Could be solved by a mix-in parent
 #define DEF_STATIC_CONSTR(Name, Args, Descr) \
-    DEF_LOGICAL_FUNC_CONSTR(Name, Args, Descr)
+    DEF_CUSTOM_STATIC_CONSTR_WITH_PRM(Name, Args, ParamArray0, Descr)
 #define DEF_STATIC_CONSTR_WITH_PRM(Name, Args, Params, Descr) \
-    DEF_LOGICAL_FUNC_CONSTR_WITH_PRM(Name, Args, Params, Descr)
+    DEF_CUSTOM_STATIC_CONSTR_WITH_PRM(Name, Args, Params, Descr)
 
 
 } // namespace mp

@@ -153,17 +153,22 @@ template <typename Solver, typename PB, typename Writer>
 void SolutionWriterImpl<Solver, PB, Writer>::HandleSolution(
     int status, fmt::CStringRef message, const double *values,
     const double *dual_values, double) {
-  if (solver_.need_multiple_solutions()) {
+	if (solver_.need_multiple_solutions()
+			&& values) {             // not when reporting an error
     auto kindP = mp::suf::Kind( suf::PROBLEM | suf::OUTPUT | suf::OUTONLY );
     auto kindO = mp::suf::Kind( suf::OBJ | suf::OUTPUT | suf::OUTONLY );
     builder_.AddIntSuffix("nsol", kindP, 0).
         SetValue(0, num_solutions_);
-    builder_.AddIntSuffix("nsol", kindO, 0).
-        SetValue(0, num_solutions_);
     builder_.AddIntSuffix("npool", kindP, 0).
         SetValue(0, num_solutions_);
-    builder_.AddIntSuffix("npool", kindO, 0).
-        SetValue(0, num_solutions_);
+    // An objective suffix has one value per objective: none to set
+    // for a feasibility problem (writing value 0 would be out of bounds)
+    if (builder_.num_objs() > 0) {
+      builder_.AddIntSuffix("nsol", kindO, 0).
+          SetValue(0, num_solutions_);
+      builder_.AddIntSuffix("npool", kindO, 0).
+          SetValue(0, num_solutions_);
+    }
   }
   SolutionAdapter<PB> sol(
         status, &builder_, message.c_str(), options_,
@@ -305,7 +310,8 @@ void AppSolutionHandlerImpl<Solver, PB, Writer>::HandleSolution(
   if (solver.ampl_flag() || (wantsol & Solver::WRITE_SOL_FILE) != 0) {
     // "Erase" the banner so that it is not duplicated when printing
     // the solver message.
-    if (solver.ampl_flag() && banner_size_ != 0) {
+    if (solver.ampl_flag() && banner_size_ != 0
+        && !solver.output_handler()->has_output) {   // #233
       fmt::MemoryWriter w;
       w << fmt::pad("", banner_size_, '\b');
       solver.Print("{}", w.c_str());

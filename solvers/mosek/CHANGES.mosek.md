@@ -2,6 +2,209 @@ Summary of recent updates to MOSEK for AMPL
 ===========================================
 
 
+## 20261101
+- Emulate *mip:basis* for linear algebraic MIPs, with separate
+  *mip:basis:timelimit* and *mip:basis:iterlimit* options.
+- Options aligned with MOSEK 11.2.0: *alg:method* lists the MOSEK 11
+  optimizers (6 = new dual simplex, 7 = new primal simplex, 8 = primal
+  simplex), corrected defaults and ranges (*pre:folding*, *mip:symmetry*,
+  *mip:feastol*, *mip:inttol*, *mip:relgapconst*, *tech:lpseed*,
+  *lim:nodes*, *lim:sol*, *lim:time*).
+- A value rejected by MOSEK now aborts with a message naming the AMPL
+  option and the MOSEK parameter.
+- Solve results reflect the termination reason: time, iteration,
+  branch/relaxation, objective range and solution limits, interrupts,
+  stalling and numerical problems get their own codes (previously all
+  400 "feasible primal"); a feasible solution without a termination
+  reason is reported as 'solved?'.
+- Ctrl-C now interrupts MOSEK (the handler was a stub).
+- An input basis for constraints was ignored (every status was reset
+  before mapping); a starting basis or point now goes to the basic
+  solution of an LP. Simplex iteration counts include the dual
+  iterations; the node count is the number of branches.
+- *tech:logfile* without *tech:outlev* writes the standard log to the
+  file with a quiet console (the file was empty).
+- New options: *alg:feastol*, *alg:dualfeastol* (simplex tolerances;
+  the bare *feastol* keeps its meaning of *mip:feastol*),
+  *lp:primalselection*, *lp:dualselection*, *lp:hotstart*, *lp:degen*,
+  *lp:solveform*, *bar:iterlim*, *bar:pfeastol*, *bar:dfeastol*,
+  *bar:relgaptol*, *bar:copfeastol*, *bar:codfeastol*, *bar:corelgaptol*,
+  *bar:order*, *bar:solveform*, *pre:lindep*, *mip:cuts*, *cut:clique*,
+  *cut:mir*, *cut:gomory*, *cut:implied*, *cut:cover*, *cut:lipro*,
+  *mip:nodeselect*, *mip:branchdir*, *mip:probing*, *mip:rootmethod*,
+  *mip:nodemethod*, *mip:rinsmaxnodes*, *mip:restarts*,
+  *mip:rootcutrounds*, *mip:djcbigm*, *mip:symmetry* (primary name of
+  *pre:mipfolding*), *lim:iter*, *lim:miptime*, *lim:lowerobjcut*,
+  *lim:upperobjcut*, *tech:writesolution*.
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+
+
+## 20260515
+- Updated to MOSEK 11.2.0, which includes many bug fixes and 
+  improvements.
+
+
+## 20260414
+- Changes in MP, see MP changelog.
+
+
+## 20251210
+- Change in MP: option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- New option *obj:multi:options* to control
+  whether multi-objective option suffixes
+  are used.
+
+
+## 20251021
+- Update to Mosek 11.0.29.
+
+
+## 20251015
+- Changes in MP
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options *cvt:pre:unnest*, *cvt:pre:sort*).
+  - Option *cvt:pre:boundlogarg* (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options *pre:feastol*,
+    *pre:feastolrel* both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options *cvt:compl*, *cvt:compl:eps* control
+    complementarity reformulations.
+
+
+## 20250617
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250426
+- Updated to MOSEK 11.0.18
+- Return solution whenever available (even 'unknown'
+  or 'infeasible'). This seems helpful on some
+  numerically tough models.
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+- Option mip:conic:outapprox, useful to find
+  feasible solutions in numerically tough conic
+  models.
+
+
+## 20250308
+- Options mip:gapabs, mip:feastol, mip:heurlevel, mip:feaspump
+
+
+## 20250226
+- Updated to MOSEK 11.0.8.
+- Option *bar:basis* to control crossover after interior-point
+  optimization.
+- Option *pre:scale* to control if to apply scaling during presolve
+- On MacOS, Intel processors support is dropped
+
+- 
+## 20240901
+- Option *tech:logfile* to write Mosek's output to a log file
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240531
+- Updated to MOSEK 10.2, which provides many bugfixes.
+- Added options `mip:varselection`, `pre:dualray_analysis` and 
+  `lim:sol`.
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+  
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use 
+    MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
 ## 20240118
 - *Native Mosek options*
   - Use tech:optionnative, tech:optionnative(read/write)

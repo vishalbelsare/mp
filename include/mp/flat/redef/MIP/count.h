@@ -21,11 +21,11 @@ public:
   using ItemType = CountConstraint;
 
   /// Convert in any context
-  void Convert(const ItemType& cc, int ) {
+  Context Convert(const ItemType& cc, int ) {
     const auto& args = cc.GetArguments();
-    std::vector<double> coefs(args.size()+1, 1.0);
-    coefs.back() = -1.0;
-    std::vector<int> flags(args.size()+1, cc.GetResultVar());
+    std::vector<double> coefs(args.size(), 1.0);  // size()+1
+    // coefs.back() = -1.0;
+    std::vector<int> flags(args.size());
     for (size_t ivar = 0; ivar < args.size(); ++ivar) {
       flags[ivar] = args[ivar];
       /// Force booleanize: reify if we have a "!=0" expression
@@ -36,7 +36,16 @@ public:
             NotConstraint( {feq0} ));
       }
     }
-    GetMC().AddConstraint( LinConEQ( {coefs, flags}, 0.0 ) );
+    // old way: propagates CTX_MIX but we want to keep context.
+    // Could be solved also by using just AddConstraint().
+    //GetMC().AddConstraint_AS_ROOT( LinConEQ( {coefs, flags}, 0.0 ) );
+    GetMC().RedefineVariable(cc.GetResultVar(),
+          LinearFunctionalConstraint(
+            AffineExpr( LinTerms( coefs, flags ), 0.0) ));
+    /// propagate ctx into new constr, but it should be already in the args
+    GetMC().PropagateResultOfInitExpr(
+          cc.GetResultVar(), cc.GetContext());
+    return Context::CTX_MIX;   // Can be propagated into arguments later
   }
 
   /// Reuse the stored ModelConverter

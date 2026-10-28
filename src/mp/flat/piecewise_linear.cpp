@@ -290,7 +290,7 @@ void BasicPLApproximator<FuncCon>::InitNonPeriodic() {
   // according to lbx() / ubx()
   laPrm_.fUsePeriod = false;
   auto bp_default = GetDefaultBreakpoints();
-  std::set<float> bpl_set(bp_default.begin(), bp_default.end());
+  std::set<double> bpl_set(bp_default.begin(), bp_default.end());
   auto it = bpl_set.insert(lbx()).first;
   bpl_set.erase(bpl_set.begin(), it);      // remove points before lbx()
   it = bpl_set.insert(ubx()).first;
@@ -353,10 +353,12 @@ void BasicPLApproximator<FuncCon>::ConsiderIntegrality() {
 template <class FuncCon>
 bool BasicPLApproximator<FuncCon>::CheckDomainReturnFalseIfTrivial(
     PLPoints& result) {
-  if (lbx() > ubx()+1e-6)
-    MP_INFEAS(fmt::format("PLApprox {}: "
-                          "empty argument domain [{}, {}]",
-                          GetConTypeName(), lbx(), ubx()));
+  if (lbx() > ubx()) {
+    std::string kind = "[PlApprox ";
+    kind += GetConTypeName();
+    kind += "] argument";
+    laPrm_.bnd_checker( lbx(), ubx(), kind.c_str(), -1);
+  }
   /// Domain ~ single point
   if (lbx() > ubx()-1e-6) {
     result = { {(lbx()+ubx())/2.0}, {eval((lbx()+ubx())/2.0)} };
@@ -622,20 +624,20 @@ void PLApproximate<LogAConstraint>(
     const LogAConstraint& con, PLApproxParams& laPrm);
 
 
-/// PLApproximator<PowConstraint>
+/// PLApproximator<PowConstExpConstraint>
 template <>
-class PLApproximator<PowConstraint> :
-    public BasicPLApproximator<PowConstraint> {
+class PLApproximator<PowConstExpConstraint> :
+    public BasicPLApproximator<PowConstExpConstraint> {
 public:
-  PLApproximator(const PowConstraint& con, PLApproxParams& p) :
-    BasicPLApproximator<PowConstraint>(con, p) {
+  PLApproximator(const PowConstExpConstraint& con, PLApproxParams& p) :
+    BasicPLApproximator<PowConstExpConstraint>(con, p) {
     InitPowDomain();
   }
   /// Constraint name. This should normally go via some
   /// printing facilities
   const char* GetConTypeName() const override {
     static std::string nm {
-      "PowConstraint ^ " + std::to_string(GetConParams()[0])
+      "PowConstExpConstraint ^ " + std::to_string(GetConParams()[0])
     };
     return nm.c_str();
   }
@@ -705,10 +707,10 @@ private:
   BreakpointList bpl_{{-1e6, 0.0, 1e6}};
 };
 
-/// Instantiate PLApproximate<PowConstraint>
+/// Instantiate PLApproximate<PowConstExpConstraint>
 template
-void PLApproximate<PowConstraint>(
-    const PowConstraint& con, PLApproxParams& laPrm);
+void PLApproximate<PowConstExpConstraint>(
+    const PowConstExpConstraint& con, PLApproxParams& laPrm);
 
 
 /// PLApproximator<SinConstraint>
@@ -1142,24 +1144,107 @@ PLPoints::PLPoints(const PLSlopes &pls) {
   const auto X0 = pls.GetX0(), Y0 = pls.GetY0();
   x_.resize(nsl+1);
   y_.resize(nsl+1);
+  SmallVec<long double, 32> YL(nsl+1);   // leftmost point: YL[0]=0
   /// Copy and add dummy breakpoints on both ends
   std::copy(bp.begin(), bp.end(), x_.begin()+1);
   x_[0] = x_[1] - eps;
   x_[nsl] = x_[nsl-1] + eps;
-  y_[0] = 0.0;                        // initialize leftmost point
   /// Lift the line by this
-  double deltaH {};
+  long double deltaH {};
   if (x_[0] > X0)                     // if left x > reference point
-    deltaH = sl[0] * (x_[0]-X0) + Y0;
+    deltaH = ((long double)sl[0])
+                 * ((long double)x_[0]-X0) + Y0;
   for (size_t i = 0; i < nsl; ++i) {
     assert( x_[i+1] > x_[i] );
-    y_[i+1] = y_[i] + sl[i] * (x_[i+1]-x_[i]);
+    YL[i+1] = YL[i] + sl[i] * ((long double)x_[i+1]-x_[i]);
     if (x_[i]<=X0 && (x_[i+1]>=X0 || i==nsl-1))
-      deltaH = Y0 - (y_[i] + sl[i]*(-x_[i]-X0));
+      deltaH = Y0 - (YL[i] + sl[i]*(-(long double)x_[i]-X0));
   }
   for (size_t i = 0; i <= nsl; ++i) {
-    y_[i] += deltaH;
+    y_[i] = YL[i] + deltaH;
   }
+}
+
+PLSlopes::PLSlopes(const PLPoints& plp) {
+	assert(plp.size() >= 3);      // Otherwise caught as degenerate
+	X0_ = plp.x_[0];
+	Y0_ = plp.y_[0];
+	breakpoints_.assign(plp.x_.begin()+1, plp.x_.end()-1);
+	slopes_.resize(plp.size()-1);
+	for (auto i=slopes_.size(); i--; ) {
+		long double div = (long double)plp.x_[i+1] - plp.x_[i];
+		MP_ASSERT_ALWAYS(div > 0.0,
+										 "PL expression: coinciding breakpoints");
+		slopes_[i] = ((long double)plp.y_[i+1] - plp.y_[i]) / div;
+	}
+}
+
+double PLPoints::Eval(double x) const {
+  assert(!empty());
+  if (x <= x_.front())
+    return y_.front() + PreSlope() * ((long double)x - x_.front());
+  if (x >= x_.back())
+    return y_.back() + PostSlope() * ((long double)x - x_.back());
+  auto i1 = std::upper_bound(x_.begin(), x_.end(), x) - x_.begin();
+  auto i0 = i1-1;                     // x_[i0] <= x < x_[i1]
+  return y_[i0] + ((long double)y_[i1]-y_[i0])
+      * ((long double)x-x_[i0]) / ((long double)x_[i1]-x_[i0]);
+}
+
+namespace {
+/// Accumulates the min and max of values
+struct ValueRange {
+  double min_ {INFINITY}, max_ {-INFINITY};
+  void Add(double y) {
+    min_ = std::min(min_, y);
+    max_ = std::max(max_, y);
+  }
+  /// Add the values on a ray with \a slope (sign of direction applied)
+  /// starting at \a y0
+  void AddRay(double y0, double slope) {
+    if (slope > 0.0)
+      max_ = INFINITY;
+    else if (slope < 0.0)
+      min_ = -INFINITY;
+    Add(y0);
+  }
+};
+}  // namespace
+
+std::pair<double, double>
+PLPoints::Range(double lb, double ub) const {
+  assert(!empty() && lb <= ub);
+  ValueRange r;
+  if (std::isinf(lb))                 // left ray: x -> -inf
+    r.AddRay(y_.front(), -PreSlope());
+  else
+    r.Add(Eval(lb));
+  if (std::isinf(ub))
+    r.AddRay(y_.back(), PostSlope());
+  else
+    r.Add(Eval(ub));
+  for (size_t i=0; i<x_.size(); ++i)
+    if (lb < x_[i] && x_[i] < ub)     // interior breakpoints
+      r.Add(y_[i]);
+  return { r.min_, r.max_ };
+}
+
+bool IsConvex(const PLSlopes& pls) {
+	const auto& sl = pls.GetSlopes();
+	MP_ASSERT_ALWAYS(sl.size(), "Empty PL expression");
+	for (auto i=sl.size()-1; i--; )
+		if (sl[i] > sl[i+1])
+			return false;
+	return true;
+}
+
+bool IsConcave(const PLSlopes& pls) {
+	const auto& sl = pls.GetSlopes();
+	MP_ASSERT_ALWAYS(sl.size(), "Empty PL expression");
+	for (auto i=sl.size()-1; i--; )
+		if (sl[i] < sl[i+1])
+			return false;
+	return true;
 }
 
 }  // namepsace mp

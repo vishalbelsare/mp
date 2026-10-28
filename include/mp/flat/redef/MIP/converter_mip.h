@@ -6,6 +6,7 @@
 #include "mp/flat/converter.h"
 #include "mp/flat/redef/MIP/redefs_mip_std.h"
 #include "mp/flat/redef/encodings.h"
+#include "mp/flat/redef/MIP/disj2ind.h"
 
 namespace mp {
 
@@ -13,7 +14,8 @@ namespace mp {
 template <class Impl, class ModelAPI,
           class Model = FlatModel< > >
 class MIPFlatConverter
-    : public FlatConverter<Impl, ModelAPI, Model>
+    : public FlatConverter<Impl, ModelAPI, Model>,
+      public Disj2IndMixin<Impl>
 {
 public:
   /// Class name for diagnostics
@@ -24,6 +26,15 @@ public:
 
   /// Constructor
   MIPFlatConverter(Env& e) : BaseConverter(e) {  }
+
+  /// Disjunction absorption mix-in
+  using Disj2Ind = Disj2IndMixin<Impl>;
+
+  /// Hooks: from the mix-in, hiding the empty defaults
+  using Disj2Ind::NoteConstraintAdded;
+  using Disj2Ind::IfNeedsCvtForParent;
+  using Disj2Ind::IfDelayCvtForParent;
+  using Disj2Ind::TryConvertParentFirst;
 
 
   ///////////////////// MIP CONSTRAINT CONVERTERS ///////////////////////
@@ -44,6 +55,15 @@ public:
   INSTALL_ITEM_CONVERTER(CountConverter_MIP)
   /// Div
   INSTALL_ITEM_CONVERTER(DivConverter_MIP)
+  /// Integer div, mod (AMPL div, mod)
+  INSTALL_ITEM_CONVERTER(IntDivConverter_MIP)
+  INSTALL_ITEM_CONVERTER(ModConverter_MIP)
+  /// Floor, ceil, round
+  INSTALL_ITEM_CONVERTER(FloorConverter_MIP)
+  INSTALL_ITEM_CONVERTER(CeilConverter_MIP)
+  INSTALL_ITEM_CONVERTER(RoundConverter_MIP)
+  /// Products r = x*y (when not accepted natively)
+  INSTALL_ITEM_CONVERTER(MulConverter_MIP)
   /// CondLinEQ
   INSTALL_ITEM_CONVERTER(CondLinEQConverter_MIP)
   /// CondQuadEQ
@@ -94,6 +114,8 @@ public:
   INSTALL_ITEM_CONVERTER(OrConverter_MIP)
   /// PLConstraint
   INSTALL_ITEM_CONVERTER(PLConverter_MIP)
+  /// Pow
+  INSTALL_ITEM_CONVERTER(PowConverter_MIP)
   /// PowConstExp
   INSTALL_ITEM_CONVERTER(PowConstExponentConverter_MIP)
   /// SOS2
@@ -143,6 +165,8 @@ public:
   /// Strict comparison tolerance.
   /// Need a big eps to avoid misinterpretation,
   /// at least the solver's feasibility tolerance
+  /// @todo Also for integers if >1?
+  /// @todo suffixes?
   double ComparisonEps(int var) const {
     return MPCD(is_var_integer(var)) ? 1.0 : cmpEpsContinuous();
   }
@@ -150,6 +174,10 @@ public:
   double ComparisonEps(var::Type vartype) const {
     return var::INTEGER==vartype ? 1.0 : cmpEpsContinuous();
   }
+  /// Strict comparison tolerance
+  template <class BndNType>
+  double ComparisonEps(const BndNType& bnt) const
+  { return ComparisonEps(bnt.get_result_type()); }
 
 
   ///////////////////////////////////////////////////////////////////////
@@ -180,17 +208,33 @@ public:
     MP_DISPATCH( ConvertEqVarConstMaps() );
   }
 
-  /// Whether might use equality encoding for \a var
+  /// Whether might use equality encoding for \a var.
+  /// @return false when UEnc apriori not applicable
   bool IfMightUseEqualityEncodingForVar(int var) const {
     if (n_map_cvt_cycles_)   // we've started map conversion
       return false;
-    if (!MPCD(is_var_integer(var)))
+    if (IsUEncAprioriExcluded(var))
       return false;
+    if (!MPCD(is_var_integer(var))) {
+      ExcludeUEncApriori(var);
+      return false;
+    }
     const auto lb_dbl = this->lb(var);
     const auto ub_dbl = this->ub(var);
-    return (lb_dbl>std::numeric_limits<int>::min() &&
-            ub_dbl<std::numeric_limits<int>::max()) &&
-        (ub_dbl-lb_dbl <= 10000000);
+    bool fMight = (lb_dbl>=std::numeric_limits<int>::min() &&
+                   ub_dbl<=std::numeric_limits<int>::max()) &&
+                  (ub_dbl-lb_dbl <= 10000000);
+    if (!fMight)
+      ExcludeUEncApriori(var);
+    return fMight;
+  }
+
+  /// Mark variable as "apriori no UEnc"
+  void ExcludeUEncApriori(int var) const
+  { set_vars_noUEnc_apriori_.insert(var); }
+  /// Is var apriori not for UEnc?
+  bool IsUEncAprioriExcluded(int var) const {
+    return set_vars_noUEnc_apriori_.end() != set_vars_noUEnc_apriori_.find(var);
   }
 
   /// Obtain extended column \a k of ZZI encoding C^r
@@ -206,8 +250,11 @@ private:
   using SingleVarEqConstMap = std::unordered_map<double, int>;
   /// A map keeping such maps for certain variables
   using VarsEqConstMap = std::unordered_map<int, SingleVarEqConstMap>;
+  /// A set for variables not subject to UEncoding apriori
+  using AprioriNoUEncSet = std::unordered_set<int>;
 
   VarsEqConstMap map_vars_eq_const_;
+  mutable AprioriNoUEncSet set_vars_noUEnc_apriori_;
   int n_map_cvt_cycles_ = 0;      // number of cycles for map conversion
 
   P_ZZI_Encoding p_zzi_ { MakeZZIEncoding() };
@@ -252,15 +299,21 @@ protected:
     if (n_map_cvt_cycles_++)
       MP_RAISE("Repeated map conversion cycle");
     for (const auto& m: map_vars_eq_const_) {
-      if (!WentWithoutEqEncForVar(m.first, m.second))
-        ConvertEqVarConstMap(m.first, m.second);
+      if (!IsUEncAprioriExcluded(m.first)) {  // else it's all done
+        if (!WentWithoutEqEncForVar(m.first, m.second)) {
+          ConvertEqVarConstMap(m.first, m.second);
+          MarkUnusedConditionals(m.first, m.second);
+        }
+      }
     }
     // 2. Initiate possible conversions into big-M's
     MPD( ConvertAllConstraints() );
   }   // But why the map then?
 
-  /// Managed to reformulate cond equalities without unary encoding?
-  bool WentWithoutEqEncForVar(int var, const SingleVarEqConstMap& map) {
+  /// Aposteriori decide & reformulate cond equalities
+  /// without unary encoding?
+  bool WentWithoutEqEncForVar(
+      int var, const SingleVarEqConstMap& map) {
     if (DontNeedEqEncForVar(var, map)) {
       GoWithoutEqEnc(var, map);
       return true;
@@ -268,33 +321,48 @@ protected:
     return false;
   }
 
-  /// @return true if don't need UEnc for var
-  bool DontNeedEqEncForVar(int var, const SingleVarEqConstMap& map) {
-    double dom_rng = MPCD(ub(var))-MPCD(lb(var))+1;
+  /// @return true if don't need UEnc for var _aposteriori_
+  bool DontNeedEqEncForVar(
+      int var, const SingleVarEqConstMap& map) {
+    if (IsUEncAprioriExcluded(var))
+      return true;
+    const auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
+    if (!ck.IfConsiderConversion())
+      return true;
+    auto lb = int(std::ceil(MPCD(lb(var))));
+    auto ub = int(std::ceil(MPCD(ub(var))));
+    double dom_rng = ub-lb+1;
     if (options_.NoUEncPosCtxRatio_ * map.size()   // Use UEnc if >
         > dom_rng)
       return false;
     int nNegCtx = 0;
-    const auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
     for (const auto& el: map) {
-      const auto& con = ck.GetConstraint(el.second);
-      if (con.GetContext().HasNegative())
-        ++nNegCtx;
-    }  // When up to 1 value in negative ctx, allow indicators.
-    // Example:
+      if (el.first!=lb && el.first!=ub) {  // except lb/ub
+        const auto& con = ck.GetConstraint(el.second);
+        assert(con.GetContext().HasPositive()
+               || con.GetContext().HasNegative());
+        if (con.GetContext().HasNegative())
+          ++nNegCtx;
+      }
+    }  // When up to (options_.NoUEncNegCtxMax_) values
+    // in negative ctx, allow indicators.
+    // Example.
+    // x is conditionally equated to a single value 5:
     // x==5 ==> ...
     return nNegCtx <= options_.NoUEncNegCtxMax_;
   }
 
   /// Manually convert all comparisons for this variable
   void GoWithoutEqEnc(int , const SingleVarEqConstMap& map) {
-    const auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
+    auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
+    if (!ck.IfConsiderConversion())
+      return;
     // 1. Convert the ConLinEq's into indicators.
     // Make sure IfMightUseEqualityEncoding() returns false.
     for (const auto& el: map) {
-      const auto& con = ck.GetConstraint(el.second);
-      MPD( RunConversion(
-             con, el.second, ck.GetConstraintDepth(el.second)) );
+      if (!ck.IsRedundant(el.second)) {
+        ck.ConvertConstraintStd(el.second);  // might absorb its disjunction
+      }
     }
     // 2. Initiate possible conversions into big-M's
     //    - done later for all.
@@ -312,12 +380,18 @@ protected:
   /// A benefit would be if some solver later supports them natively
   /// (IloDistribute?), now they are always converted below.
   void CreateUnaryEncoding(int var, const SingleVarEqConstMap& map) {
-    // Create links from CondLinEQ's into the dummy UEnc
-    auto valnode = MPD( AddConstraint( UnaryEncodingConstraint{{var}} ) );
-    auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
-    for (const auto& veq : map) {
-      MPD( GetMany2OneLink().AddEntry(
-        { ck.SelectValueNodeRange(veq.second), valnode } ));
+    pre::NodeRange valnode;
+    {
+      auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
+      auto emptylinker =
+          MPD( MakeEmptyLinker(ck.SelectValueNodeRange(map.begin()->second)) );
+      // Create links from CondLinEQ's into the dummy UEnc
+      // @todo We could extend AutoLinkScope to handle many-to-1
+      valnode = MPD( AddConstraint( UnaryEncodingConstraint{{var}} ) );
+      for (const auto& veq : map) {
+        MPD( GetMany2OneLink().AddEntry(
+            { ck.SelectValueNodeRange(veq.second), valnode } ));
+      }
     }
     // Start AutoLinking from the dummy UEnc into its reformulation
     pre::AutoLinkScope<Impl> auto_link_scope{
@@ -326,13 +400,13 @@ protected:
     // Create UEncoding
     const Model& model = MP_DISPATCH( GetModel() );
     if (!model.is_integer_var(var))
-      MP_RAISE("MP2MIP: Equality encoding: comparing non-integer variables not implemented");
+      MP_RAISE("Unary encoding: comparing non-integer variables not implemented");
     const auto lb_dbl = this->lb(var);
     const auto ub_dbl = this->ub(var);
     if (lb_dbl==this->MinusInfty() || ub_dbl==this->Infty())
-      MP_RAISE("MP2MIP: Equality-comparing unbounded variables not implemented");
+      MP_RAISE("Equality-comparing unbounded variables not implemented");
     if (lb_dbl<std::numeric_limits<int>::min() || ub_dbl>std::numeric_limits<int>::max())
-      MP_RAISE("MP2MIP: Equality-comparing variables with domain out of integer range not implemented");
+      MP_RAISE("Equality-comparing variables with domain out of integer range not implemented");
     const int lb = (int)std::round(lb_dbl);
     const int ub = (int)std::round(ub_dbl);
     std::vector<int> unaryEncVars(ub-lb+1);
@@ -358,6 +432,16 @@ protected:
     this->AddConstraint(LinConEQ({coefs, unaryEncVars}, 0.0));
   }
 
+  /// Mark unused CondLinEQ's which were replaced by UEnc
+  void MarkUnusedConditionals(int /*var*/,
+      const SingleVarEqConstMap& map) {
+    auto& ck = GET_CONSTRAINT_KEEPER(CondLinConEQ);
+    for (const auto& el: map) {
+      assert(!ck.IsRedundant(el.second));
+      ck.MarkAsBridged(el.second);
+    }
+  }
+
   ///////////////////////////////////////////////////////////////////////
   /////////////////////// OPTIONS /////////////////////////           ///
 public:
@@ -372,24 +456,47 @@ public:
   double bigMDefault() const { return options_.bigM_default_; }
   double PLApproxRelTol() const { return options_.PLApproxRelTol_; }
   double PLApproxDomain() const { return options_.PLApproxDomain_; }
+  /// Max abs value of a PL argument's domain for PL -> SOS2,
+  /// <0 if not set
+  double PLDomain() const { return options_.PLDomain_; }
+  /// Max number of binaries for the exact MIP reformulation of
+  /// a product with an integer factor (cvt:mip:intprodbits)
+  int IntProdBits() const { return options_.IntProdBits_; }
+  /// How to convert complementarity
+  int ComplementarityCvt() const { return options_.complCvt_; }
+  /// Complementarity smoothing tolerance
+  double ComplementarityCvtTol() const { return options_.complCvtEps_; }
 
 private:
   struct Options {
     double cmpEps_ { 1e-4 };
+    int complCvt_ = 0;
+    double complCvtEps_ {1e-9};
     double bigM_default_ { -1 };
     double PLApproxRelTol_ { 1e-2 };
     double PLApproxDomain_ { 1e6 };
+    double PLDomain_ { -1 };
+    int IntProdBits_ { 30 };
     double NoUEncPosCtxRatio_ { 0.0 };
     int NoUEncNegCtxMax_ { 1 };
   };
   Options options_;
 
+  static constexpr mp::OptionValueInfo values_complcvt_[4] = {
+      {     "0", "Disjunction: a<=0 || b<=0, a>=0, b>=0", 0 },
+      {     "1", "Product: a*b=cvt:compl:tol", 1 },
+      {     "2", "Fischer-Burmeister function: sqrt(a^2+b^2+2*cvt:compl:tol)=a+b", 2},
+      {     "3", "min(a,b)=0", 3}
+  };
+
   void InitOwnOptions() {
+    this->InitDisj2IndOptions();
     this->GetEnv().AddOption("cvt:mip:eps cvt:cmp:eps cmp:eps",
                        "Tolerance for strict comparison of continuous variables for MIP. "
                              "Applies to <, >, and != operators. "
                        "Also applies to negation of conditional comparisons: "
                        "b==1 <==> x<=5 means that with b==0, x>=5+eps. "
+                             "Normally should be larger or equal to the solver's feasibility tolerance. "
                              "Default: 1e-4.",
                        options_.cmpEps_, 0.0, 1e100);
     this->GetEnv().AddOption("cvt:bigM cvt:bigm cvt:mip:bigM cvt:mip:bigm",
@@ -397,6 +504,18 @@ private:
                        "Not used by default. Use with care (prefer tight bounds). "
                        "Should be smaller than (1.0 / [integrality tolerance])",
                        options_.bigM_default_, -1.0, 1e100);
+    this->GetEnv().AddStoredOption("cvt:compl cvt:complementarity",
+                             "Complementarity conversion method "
+                             "(if not accepted natively, see acc:compl and acc:nlcompl). "
+                                   "Default 0:\n"
+                                   "\n"
+                                   ".. value-table::\n",
+                             options_.complCvt_, values_complcvt_);
+    this->GetEnv().AddOption("cvt:compl:tol cvt:compl:eps compl:eps",
+                             "Tolerance parameter for the product "
+                             "and Fischer-Burmeister encodings of complementarity, "
+                             "see cvt:compl. Default 1e-9.",
+                             options_.complCvtEps_, 0.0, 1e100);
     this->GetEnv().AddOption("cvt:plapprox:reltol plapprox:reltol plapproxreltol",
                        "Relative tolerance for piecewise-linear approximation. Default 0.01.",
                        options_.PLApproxRelTol_, 0.0, 1e100);
@@ -404,18 +523,59 @@ private:
                        "For piecewise-linear approximated functions, both arguments and result "
                        "are bounded to +-[pladomain]. Default 1e6.",
                        options_.PLApproxDomain_, 0.0, 1e100);
+    this->GetEnv().AddOption("cvt:pl:domain pl:domain pldomain",
+                       "Max absolute value of the argument of a piecewise-linear "
+                       "expression converted to SOS2 (and further to MIP if SOS2 "
+                       "is not accepted natively). In the MIP reformulation, "
+                       "the solver's feasibility tolerance is amplified by up to "
+                       "this value. Not used by default: then an unbounded "
+                       "argument is an error in the MIP reformulation, and "
+                       "native SOS2 gets exact rays for unbounded sides. "
+                       "Use with care (prefer tight bounds).",
+                       options_.PLDomain_, -1.0, 1e100);
+    this->GetEnv().AddOption("cvt:mip:intprodbits intprodbits",
+                       "Products x*y of variables, when not accepted "
+                       "natively, with an integer factor of finite bounds "
+                       "(and the other factor bounded): "
+                       "exact MIP reformulation by binary expansion of the "
+                       "integer factor with the smaller range if it needs "
+                       "at most this many binary variables. Default 30. "
+                       "Otherwise, and with 0, such products are "
+                       "approximated as ((x+y)^2-x^2-y^2)/2 with "
+                       "piecewise-linear squares, as for continuous factors. "
+                       "Products with a binary factor are always exact.",
+                       options_.IntProdBits_, 0, 62);
     this->GetEnv().AddOption("cvt:uenc:ratio uenc:ratio",
-                       "Min ratio (ub-lb)/Nvalues to skip unary encoding "
+                       "Min ratio (ub-lb+1)/Nvalues to skip unary encoding "
                        "for a variable x, where Nvalues is the number of constants "
                        "used in conditional comparisons x==const. Instead, "
                        "indicator constraints (or big-Ms) are used, if "
-                       "uenc:negctx also applies. Default 0.",
+                       "uenc:negctx also applies. Default 0.\n"
+                             "\n"
+                             "Example:\n"
+                             "\n"
+                             " | var x in 1..9;\n"
+                             " | var y >=1 <=200;\n"
+                             " | \n"
+                             " | s.t. Con: y>3 ==> (x==2 || x==6 || x==5);\n"
+                             "\n"
+                             "With uenc:ratio>3, this triggers unary encoding for x.",
                        options_.NoUEncPosCtxRatio_, 0.0, 1e100);
-    this->GetEnv().AddOption("cvt:uenc:negctx:max uenc:negctx:max uenc:negctx",
+    this->GetEnv().AddOption("cvt:uenc:negctx:max uenc:negctx:max cvt:uenc:negctx uenc:negctx",
                        "If cvt:uenc:ratio applies, max number of constants "
                        "in comparisons x==const in negative context "
-                       "(equivalently, x!=const in positive context) to skip "
-                       "UEnc(x). Default 1.",
+                       "(equivalently, x!=const in positive context), "
+                             "where const!=lb(x) and const!=ub(x), to skip "
+                       "unary encoding of x. Default 1.\n"
+                             "\n"
+                             "Example:\n"
+                             "\n"
+                             " | var x in 1..9;\n"
+                             " | var y >=1 <=200;\n"
+                             " | \n"
+                             " | s.t. Con: (x==9 || x==2 || x==6) ==> y >= 4;\n"
+                             "\n"
+                             "With uenc:negctx<=1, this triggers unary encoding for x.",
                        options_.NoUEncNegCtxMax_, 0, INT_MAX);
   }
 };

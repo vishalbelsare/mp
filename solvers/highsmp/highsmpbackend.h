@@ -16,6 +16,16 @@ class HighsBackend :
   using BaseBackend = FlatBackend< MIPBackend<HighsBackend> >;
 
   std::vector<int> conStatiii_;
+  /// Separate HiGHS instance holding the fixed LP of mip:basis
+  /// (kept after the solve for sensitivity queries)
+  void* fixed_ = nullptr;
+  /// IIS statuses in solver coordinates (AMPL .iis values)
+  std::vector<int> iisVars_, iisCons_;
+  /// Whether the solve was a feasibility relaxation
+  bool feasrelaxDone_ = false;
+  void DestroyFixedLP();
+  /// Copy the user's options to the fixed-LP instance
+  void CopyOptionsToFixedLP(void* fixed);
   //////////////////// [[ The public interface ]] //////////////////////
 public:
   HighsBackend();
@@ -30,11 +40,10 @@ public:
   static const char* GetBackendName();
   static const char* GetBackendLongName() { return nullptr; }
 
-  /// Chance for the Backend to init solver environment, etc
-  void InitOptionParsing() override { }
-  /// Chance to consider options immediately (open cloud, etc)
-  void FinishOptionParsing() override;
 
+
+  /// This can actually modify the model -- e.g., suffixes
+  void InputStartValues() override;
 
 
   ////////////////////////////////////////////////////////////
@@ -43,7 +52,21 @@ public:
   // Use this section to declare and implement some standard features
   // that may or may not need additional functions. 
   USING_STD_FEATURES;
+  ALLOW_STD_FEATURE(FIX_MODEL, true)
+  bool IsFixedModelEmulated() const override { return true; }
+  FixedLPResult SolveFixedLP(ArrayRef<double>) override;
 
+  /**
+  * MULTIOBJ
+  **/
+  // Note: native MO is currently disabled as its implementation is 
+  // somewhat inconsitent with other solvers
+  ALLOW_STD_FEATURE( MULTIOBJ, false )
+  ArrayRef<double> GetObjectiveValues() override;
+  void ObjPriorities(ArrayRef<int>) override;
+  void ObjWeights(ArrayRef<double>) override;
+  void ObjAbsTol(ArrayRef<double>) override;
+  void ObjRelTol(ArrayRef<double>) override;
   /**
   * EXPORT PROBLEM
   **/
@@ -60,6 +83,8 @@ public:
   * General warm start:
   * set primal/dual initial guesses for continuous case
   **/
+  ALLOW_STD_FEATURE(MIPSTART, true)
+  void AddMIPStart(ArrayRef<double>, ArrayRef<int>) override;
   ALLOW_STD_FEATURE(WARMSTART, true)
     void AddPrimalDualStart(Solution sol0) override;
   /**
@@ -81,6 +106,39 @@ public:
   ALLOW_STD_FEATURE(RETURN_BEST_DUAL_BOUND, true)
   double BestDualBound() override;
 
+  /**
+  * Compute the IIS and obtain relevant values
+  **/
+  ALLOW_STD_FEATURE(IIS, true)
+  void ComputeIIS() override;
+  IIS GetIIS() override;
+
+  /**
+  * Sensitivity analysis (LP, or the fixed LP of mip:basis)
+  **/
+  ALLOW_STD_FEATURE(SENSITIVITY_ANALYSIS, true)
+  SensRangesPresolved GetSensRangesPresolved() override;
+
+  /**
+  * Feasibility relaxation (alg:feasrelax=1 only:
+  * weighted sum of violations, via Highs_feasibilityRelaxation)
+  **/
+  ALLOW_STD_FEATURE(FEAS_RELAX, true)
+  void DoHighsFeasRelax();
+
+  /**
+  * Obtain inf/unbounded rays
+  **/
+  ALLOW_STD_FEATURE(RAYS, true)
+    ArrayRef<double> Ray() override;
+  ArrayRef<double> DRay() override;
+
+  /**
+  * Stop the MIP search on a plateau (mip:plateau* options)
+  **/
+  ALLOW_STD_FEATURE( PLATEAU_STOP, true )
+  ALLOW_STD_FEATURE(PLATEAU_STOP_BOUND, true)
+  void SetupPlateauCallbacks() override;
 
   /////////////////////////// Model attributes /////////////////////////
   bool IsQCP() const override;
@@ -95,14 +153,20 @@ public:
   /// otherwise in ReportResults()
   void Solve() override;
 
-  ArrayRef<double> GetObjectiveValues() override
-  { return std::vector<double>{ObjectiveValue()}; } 
-
-
   //////////////////// [[ Implementation details ]] //////////////////////
   ///////////////////////////////////////////////////////////////////////////////
-public:  // public for static polymorphism
+public:  
   void InitCustomOptions() override;
+  void FinishOptionParsing() override;
+
+  /// AddSolverOption() + remember the AMPL name of the HiGHS option
+  /// (used in rejected-value messages).
+  template <class... Args>
+  void AddHighsOption(const char* names, const char* description,
+                      const char* key, Args&&... args) {
+    RememberOptionName(key, names);
+    AddSolverOption(names, description, key, std::forward<Args>(args)...);
+  }
 
 protected:
 
@@ -115,22 +179,38 @@ protected:
 
   void WindupHIGHSSolve();
 
+  /// Native callback implementing PLATEAU_STOP / PLATEAU_STOP_BOUND:
+  /// forwards new incumbents (kHighsCallbackMipImprovingSolution) to
+  /// ReportIncumbentForPlateau(), and gap updates (from
+  /// kHighsCallbackMipInterrupt and kHighsCallbackMipSolution --
+  /// absgap/relgap derived from mip_primal_bound/mip_dual_bound/mip_gap)
+  /// to ReportGapForPlateau(), requesting termination via
+  /// data_in->user_interrupt when either signals a plateau.
+  static void DoPlateauCallback(
+      int callback_type, const char* message,
+      const HighsCallbackDataOut* data_out, HighsCallbackDataIn* data_in,
+      void* user_callback_data);
+
   void ReportResults() override;
   void ReportHIGHSResults();
 
-  void ReportHIGHSPool();
-
-  std::vector<double> getPoolSolution(int i);
-  double getPoolObjective(int i);
-
   /// Solution attributes
-  double NodeCount() const;
-  double SimplexIterations() const;
+  int NodeCount() const;
+  int SimplexIterations() const;
   int BarrierIterations() const;
+  int PdlpIterations() const;
 
-  std::pair<int, std::string> ConvertHIGHSStatus();
+  std::map<std::string, std::variant<int, double, std::string>>
+      SolutionStats() override;
+
+  std::pair<int, std::string> GetSolveResult() override;
   void AddHIGHSMessages();
   
+  /// Legacy completion of a partial MIP start: fix the provided
+  /// integer values, solve, unfix. Returns false if no solution resulted.
+  bool CompleteStartByFixing(std::vector<double>& x0,
+                             const std::vector<int>& s0);
+
   ArrayRef<int> VarStatii();
   ArrayRef<int> ConStatii();
   void VarConStatii(ArrayRef<int>, ArrayRef<int>);
@@ -138,6 +218,10 @@ protected:
 private:
   /// These options are stored in the class
   struct Options {
+    std::string lpmethod_ = "choose";
+    int mipstart_ = 1;
+    int iisStrategy_ = -1;
+    bool onGPU() { return lpmethod_ == "pdlp-gpu" || lpmethod_ == "hipdlp-gpu"; }
   };
   Options storedOptions_;
 

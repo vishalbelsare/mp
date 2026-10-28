@@ -11,6 +11,14 @@ lead to better solver performance than another. Here we collect some examples
 that are relevant to the current MP implementation.
 Future versions may automate some of these reformulations.
 
+A general treatment of this topic is provided in
+*E. Klotz and A.M. Newman (2013).
+Practical guidelines for solving difficult mixed integer linear programs.
+Surveys in Operations Research and Management Science 18(1-2) 18-32*,
+and related literature. Choosing between whole formulations of a model
+(hand-written big-M, indicators, known reformulations) is covered in
+:ref:`modeling-formulations`.
+
 
 Simplification of logic
 ************************
@@ -72,6 +80,8 @@ The constraint implies that if ``sum {p in PRODUCTS} Flow[p,i,j]`` is positive, 
 As a result of this change, ``sum {p in PRODUCTS} Flow[p,i,j] >= min_ship`` is a subexpression in both the constraint and the objective, simplifying the converson of the model.
 
 
+.. _subexpression-bounds:
+
 Bounds on subexpressions
 *************************
 
@@ -99,5 +109,58 @@ Solver performance can often be improved by tightening bounds on the variables. 
           * (18 - 32*x[1] + 12*x[1]^2 + 48*x[2] - 36*x[1]*x[2] + 27*x[2]^2));
 
 These bounds are observed to substantially improve Gurobi's performance in this case.
+
+
+.. _declared-bounds-bigm:
+
+Declared bounds set the big-M constants
+******************************************
+
+When MP linearizes a logical constraint for a solver
+(see :ref:`tight_bounds`), it takes the big-M constant from the
+**declared bounds of the variables in the constraint**, propagated through
+the expression. Bounds implied by *other* constraints of the model are not
+used. So the same implication can receive a loose or a tight constant
+depending only on what the declarations say:
+
+.. code-block:: ampl
+
+    var Ship {i in I, j in J} >= 0, <= dem[j];
+
+    # Loose: the only bound MP can derive for the sum is the total demand,
+    # although a separate constraint limits it to cap[i]
+    subject to Capacity {i in I}: sum {j in J} Ship[i,j] <= cap[i];
+    subject to Use {i in I}: Open[i] = 0 ==> sum {j in J} Ship[i,j] <= 0;
+
+    # Tight: name the sum and declare the bound that follows from the data
+    var Out {i in I} >= 0, <= cap[i];
+    subject to Out_Def {i in I}: Out[i] = sum {j in J} Ship[i,j];
+    subject to Use {i in I}: Open[i] = 0 ==> Out[i] <= 0;
+
+In the second form MP linearizes ``Use`` as ``Out[i] <= cap[i] * Open[i]``,
+the classical strong form, instead of ``... <= (total demand) * Open[i]``.
+In a small facility location instance this reduces the root gap from 32.5%
+to 8.7%.
+
+- A constraint on a **single variable** (``Out[i] <= cap[i]``) is a bound in
+  disguise: AMPL presolve or MP turns it into one.
+  A constraint on an **expression** (a sum, a difference) is not, and does
+  not reach the big-M sizing. A limit on an expression needs its own
+  variable with a bound.
+- Typical candidates: start times declared on their earliest/latest-start
+  window rather than on ``[0, horizon]``; flows on their capacity; a net
+  quantity such as ``Charge - Discharge`` on what the device allows.
+- A variable without a finite bound in a logical constraint stops the solve
+  with "Set bounds on variables participating in logical expressions".
+  The option *cvt:bigM* sets a default constant; a constant derived from
+  the data is always better than a guessed one.
+
+To check what MP generated, export the solver's model
+(:ref:`explore-final-model`) and compare the coefficients of the binary
+variables with what the data allows. To measure the effect, compare
+root bounds (:ref:`root-bound-check`). Whether to keep such implications as
+native indicators instead is discussed in :ref:`indicator-vs-bigm`. The
+notebooks tagged
+`big-m <https://colab.ampl.com/tags/big-m.html>`__ walk through these steps.
 
 

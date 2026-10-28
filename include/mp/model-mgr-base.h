@@ -13,6 +13,7 @@
 #include "mp/arrayref.h"
 #include "mp/solver-base.h"
 #include "mp/suffix.h"
+#include "mp/obj-option-base.h"
 
 namespace mp {
 
@@ -32,7 +33,7 @@ public:
   virtual void ReadNLModel(const std::string& nl_filename,
                            const std::string& filename_no_ext,
                            Checker_AMPLS_ModeltTraits ,
-                           std::function<void()> after_header) = 0;
+                            std::function<void(char*)> after_header) = 0;
 
   /// User-provided primal solution
   virtual ArrayRef<double> InitialValues() = 0;
@@ -43,10 +44,18 @@ public:
   /// User-provided dual solution: sparsity
   virtual ArrayRef<int> InitialDualValuesSparsity() = 0;
 
+  /// Get suffix names
+  virtual std::set<std::string> GetSuffixNames() = 0;
+
+  virtual   SuffixSet& GetSuffixes(suf::Kind kind) = 0;
+
   /// Read integer suffix
   virtual ArrayRef<int> ReadSuffix(const SuffixDef<int>& suf) = 0;
   /// Read double suffix
-  virtual ArrayRef<double> ReadSuffix(const SuffixDef<double>& suf) = 0;
+  /// @param fint: if not NULL,
+  ///   is set to 1 iff the suffix was integer.
+  virtual ArrayRef<double> ReadSuffix(
+      const SuffixDef<double>& suf, int *fint=nullptr) = 0;
 
   /// Report integer suffix
   virtual void ReportSuffix(const SuffixDef<int>& suf,
@@ -58,6 +67,10 @@ public:
   /// Length of a suffix vector of given kind
   virtual size_t GetSuffixSize(int kind) = 0;
 
+  /// Get obj option setter
+  virtual BasicObjOptionSetter* GetObjOptionSetter() = 0;
+
+  /// Get solution file name
   virtual void SetSolutionFileName(const std::string& fileName) = 0;
 
   /// Report final solution
@@ -70,6 +83,23 @@ public:
                               const double *, const double *,
                               double) = 0;
 
+  /// Need and successfully prepared the next solve iteration?
+  /// @param get_stt: solution status getter.
+  ///   If called, then before get_sol.
+  /// @param get_sol: solution getter (for postsolved solution.)
+  virtual bool PrepareSolveIteration(
+      std::function<sol::Status(void)> get_stt, std::function<Solution(void)> get_sol) = 0;
+
+  /// Is/was MultiObj Emulator used?
+  virtual bool IsMOEmulationOn() const = 0;
+
+  /// Vector of pass indexes for each original objective
+  /// @note 0 is the first index
+  virtual ArrayRef<int> GetMultiobjPasses() const = 0;
+
+  /// Objective weights in the 'legacy' format of the obj:multi:weight option
+  virtual ArrayRef<double> GetObjWeightsAdapted() = 0;
+
   /// Integrality flags of the variables in the original instance.
   /// Used for solution rounding
   virtual const std::vector<bool>& IsVarInt() const = 0;
@@ -77,6 +107,10 @@ public:
   /// Has unfixed int vars?
   /// This is about the solver-facing instance.
   virtual bool HasUnfixedIntVars() const = 0;
+
+  /// Original input is linear algebraic, without SOS/PWL/logical constructs.
+  /// Conservative default for model managers that cannot establish this.
+  virtual bool IsLinearAlgebraic() const { return false; }
 };
 
 } // namespace mp

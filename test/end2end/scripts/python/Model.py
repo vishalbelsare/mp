@@ -1,6 +1,8 @@
 import enum
+import re
 from pathlib import Path
 from collections.abc import Iterable
+from SolverCategory import SolverCategory
 
 
 class ModelTags(enum.Enum):
@@ -11,10 +13,18 @@ class ModelTags(enum.Enum):
     quadratic = 2             # obj and con
     quadratic_obj = 2.5
     quadraticnonconvex = 3
+    quadratic_obj_nonconvex = 3.5
+    prod_with_bin_var = 3.7   # at most 1 term in a product non-binary
+    prod_int = 3.8            # products and integer powers of integer variables,
+                              # solved exactly (nonconvex quadratics or CP)
+    int_ops = 3.9             # floor, ceil, round, trunc, div, mod
     socp = 4
     socp_hard_to_recognize = 4.1  ## For solvers recognizing from quadratics
     expcones = 4.4
-    nonlinear = 5
+    nonlinear = 5       # All MP drivers PL-approximate nonlinears
+    formulas = 5.5      # Expression interface
+    nlobj_native = 5.7  # API accepts NL objective
+    formulas_scip = 5.53 # SCIP expression interface
     complementarity = 6
     arc = 7
     plinear = 8         # Requires native handling of pl constraints
@@ -30,6 +40,8 @@ class ModelTags(enum.Enum):
     trigonometric = 100   # subcategories of nonlinear
     htrigonometric = 101
     log = 102
+    signpow = 103
+    logistic = 104
 
     ## Execution mode
     script = 1000
@@ -51,7 +63,7 @@ class ModelTags(enum.Enum):
     mipstart=20008
 
     multiobj=30009
-    obj_priority=30010
+    obj_priority=30010           # understands obj:2:priority etc.
 
     multisol = 40011
     sstatus = 40012              # Basis I/O
@@ -59,6 +71,8 @@ class ModelTags(enum.Enum):
     iis = 40013
     iisforce = 40014
     feasrelax = 40100
+    feasrelax_squared = 40101    # squared-violation modes 2 and 5
+    feasrelax_modes = 40102      # modes 3, 4 and 6: violation count / original objective after relaxation
 
     writelp = 45000              # writeprob=...lp (for Mosek, .jtask)
     writesol = 45010             # writesol=...sol
@@ -71,6 +85,9 @@ class ModelTags(enum.Enum):
     check_pl_approx_cos = 50004
     check_pl_approx_tan = 50005
 
+    check_pl_approx_pow = 50006
+    check_qp_approx_pow = 50007
+
     check_pl2sos2 = 50500                # Solvers accepting PL constraints but wishing
                                          # to test MP's PL -> SOS2 conversion, by acc:pl=1
 
@@ -81,9 +98,14 @@ class ModelTags(enum.Enum):
     option_flag_barrier = 61000
 
     ## Solver-specific
+    gurobi = 99999
     gurobi_cloud = 100000
-    gurobi_server=100001
+    gurobi_server= 100001
+    gurobi_wls   = 100002
 
+    mp2nl = 101000
+    mpdriver = 101100            # needs an MP driver (MP options, MP error handling);
+                                 # ASL drivers run such cases through MP2NL
 
     @staticmethod
     def fromString(l):
@@ -104,6 +126,7 @@ class Model(object):
         self._filename = filename
         self._expsolution = expsolution
         self._tags = tags
+        
         if otherFiles:
             self._otherFiles = otherFiles if type(
                 otherFiles) is list else [otherFiles]
@@ -111,9 +134,28 @@ class Model(object):
             self._otherFiles = None
         self._name = overrideName if overrideName else filename.stem
         self._description = description
+        self._caseDir = None
+
+    def setCaseDir(self, caseDir: str):
+        """Label of the folder whose case list or file scan produced this case"""
+        self._caseDir = caseDir
+
+    def getCaseDir(self):
+        return self._caseDir
+
+    def hasSolvers(self):
+        return (self._description is not None) and \
+            ("solvers" in self._description)
 
     def getSolvers(self):
         return self._description["solvers"]
+
+    def hasSolversExcluded(self):
+        return (self._description is not None) and \
+            ("solvers_exclude" in self._description)
+
+    def getSolversExcluded(self):
+        return self._description["solvers_exclude"]
 
     def hasOptions(self):
         return (self._description is not None) and \
@@ -124,10 +166,33 @@ class Model(object):
 
     def hasExpectedValues(self):
         return (self._description is not None) and \
-            ("values" in self._description)
+            ("values" in self._description or
+             "values_per_solver_category" in self._description)
 
-    def getExpectedValues(self):
-        return self._description["values"]
+    def getExpectedValues(self, category=None):
+        """'values', updated by 'values_per_solver_category'[category]
+        (a SolverCategory or None): a null value there drops the check,
+        e.g., for converter statistics a category does not produce"""
+        values = dict(self._description.get("values", {}))
+        percat = self._description.get("values_per_solver_category", {})
+        unknown = set(percat) - {c.value for c in SolverCategory}
+        if unknown:
+            raise ValueError("unknown solver categories {} in case '{}'".format(
+                sorted(unknown), self.getName()))
+        if category is not None:
+            for name, val in percat.get(category.value, {}).items():
+                if val is None:
+                    values.pop(name, None)
+                else:
+                    values[name] = val
+        return values
+
+    def hasExpectedOutput(self):
+        return (self._description is not None) and \
+              ("output" in self._description)
+
+    def getExpectedOutput(self):
+        return self._description["output"]
 
     def getExpectedObjective(self):
         return self._expsolution
@@ -165,10 +230,27 @@ class Model(object):
     def isSubsetOfTags(self, tags: set):
         if tags is None:
             return False
+        if self._tags == ModelTags.NA:
+            return True # for NL models with no modellist.json
         for tag in self._tags:
             if tag not in tags:
                 return False
         return True
+
+    def needsMPDriver(self, optionsName: str):
+        """Whether the case needs an MP driver: tag mpdriver, mp_options,
+        or MP (namespaced) options such as cvt:bigm in the solver's
+        '<optionsName>_options', else in ANYSOLVER_options"""
+        if self.hasTag(ModelTags.mpdriver):
+            return True
+        if not self.hasOptions():
+            return False
+        opts = self.getOptions()
+        if "mp_options" in opts:
+            return True
+        val = opts.get(f"{optionsName}_options",
+                       opts.get("ANYSOLVER_options", ""))
+        return re.search(r"(^|\s)[A-Za-z_]\w*:\w", val) is not None
 
     def isScript(self):
         return self.hasTag(ModelTags.script)

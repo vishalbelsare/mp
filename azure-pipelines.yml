@@ -1,18 +1,113 @@
-trigger:
-- master
+trigger: none # trigger manually
 
-jobs:
-- template: support/azure/template-build.yml  # Template reference
-  parameters:
-    name: Linux
-    vmImage: 'ubuntu-latest'
+stages:
+- stage: native
+  displayName: 'Build native'
+  jobs:
+  - job: sdist
+    pool: {vmImage: 'Ubuntu-20.04'}
+    steps:
+      - task: UsePythonVersion@0
+      - bash: |
+          set -ex
+          cd nl-writer2/
+          pip install pybind11 setuptools
+          python setup.py sdist -d upload
+        displayName: Build sdist
+      - task: PublishBuildArtifacts@1
+        inputs: {pathtoPublish: 'nl-writer2/upload'}
+  - job: manylinux
+    pool: {vmImage: 'Ubuntu-20.04'}
+    steps:
+      - task: UsePythonVersion@0
+      - bash: |
+          set -ex
+          cd nl-writer2/
+          python -m pip install --upgrade cibuildwheel==2.16.2
+          cibuildwheel --platform linux --output-dir wheelhouse .
+        displayName: Build wheels
+      - task: PublishBuildArtifacts@1
+        inputs: {pathtoPublish: 'nl-writer2/wheelhouse'}
+  - job: macos
+    pool: {vmImage: 'macos-latest'}
+    variables:
+      MACOSX_DEPLOYMENT_TARGET: 10.15
+    steps:
+      - task: UsePythonVersion@0
+      - bash: |
+          set -ex
+          cd nl-writer2/
+          python -m pip install --upgrade cibuildwheel==2.16.2
+          cibuildwheel --platform macos --output-dir wheelhouse .
+        displayName: Build wheels
+      - task: PublishBuildArtifacts@1
+        inputs: {pathtoPublish: 'nl-writer2/wheelhouse'}
+  - job: windows
+    pool: {vmImage: 'windows-2022'}
+    steps:
+      - task: UsePythonVersion@0
+      - bash: |
+          set -ex
+          cd nl-writer2/
+          python -m pip install --upgrade cibuildwheel==2.16.2
+          cibuildwheel --platform windows --output-dir wheelhouse .
+        displayName: Build wheels
+      - task: PublishBuildArtifacts@1
+        inputs: {pathtoPublish: 'nl-writer2/wheelhouse'}
 
-- template: support/azure/template-build.yml  # Template reference
-  parameters:
-    name: windows
-    vmImage: 'windows-2019'
+# - stage: qemu
+#   displayName: 'Build with QEMU'
+#   jobs:
+  - job: qemu
+    pool: {vmImage: 'Ubuntu-20.04'}
+    strategy:
+      matrix:
+        aarch64 cp37:
+          CIBW_BUILD: cp37-*
+          CIBW_ARCHS_LINUX: aarch64
+        aarch64 cp38:
+          CIBW_BUILD: cp38-*
+          CIBW_ARCHS_LINUX: aarch64
+        aarch64 cp39:
+          CIBW_BUILD: cp39-*
+          CIBW_ARCHS_LINUX: aarch64
+        aarch64 cp310:
+          CIBW_BUILD: cp310-*
+          CIBW_ARCHS_LINUX: aarch64
+        aarch64 cp311:
+          CIBW_BUILD: cp311-*
+          CIBW_ARCHS_LINUX: aarch64
+        aarch64 cp312:
+          CIBW_BUILD: cp312-*
+          CIBW_ARCHS_LINUX: aarch64
+    steps:
+      - task: UsePythonVersion@0
+      - bash: docker run --rm --privileged multiarch/qemu-user-static --persistent yes
+        displayName: Configure qemu
+      - bash: |
+          set -ex
+          cd nl-writer2/
+          python -m pip install --upgrade cibuildwheel==2.16.2
+          cibuildwheel --platform linux --output-dir wheelhouse .
+        displayName: Build wheels
+      - task: PublishBuildArtifacts@1
+        inputs: {pathtoPublish: 'nl-writer2/wheelhouse'}
 
-- template: support/azure/template-build.yml  # Template reference
-  parameters:
-    name: macOS
-    vmImage: 'macOS-10.15'
+- stage: publish
+  jobs:
+    - job: upload
+      pool: {vmImage: 'ubuntu-latest'}
+      steps:
+        - task: DownloadBuildArtifacts@0
+          inputs:
+              buildType: 'current'
+              downloadPath: 'artifacts/'
+              artifactName: 'drop'
+          displayName: 'Download current pipeline artifacts'
+        - bash: mv artifacts/drop artifacts/mp
+          displayName: Rename directory
+        - task: PublishPipelineArtifact@1
+          inputs:
+            targetPath: 'artifacts/'
+            artifact: 'release'
+            artifactType: 'pipeline'

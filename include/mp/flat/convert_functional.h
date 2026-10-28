@@ -33,7 +33,7 @@ protected:
       SetResultVar(GetConverter().
                    template GetConstraint<Constraint>(i).
                    GetResultVar());
-      GetConverter().IncrementVarUsage(GetResultVar()); // already here
+      // Not here any more #266: GetConverter().IncrementVarUsage(GetResultVar());
 			if (GetConverter().DoingAutoLinking()) {  // Autolink known targets
         auto& varvn = GetConverter().GetVarValueNode();
         GetConverter().AutoLink( varvn.Select(GetResultVar()) );
@@ -77,9 +77,10 @@ public:
   /// Convert array of arguments into a result (var or const),
   /// possibly adding extra constraint(s).
   /// @return either a constant or a variable
-  VarOrConst Convert() {
+  /// @param if fVarOnly, always variable
+  VarOrConst Convert(bool fVarOnly=false) {
     MP_DISPATCH( PreprocessArguments() );
-    if (ResultIsConstant())
+    if (!fVarOnly && ResultIsConstant())
       return VarOrConst::MakeConst( lb() );
     if (ResultVarIsKnown())
       return VarOrConst::MakeVar( GetResultVar() );
@@ -93,13 +94,22 @@ public:
     GetConverter().PreprocessConstraint(GetConstraint(), prepro_);
   }
   void AddResultVariable() {
-    auto r = int( GetConverter().AddVar(lb(), ub(), type()) );
+    auto r = int( GetConverter().AddVar(
+        GetConverter().MinusInfty(), GetConverter().Infty(),  // free var
+        type()) );
+    if (GetConstraint().IsLogical())
+      GetConverter().NarrowVarBounds(r, lb(), ub());  // for logical, hard bounds
+    else {
+      GetConverter().NarrowVarBestBounds(r, lb(), ub());  // unless boundsbest=1
+      if (var::INTEGER == type())      // integrality implied by the args,
+        GetConverter().MarkVarImpliedInt(r);   // see cvt:pre:auxint
+    }
     SetResultVar( r );
     GetConstraint().SetResultVar( r );
-		GetConverter().IncrementVarUsage(r);
 	}
   void AddConstraint() {
-    GetConverter().AddConstraint( std::move(GetConstraint()) );
+    GetConverter().AddFunctionalConstraint( std::move(GetConstraint()) );
+    // not here any more #266: GetConverter().IncrementVarUsage(GetResultVar());
   }
 };
 

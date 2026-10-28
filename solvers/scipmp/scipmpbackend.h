@@ -2,6 +2,8 @@
 #define MP_SCIP_BACKEND_H_
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "mp/backend-mip.h"
 #include "mp/flat/backend_flat.h"
@@ -51,12 +53,22 @@ public:
   // Use this section to declare and implement some standard features
   // that may or may not need additional functions. 
   USING_STD_FEATURES;
+  ALLOW_STD_FEATURE(FIX_MODEL, true)
+  bool IsFixedModelEmulated() const override { return true; }
+  FixedLPResult SolveFixedLP(ArrayRef<double>) override;
 
   /**
  * MULTISOL support
  * No API, see ReportIntermediateSolution()
 **/
   ALLOW_STD_FEATURE(MULTISOL, true)
+
+  /**
+  * Compute IIS (SCIP 10 IIS finder)
+  **/
+  ALLOW_STD_FEATURE(IIS, true)
+  void ComputeIIS() override;
+  IIS GetIIS() override;
 
   /**
   * Get/Set AMPL var/con statii
@@ -70,16 +82,27 @@ public:
   * General warm start, e.g.,
   * set primal/dual initial guesses for continuous case
   **/
-  ALLOW_STD_FEATURE( WARMSTART, false )
+  ALLOW_STD_FEATURE( WARMSTART, true )
   void AddPrimalDualStart(Solution sol) override;
   /**
   * MIP warm start
   **/
   // If MIP warm start is supported, implement the function below
   // to set a non-presolved starting solution
-  ALLOW_STD_FEATURE(MIPSTART, false)
+  ALLOW_STD_FEATURE(MIPSTART, true)
   void AddMIPStart(ArrayRef<double> x0,
 									 ArrayRef<int> sparsity) override;
+
+  /**
+  * EXPORT PROBLEM
+  **/
+  ALLOW_STD_FEATURE(WRITE_PROBLEM, true)
+  void DoWriteProblem(const std::string& name) override;
+  /**
+  * EXPORT SOLUTION
+  **/
+  ALLOW_STD_FEATURE(WRITE_SOLUTION, true)
+  void DoWriteSolution(const std::string& name) override;
 
 
  /**
@@ -115,7 +138,7 @@ public:  // public for static polymorphism
 
   /// Default impl of GetObjValues()
   ArrayRef<double> GetObjectiveValues() override
-  { return std::vector<double>{ObjectiveValue()}; } 
+  { return std::vector<double>{HasFixedLP() ? FixedLP().objective : ObjectiveValue()}; }
 
 
   //////////////////// [[ Implementation details ]] //////////////////////
@@ -136,16 +159,34 @@ protected:
   void ReportSCIPResults();
 
   void ReportSCIPPool();
+  /// Whether a pool solution passes sol:poolgap / sol:poolgapabs
+  bool AcceptPoolSolution(double obj, double best) const;
+  /// sol:poolmode > 0: enumerate the feasible solutions of a
+  /// pure-integer model with SCIP's solution counting, on a copy
+  void EnumerateSolutions();
+  bool AllVarsInteger() const;
 
   std::vector<double> getPoolSolution(int i);
   double getPoolObjective(int i);
 
-  /// Solution attributes
-  double NodeCount() const;
-  double SimplexIterations() const;
-  int BarrierIterations() const;
+  /// tech:optionnative: "name=value" or "name value" pairs
+  void ApplyInlineParams();
+  /// tech:threads: concurrent solve and LP threads
+  void ApplyThreads();
+  /// tech:outlev, tech:logfile: verbosity and log file
+  void SetUpLogging();
+  /// alg:emphasis, heu/cut/pre:settings, pre:solve
+  void ApplyParamSettings();
+  bool UseConcurrentSolve() const;
 
-  std::pair<int, std::string> ConvertSCIPStatus();
+  /// Solution attributes
+  int NodeCount() const;
+  int SimplexIterations() const;
+  int BarrierIterations() const;
+  std::map<std::string, std::variant<int, double, std::string>>
+      SolutionStats() override;
+
+  std::pair<int, std::string> GetSolveResult() override;
   void AddSCIPMessages();
 
   ArrayRef<int> VarStatii();
@@ -155,16 +196,55 @@ protected:
 
 
 private:
+  /// Register a SCIP parameter as an AMPL option and remember
+  /// the AMPL name for rejection messages.
+  /// Integer bounds of a SCIP_Longint parameter register a 64-bit option.
+  template <class... Args>
+  void AddScipOption(const char* names, const char* descr,
+                     const char* key, Args&&... args) {
+    RecordOptionName(key, PrimaryName(names));
+    if constexpr (2 == sizeof...(Args)
+                  && (std::is_same_v<std::decay_t<Args>, int> && ...)) {
+      if (SCIP_PARAMTYPE_LONGINT == ParamType(key)) {
+        AddSolverOption(names, descr, key, (SCIP_Longint)0, (SCIP_Longint)0);
+        return;
+      }
+    }
+    AddSolverOption(names, descr, key, std::forward<Args>(args)...);
+  }
+  static std::string PrimaryName(const char* names) {
+    std::string s(names);
+    return s.substr(0, s.find(' '));
+  }
+
   /// These options are stored in the class
   struct Options {
-    std::string exportFile_, logFile_, paramRead_;
-    int concurrent_ = 0;
+    std::string logFile_, paramRead_, paramWrite_;
+    std::vector<std::string> inlineParams_;
+    int threads_ = 0;
+    int concurrent_ = -1;       // -1: with tech:threads > 1
     int heuristics_ = 0;
     int cuts_ = 0;
     int presolvings_ = 0;
+    int presolve_ = 1;
+    int emphasis_ = 0;
     int outlev_ = 0;
+    int poolLimit_ = 10;
+    int poolMode_ = 2;
+    double poolGap_ = -1.0;     // < 0: no limit
+    double poolGapAbs_ = -1.0;
   };
   Options storedOptions_;
+
+  /// IIS statuses of the variables and linear constraints
+  std::vector<int> iisVars_, iisCons_;
+
+  /// Solutions enumerated by sol:poolmode > 0, best first
+  struct CountedSolution {
+    double obj;
+    std::vector<double> x;
+  };
+  std::vector<CountedSolution> countedSols_;
 
 
 };

@@ -136,18 +136,18 @@ function(add_ampl_solver name)
     endforeach() 
   endif()
 
-  # Add a solver static library to be linked with the shared library and
+  # Add a solver static library to be linked with the shared library and/or
   # the executable.
   set(static_lib ampl${name}-static)
   add_library(${static_lib} STATIC ${sources})
   target_include_directories(${static_lib}
-    PUBLIC ${include_dirs} ${MP_BASE_DIR}/solvers)
+      PUBLIC ${include_dirs} ${MP_BASE_DIR}/solvers)
   target_link_libraries(${static_lib} PUBLIC ${libraries})
   target_compile_options(${static_lib} PUBLIC ${definitions})
   if(add_ampl_solver_VERSION)
       target_compile_definitions(${static_lib} PUBLIC DRIVER_DATE=${add_ampl_solver_VERSION})
   endif()
-  set_property(TARGET ${static_lib}  PROPERTY CXX_STANDARD 11)
+  set_property(TARGET ${static_lib}  PROPERTY CXX_STANDARD 17)
   if (use_dll_runtime)
     target_link_libraries(${static_lib} PUBLIC mp-dynrt)
   else ()
@@ -156,8 +156,15 @@ function(add_ampl_solver name)
 
   if(${add_ampl_solver_SHARED_LIB})
     set(shared_lib ${name}-lib)
-    add_library(${shared_lib} SHARED ${MP_BASE_DIR}/solvers/${name}/${name}-lib.c ${MP_BASE_DIR}/src/solver.cc)
-    target_compile_definitions(${shared_lib} PRIVATE MP_SOLVER=${name})
+    # if we want the drivers linked with the shared library, we need to add main.cc to the shared library,
+    # as it will be consumed from the driver
+    if(${MP_LINK_WITH_SHARED_LIB})
+        add_library(${shared_lib} SHARED ${MP_BASE_DIR}/solvers/${name}/${name}-lib.c ${dir}main.cc)
+        target_compile_definitions(${shared_lib} PUBLIC MP_LINK_WITH_SHARED_LIB)
+    else()
+        add_library(${shared_lib} SHARED ${MP_BASE_DIR}/solvers/${name}/${name}-lib.c ${dir}main.cc)
+    endif()
+    target_compile_definitions(${shared_lib} PRIVATE MP_SOLVER=${name} MP_SOLVER_LIBRARY)
     target_link_libraries(${shared_lib} PRIVATE ${static_lib})
   elseif(${add_ampl_solver_OLD_SHARED_LIB})     ## DEPRECATED
     # Old-style shared library if we are not building a directinterface
@@ -177,9 +184,16 @@ function(add_ampl_solver name)
     set(exename ${name})
     message("Setting exe " ${name})
   endif()
+ 
   add_executable(${exename} ${dir}main.cc)
-  target_link_libraries(${exename} PRIVATE ${static_lib}  ##${${module_upper}_LIBS}
-	  )
+  # If we want to link with the shared library, and we have it, do it
+  if(${MP_LINK_WITH_SHARED_LIB} AND ${add_ampl_solver_SHARED_LIB})
+     target_link_libraries(${exename} PRIVATE ${shared_lib})
+     message("Linking ${exename} with shared lib: ${shared_lib}")
+  else ()
+    target_link_libraries(${exename} PRIVATE ${static_lib})
+    message("Linking ${exename} with static lib")
+  endif ()
   if(add_ampl_solver_ADDITIONAL_DEPS)
     add_dependencies(${exename} ${add_ampl_solver_ADDITIONAL_DEPS})
     if(TARGET ${shared_lib})
@@ -202,22 +216,18 @@ if (build_cplex)
   add_subdirectory(cplex)
 endif ()
 
-# Excludes targets from the default build.
-function(exclude_from_build)
-  foreach (target ${ARGN})
-    if (TARGET ${target})
-      set_target_properties(${target} PROPERTIES
-        EXCLUDE_FROM_ALL TRUE EXCLUDE_FROM_DEFAULT_BUILD TRUE)
-    endif ()
-  endforeach ()
-endfunction()
 
-set(GECODE_DISABLE_WARNINGS TRUE)
-set(GECODE_USE_QT FALSE)
-add_ampl_solver(gecode EXTERNAL LIBRARIES
-  gecodeminimodel gecodesupport gecodekernel gecodeint gecodesearch)
-# Exclude unused Gecode targets from the build.
-exclude_from_build(fzn-gecode gecodeflatzinc gecode-test)
+
+# Gecode is built from thirdparty/gecode as an external project
+# (support/cmake/GecodeExternal.cmake).
+check_module(gecode build_gecode)
+if (build_gecode)
+  get_property(MP_BASE_DIR GLOBAL PROPERTY MP_BASE_DIR)
+  include(GecodeExternal)
+  add_gecode_external(${MP_BASE_DIR} ${PROJECT_BINARY_DIR})
+  add_ampl_solver(gecode LIBRARIES mp-gecode-libs ADDITIONAL_DEPS gecode-libs)
+  add_dependencies(amplgecode-static gecode-libs)
+endif ()
 
 add_ampl_solver(ilogcp DLL_RUNTIME MODULE CPLEX
   concert.cc concert.h ilogcp.cc ilogcp.h
@@ -229,7 +239,7 @@ endif ()
 
 
 ## Add a solver assuming the Backend/ModelAPI architecture
-function(add_ampl_backend name)
+function(add_ampl_backend name )
     set(SRC ${name}backend.cc ${name}backend.h
             ${name}common.cc ${name}common.h
             ${name}modelapi.cc ${name}modelapi.h
@@ -244,11 +254,17 @@ function(add_ampl_backend name)
     endif()
 endfunction()
 
+
+
 add_ampl_backend(visitor DLL_RUNTIME)
 
 add_ampl_backend(mosek DLL_RUNTIME MODULE MOSEK 
   LIBRARIES ${MOSEK_LIBS} ${CMAKE_DL_LIBS})
-add_ampl_backend(copt DLL_RUNTIME SHARED_LIB MODULE COPT 
+
+  add_ampl_backend(knitromp knitroutils.h knitroutils.cc DLL_RUNTIME MODULE KNITRO
+    KIBRARIES ${KNITRO_LIBS} ${CMAKE_DL_LIBS})
+
+add_ampl_backend(copt SHARED_LIB MODULE COPT 
   LIBRARIES ${COPT_LIBS} ${CMAKE_DL_LIBS})
 
 
@@ -262,17 +278,31 @@ add_ampl_backend(gcgmp DLL_RUNTIME SHARED_LIB MODULE GCG
 add_ampl_backend(scipmp DLL_RUNTIME SHARED_LIB MODULE SCIP 
   LIBRARIES ${SCIP_LIBS} ${CMAKE_DL_LIBS})
 
-add_ampl_backend(highsmp DLL_RUNTIME SHARED_LIB MODULE HIGHS 
-  LIBRARIES ${HIGHS_LIBS} ${CMAKE_DL_LIBS})
+add_ampl_backend(highsmp highsmploader.h highsmploader.cc
+                  DLL_RUNTIME SHARED_LIB MODULE HIGHS 
+                  LIBRARIES ${HIGHS_LIBS} ${CMAKE_DL_LIBS})
+
+add_ampl_backend(cpsat DLL_RUNTIME SHARED_LIB MODULE cpsat
+  LIBRARIES ${CPSAT_LIBS} ${CMAKE_DL_LIBS})
+if (MSVC AND TARGET amplcpsat-static)
+  # OR-Tools >= 9.15: its Abseil requires C++20 with MSVC, C++17 elsewhere
+  set_property(TARGET amplcpsat-static PROPERTY CXX_STANDARD 20)
+endif ()
 
 add_ampl_backend(ortoolsmp DLL_RUNTIME SHARED_LIB MODULE ortoolsmp 
   LIBRARIES ${ortoolsmp_LIBS} ${CMAKE_DL_LIBS})
 
-add_ampl_backend(cplexmp DLL_RUNTIME SHARED_LIB MODULE CPLEX
+add_ampl_backend(cplex DLL_RUNTIME SHARED_LIB MODULE CPLEX
                       LIBRARIES cplex-library ${CMAKE_DL_LIBS})
+
+add_ampl_backend(baronmp  DLL_RUNTIME MODULE BARON
+                      LIBRARIES ${baron_LIBS} ${CMAKE_DL_LIBS})
 
 add_ampl_backend(xpress DLL_RUNTIME SHARED_LIB MODULE XPRESS
                       LIBRARIES ${xpress_LIBS} ${CMAKE_DL_LIBS})
+
+                    add_ampl_backend(mp2nl DLL_RUNTIME SHARED_LIB
+                    LIBRARIES nlw2 ${CMAKE_DL_LIBS})
 
 
 set(GRBSRC gurobibackend.cc gurobibackend.h
@@ -292,6 +322,8 @@ if (TARGET gurobi)
   endif()
 endif()
 
+
+
 ## A simple Gurobi driver to test AMPLS C API
 add_ampl_solver(gurobi_ampls DLL_RUNTIME
   gurobi-ampls.c
@@ -301,7 +333,6 @@ add_ampl_solver(gurobi_ampls DLL_RUNTIME
 
 # Copy CPLEX DLL to the target directory.
 if (CPLEX_DLL AND (TARGET ilogcp))
-
   get_filename_component(CPLEX_DLL_NAME "${CPLEX_DLL}" NAME)
   add_custom_command(TARGET ilogcp
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -359,10 +390,10 @@ endif()
 
 
 
-set(CPLEXSRC cplexmpbackend.cc cplexmpbackend.h
-            cplexmpcommon.cc cplexmpcommon.h
-            cplexmpmodelapi.cc cplexmpmodelapi.h
-            cplexmp-modelapi-connect.cc
+set(CPLEXSRC cplexbackend.cc cplexbackend.h
+            cplexcommon.cc cplexcommon.h
+            cplexmodelapi.cc cplexmodelapi.h
+            cplex-modelapi-connect.cc
             model-mgr-with-std-pb.cc)
 add_prefix(DIRCPLEXSRC "../cplexmp/" ${CPLEXSRC})
 set(CPLEXODHSRC cplexodhbackend.h cplexodhbackend.cc)
@@ -378,4 +409,7 @@ if (TARGET cplexodh)
   endif()
 endif()
 
-  
+
+add_ampl_backend(cuoptmp DLL_RUNTIME SHARED_LIB MODULE CUOPT
+                 LIBRARIES cuopt ${CMAKE_DL_LIBS}
+                )

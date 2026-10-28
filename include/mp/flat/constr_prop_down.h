@@ -1,26 +1,35 @@
 #ifndef CONSTR_PROP_DOWN_H
 #define CONSTR_PROP_DOWN_H
 
-/**
+/*
  * Propagate flat constraints from result (result bounds & context)
- * "down", i.e., to the arguments
+ * "down", i.e., to the arguments.
+ *
+ * In the below methods, for functional constraints,
+ * lb and ub are bounds on the result.
+ *
+ * For static constraints, they may be the constraint range.
  */
 
 #include "mp/common.h"
 #include "mp/flat/constr_std.h"
+#include "mp/flat/nl_expr/constr_nl.h"
 
 namespace mp {
 
 /// A mix-in base class
 /// providing "down propagators" of flat constraints, i.e.,
 /// from result bounds & context to arguments.
+///
+/// @note According to cvt:pre:boundsbest, we propagate
+///   "best-known" bounds only
 template <class Impl>
 class ConstraintPropagatorsDown {
 public:
 
   /// By default, add mixed context for argument variables
   template <class Constraint>
-  void PropagateResult(Constraint& con, double lb, double ub, Context ctx) {
+  void PropagateResult(const Constraint& con, double lb, double ub, Context ctx) {
     internal::Unused(&con, lb, ub, ctx);
     con.AddContext(ctx);           // merge context
     PropagateResult2Args(con.GetArguments(),     // we don't know the constraint
@@ -29,15 +38,17 @@ public:
 
   void PropagateResult(LinearFunctionalConstraint& con, double lb, double ub,
                        Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
-    PropagateResult2LinTerms(con.GetAffineExpr(),
-                             MPD( MinusInfty() ), MPD( Infty() ), +ctx);
+    const auto& ae = con.GetAffineExpr();
+    const auto ct = ae.constant_term();
+    PropagateResult2LinTerms(ae.GetLinTerms(),  // bounds: useful for
+                             lb-ct, ub-ct, +ctx);  // fixed redefined Not
   }
 
   void PropagateResult(QuadraticFunctionalConstraint& con, double lb, double ub,
                        Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
     const auto& args = con.GetArguments();
     PropagateResult2LinTerms(args.GetLinTerms(),
@@ -47,78 +58,109 @@ public:
   }
 
   /// Propagate a root algebraic range constraint
-  template <class Body>
-  void PropagateResult(AlgebraicConstraint<Body, AlgConRange>& con) {
+  template <class Body, class RangeOrRhs>
+  void PropagateResult(const AlgebraicConstraint<Body, RangeOrRhs>& con) {
+    PropagateResult(con, Context::CTX_ROOT);
+  }
+
+  /// Static algebraic con.
+  /// But can be the argument of a conditional.
+  template <class Body, class RngOrRhs>
+  void PropagateResult(const AlgebraicConstraint< Body, RngOrRhs >& con,
+                       Context ctx) {
     /// Distinguish bounds' finiteness for context
-		auto ctx = con.lb()<=MPD( PracticallyMinusInf() ) ?
-					Context::CTX_NEG : con.ub()>=MPD( PracticallyInf() ) ?
-            Context::CTX_POS : Context::CTX_MIX;
-    PropagateResult2Args(con.GetBody(), con.lb(), con.ub(), ctx);
+    auto ctx_new = con.lb()<=MPCD( PracticallyMinusInf() )
+                   ? -ctx : (con.ub()>=MPCD( PracticallyInf() )
+                          ? +ctx : Context::CTX_MIX);
+    auto LB = MPCD( MinusInfty() );
+    auto UB = MPCD( Infty() );
+    if (ctx.IsRoot()) {             // not for conditional comparisons
+      LB = con.lb();
+      UB = con.ub();
+    }
+    PropagateResult2Args(con.GetBody(), LB, UB, ctx_new);
   }
 
   template <class Body, int sens>
   void PropagateResult(IndicatorConstraint<
                          AlgebraicConstraint< Body, AlgConRhs<sens> > >& con,
                        double lb, double ub, Context ctx) {
-    internal::Unused(lb, ub, ctx);
+    internal::Unused(lb, ub);
     MPD( PropagateResultOfInitExpr(con.get_binary_var(),
                               MPD( MinusInfty() ), MPD( Infty() ),
                               1==con.get_binary_value() ?  // b==1 means b in CTX_NEG
                                 Context::CTX_NEG : Context::CTX_POS) );
-    PropagateResult2Args(con.get_constraint().GetBody(),   // Assume Con::BodyType is handled
-                             MPD( MinusInfty() ), MPD( Infty() ),
-                             0==sens ? Context::CTX_MIX :
-                                       0<sens ? +ctx : -ctx);
+    PropagateResult(con.get_constraint(), Context::CTX_POS);      // implication
   }
 
   template <int type>
   void PropagateResult(SOS_1or2_Constraint<type>& con, double lb, double ub, Context ) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     MPD( PropagateResult2Vars(con.get_vars(),
                         MPD( MinusInfty() ), MPD( Infty() ), Context::CTX_MIX) );
   }
 
   /// Propagate root complementarity constraint
   template <class ExprBody>
-  void PropagateResult(ComplementarityConstraint<ExprBody>& con) {
+  void PropagateResult(const ComplementarityConstraint<ExprBody>& con) {
     MPD( PropagateResult(con,
                          MPD(MinusInfty()), MPD(Infty()), Context::CTX_MIX) );
   }
 
   /// Not used?
   template <class ExprBody>
-  void PropagateResult(ComplementarityConstraint<ExprBody>& con,
+  void PropagateResult(const ComplementarityConstraint<ExprBody>& con,
                        double lb, double ub, Context ctx) {
-    internal::Unused(lb, ub, ctx);
+    internal::Unused(ctx);
     MPD( PropagateResult2Args(con.GetExpression().GetBody(),
                          lb, ub, Context::CTX_MIX) );
     MPD( PropagateResultOfInitExpr(con.GetVariable(), lb, ub, Context::CTX_MIX) );
   }
 
   void PropagateResult(NotConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    auto resvar = con.GetResultVar();
+    MPD( NarrowVarBestBounds(resvar, lb, ub) );
     con.AddContext(ctx);
-    MPD( PropagateResultOfInitExpr(con.GetArguments()[0], 1.0-ub, 1.0-lb, -ctx) );
+    if (lb==ub) {                         // result fixed
+      if (!lb && ctx.HasNegative()) {     // result==0 && ctx-
+        MPD( PropagateResultOfInitExpr(con.GetArguments()[0], 1.0, 1.0, -ctx) );
+        MPD( MarkAsBridged_ThisOnly(  // #201. Actually MarkAsBridged_ThisOnly?
+            MPCD( GetInitExpression(resvar) ) ) );
+        return;
+      } else if (lb && ctx.HasPositive()) { // result==1 && ctx+
+        MPD( PropagateResultOfInitExpr(con.GetArguments()[0], 0.0, 0.0, -ctx) );
+        MPD( MarkAsBridged_ThisOnly(       // #201
+            MPCD( GetInitExpression(resvar) ) ) );
+        return;
+      }
+    }
+    MPD( PropagateResultOfInitExpr(con.GetArguments()[0], 0.0, 1.0, -ctx) );
   }
 
   void PropagateResult(AndConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
-    MPD( PropagateResult2Vars(con.GetArguments(), lb, 1.0, +ctx) );
-    if (lb>0.5)                                 // Remove, arguments are fixed
-      MPD( DecrementVarUsage(con.GetResultVar()) );
+    if (lb>0.5 && ctx.HasPositive()) {                  // Remove, arguments are fixed
+      MPD( PropagateResult2Vars(con.GetArguments(), lb, 1.0, +ctx) );
+      MPD( MarkAsBridged_ThisOnly(       // #201
+             MPCD( GetInitExpression(con.GetResultVar()) ) ) );
+    } else
+      MPD( PropagateResult2Vars(con.GetArguments(), 0.0, 1.0, +ctx) );  // in any ctx??
   }
 
   void PropagateResult(OrConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
-    MPD( PropagateResult2Vars(con.GetArguments(), 0.0, ub, +ctx) );
-    if (ub<=0.5)                                 // Remove, arguments are fixed
-      MPD( DecrementVarUsage(con.GetResultVar()) );
+    if (ub<0.5 && ctx.HasNegative()) {                 // Remove, arguments are fixed
+      MPD( PropagateResult2Vars(con.GetArguments(), 0.0, ub, +ctx) );
+      MPD( MarkAsBridged_ThisOnly(       // #201
+             MPCD( GetInitExpression(con.GetResultVar()) ) ) );
+    } else
+      MPD( PropagateResult2Vars(con.GetArguments(), 0.0, 1.0, +ctx) );
   }
 
   void PropagateResult(IfThenConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
     auto& args = con.GetArguments();
     MPD( PropagateIfThenResultIntoCondition(args, ctx) );
@@ -142,7 +184,7 @@ public:
   }
 
   void PropagateResult(ImplicationConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
     auto& args = con.GetArguments();
     MPD( PropagateResultOfInitExpr(args[0], 0.0, 1.0, Context::CTX_MIX) );
@@ -151,31 +193,76 @@ public:
   }
 
   void PropagateResult(AllDiffConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
     con.AddContext(ctx);
     MPD( PropagateResult2Vars(con.GetArguments(), MPD( MinusInfty() ), MPD( Infty() ),
                          Context::CTX_MIX) );
   }
 
+  /// @todo Propagate CTX+/- into the conditional equalities
   void PropagateResult(NumberofConstConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
+    if ( !(MPCD( IfPropCtxCountNumberof() ) & 2) )
+      ctx = Context::CTX_MIX;                     // #267
     con.AddContext(ctx);
     MPD( PropagateResult2Vars(con.GetArguments(), MPD( MinusInfty() ), MPD( Infty() ),
-                         Context::CTX_MIX) );
+                         ctx) );
   }
 
   void PropagateResult(NumberofVarConstraint& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
+    if ( !(MPCD( IfPropCtxCountNumberof() ) & 4) )
+      ctx = Context::CTX_MIX;                     // #267
     con.AddContext(ctx);
     MPD( PropagateResult2Vars(con.GetArguments(), MPD( MinusInfty() ), MPD( Infty() ),
-                         Context::CTX_MIX) );
+                         ctx) );
+  }
+
+  void PropagateResult(CountConstraint& con, double lb, double ub, Context ctx) {
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
+    if ( !(MPCD( IfPropCtxCountNumberof() ) & 1) )
+      ctx = Context::CTX_MIX;                     // #267
+    con.AddContext(ctx);
+    MPD( PropagateResult2Vars(con.GetArguments(),       // forward same context
+                              MPD( MinusInfty() ), MPD( Infty() ), ctx) );
   }
 
 
   //////////////////////////// NONLINEAR /////////////////////////////
 
+  /// \brief PropagateResult(PowConstraint)
   void PropagateResult(
       PowConstraint& con, double , double , Context ctx) {
+    con.AddContext(ctx);           // merge context
+    auto x = con.GetArguments()[0];
+    auto y = con.GetArguments()[1];
+    Context ctx_x, ctx_y;
+    if (MPCD( lb(x) )>=0.0 ) {     // x >= 0
+      ctx_x = (MPCD( lb(y) ) >= 0.0)
+                  ? +ctx
+                  : MPCD( ub(y) ) <= 0.0
+                        ? -ctx: Context::CTX_MIX;
+      ctx_y = (MPCD( ub(x) ) <= 1.0)  // 0<=x<=1
+                  ? -ctx
+                  : MPCD( lb(x) ) >= 1.0  // x>=1
+                        ? +ctx
+                        : Context::CTX_MIX;
+    } else {
+      ctx_x = ctx_y = Context::CTX_MIX;
+    }
+    VarArray1 xx {x};
+    PropagateResult2Args(xx,
+                         MPD( MinusInfty() ), MPD( Infty() ),
+                         ctx_x);
+    VarArray1 yy {y};
+    PropagateResult2Args(yy,
+                         MPD( MinusInfty() ), MPD( Infty() ),
+                         ctx_y);
+  }
+
+
+  void PropagateResult(
+      PowConstExpConstraint& con, double , double , Context ctx) {
     con.AddContext(ctx);           // merge context
     auto pwr = con.GetParameters()[0];
     auto arg = con.GetArguments()[0];
@@ -187,14 +274,15 @@ public:
     if (is_pow_odd_pos) {            // some monotone cases
       ctx_new = +ctx;
     } else
-      if (MPD( lb(arg)>=0.0 )) {     // arg >= 0
+      if (MPD( lb(arg) )>=0.0 ) {     // arg >= 0
         ctx_new = (pwr >= 0.0) ? +ctx : -ctx;
       } else
-        if (MPD( ub(arg)<=0.0 ) && is_pow_int) {
+        if (MPD( ub(arg) )<=0.0 && is_pow_int) {
           if (pwr >= 0.0)
             ctx_new = -ctx;          // arg<=0, pwr even >=0
-          else
-            ctx_new = is_pow_odd ? -ctx : +ctx;
+          else                       // pwr < 0
+            ctx_new = is_pow_odd ?
+                          -ctx : +ctx;
         } else
           ctx_new.Add(Context::CTX_MIX);  // undecidable
     PropagateResult2Args(con.GetArguments(),
@@ -205,12 +293,12 @@ public:
   void PropagateResult(LogConstraint& con, double , double , Context ctx) {
     con.AddContext(ctx);           // merge context
     PropagateResult2Args(con.GetArguments(),     // monotone
-                         MPD( MinusInfty() ), MPD( Infty() ), ctx);
+                         MPD( MinusInfty() ), MPD( Infty() ), +ctx);
   }
 
   void PropagateResult(LogAConstraint& con, double , double , Context ctx) {
     con.AddContext(ctx);           // merge context
-    auto ctx_new = (con.GetParameters()[0]>=0.0) ? ctx : -ctx;
+    auto ctx_new = (con.GetParameters()[0]>=1.0) ? +ctx : -ctx;
     PropagateResult2Args(con.GetArguments(),     // monotone
                          MPD( MinusInfty() ), MPD( Infty() ), ctx_new);
   }
@@ -218,42 +306,49 @@ public:
   void PropagateResult(ExpConstraint& con, double , double , Context ctx) {
     con.AddContext(ctx);           // merge context
     PropagateResult2Args(con.GetArguments(),     // monotone
-                         MPD( MinusInfty() ), MPD( Infty() ), ctx);
+                         MPD( MinusInfty() ), MPD( Infty() ), +ctx);
   }
 
   void PropagateResult(ExpAConstraint& con, double , double , Context ctx) {
     con.AddContext(ctx);           // merge context
+    auto ctx_new = (con.GetParameters()[0]>=1.0) ? +ctx : -ctx;
     PropagateResult2Args(con.GetArguments(),     // monotone
-                         MPD( MinusInfty() ), MPD( Infty() ), ctx);
+                         MPD( MinusInfty() ), MPD( Infty() ), ctx_new);
   }
 
 
   //////////////////////////// ALGEBRAIC /////////////////////////////
-
-  void PropagateResult(CondLinConEQ& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
-    con.AddContext(ctx);
-    MPD( PropagateResult2LinTerms(con.GetConstraint().GetBody(),
-                         lb, ub, Context::CTX_MIX) );
-  }
-
-  void PropagateResult(CondQuadConEQ& con, double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
-    con.AddContext(ctx);
-    MPD( PropagateResult2QuadAndLinTerms(con.GetConstraint().GetBody(),
-                         lb, ub, Context::CTX_MIX) );
-  }
 
   template <class Body, int kind>
   void PropagateResult(
       ConditionalConstraint<
         AlgebraicConstraint< Body, AlgConRhs<kind> > >& con,
       double lb, double ub, Context ctx) {
-    MPD( NarrowVarBounds(con.GetResultVar(), lb, ub) );
+    MPD( NarrowVarBestBounds(con.GetResultVar(), lb, ub) );
+    if ( kind!=0                                  // inequality
+         && !MPCD( IfPropCtxCondIneq() ) )
+      ctx = Context::CTX_MIX;                     // #267
+    if ( kind==0                                  // (dis)equality
+        && !MPCD( IfPropCtxCondEqBnd() ) ) {
+      auto bnd = MPCD(  // Can have been preprocessed from <=lb etc.
+          ComputeBoundsAndType( con.GetArguments().GetBody() ) );
+      auto cmpeps = MPCD( ComparisonEps(bnd) );
+      auto rhs = con.GetArguments().rhs();
+      if (std::fabs(rhs - bnd.lb()) < cmpeps
+          || std::fabs(rhs - bnd.ub()) < cmpeps)
+        ctx = Context::CTX_MIX;                     // #267
+    }
     con.AddContext(ctx);
-    auto ctx_new = kind>0 ? ctx : kind<0 ? -ctx : Context::CTX_MIX;
-    MPD( PropagateResult2Args(con.GetConstraint().GetBody(), lb, ub,
-                             ctx_new) );
+    if (lb>0 && ctx.HasPositive()) {              // Is true
+      if constexpr (kind*kind<=1) {               // == or <= or >=
+        MPD( AddConstraint_AS_ROOT(con.GetConstraint()) );
+             // #248: not MarkAsBridged()
+             // see test_ineq_unify_01.mod
+        MPD( DecrementVarUsage(con.GetResultVar()) );
+      }
+    } else {
+      MPD( PropagateResult(con.GetConstraint(), ctx) );
+    }
   }
 
 
@@ -281,16 +376,36 @@ public:
   /// Propagate result into QuadAndLinTerms
   void PropagateResult2QuadAndLinTerms(
       const QuadAndLinTerms& qlt, double lb, double ub, Context ctx) {
-    PropagateResult2LinTerms(qlt.GetLinTerms(), lb, ub, ctx);
-    PropagateResult2QuadTerms(qlt.GetQPTerms(), lb, ub, ctx);
+    auto LB_lt = MPD( MinusInfty() );
+    auto UB_lt = MPD( Infty() );
+    if (qlt.GetQPTerms().empty()) {
+      LB_lt = lb;
+      UB_lt = ub;
+    }
+    PropagateResult2LinTerms(qlt.GetLinTerms(),
+                             LB_lt, UB_lt, ctx);
+    PropagateResult2QuadTerms(qlt.GetQPTerms(),
+                              MPD( MinusInfty() ), MPD( Infty() ), ctx);
   }
 
   /// Propagate result into LinTerms
-  void PropagateResult2LinTerms(const LinTerms& lint, double , double , Context ctx) {
+  void PropagateResult2LinTerms(const LinTerms& lint,
+                                double lb, double ub, Context ctx) {
+    auto LB = MPD( MinusInfty() );
+    auto UB = MPD( Infty() );
+    if (1==lint.size()) {
+      auto coef = lint.coef(0);
+      if (coef > 0.0) {
+        LB = lb / coef;
+        UB = ub / coef;
+      } else if (coef < 0.0) {
+        LB = ub / coef;
+        UB = lb / coef;
+      }
+    }
     for (auto i=lint.size(); i--; ) {
       if (0.0!=std::fabs(lint.coef(i))) {
-        MPD( PropagateResultOfInitExpr(lint.var(i),
-                                MPD( MinusInfty() ), MPD( Infty() ),
+        MPD( PropagateResultOfInitExpr(lint.var(i), LB, UB,
                                 (lint.coef(i)>=0.0) ? +ctx : -ctx) );
       }
     }
@@ -308,10 +423,11 @@ public:
   /// Propagate result into QuadTerms
   void PropagateResult2QuadTerms(const QuadTerms& quadt, double , double , Context ctx) {
     for (auto i=quadt.size(); i--; ) {
-      if (0.0!=std::fabs(quadt.coef(i))) {
+      double coef_i = quadt.coef(i);
+      if (0.0!=std::fabs(coef_i)) {
         // Propagate context in some cases.
         auto var1 = quadt.var1(i), var2 = quadt.var2(i);
-        auto ctx12 = ctx;
+        auto ctx12 = (coef_i>0.0) ? +ctx : -ctx;
         if (MPD( lb(var1) ) >= 0.0 && MPD( lb(var2) ) >= 0.0) {
           // leave as is
         } else if (MPD( ub(var1) ) <= 0.0 && MPD( ub(var2) ) <= 0.0) {
@@ -324,6 +440,19 @@ public:
       }
     }
   }
+
+  /// Do nothing
+  inline void PropagateResult(NLConstraint& , double , double , Context ) { }
+  /// Do nothing
+  inline void PropagateResult(NLComplementarity& , double , double , Context ) { }
+  /// Do nothing
+  inline void PropagateResult(NLLogical& , double , double , Context ) { }
+  /// Do nothing
+  inline void PropagateResult(NLReifEquiv& , double , double , Context ) { }
+  /// Do nothing
+  inline void PropagateResult(NLReifImpl& , double , double , Context ) { }
+  /// Do nothing
+  inline void PropagateResult(NLReifRimpl& , double , double , Context ) { }
 
 };
 

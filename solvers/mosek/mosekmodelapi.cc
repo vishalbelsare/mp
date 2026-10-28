@@ -6,12 +6,13 @@
 namespace mp {
 
 void MosekModelAPI::InitProblemModificationPhase(const FlatModelInfo* info) {
-	/// Preallocate algebraic constraints.
+  /// Preallocate algebraic constraints.
 	/// MOSEK 10 seems to handle all algebraic constraints as 1 group.
 	/// CG_Algebraic, etc. are the constraint group indexes
   /// provided in ACCEPT_CONSTRAINT macros.
-  MOSEK_CCALL(MSK_appendcons(lp(),
-														 info->GetNumberOfConstraintsOfGroup(CG_Algebraic)));
+  auto n_alg_all = info->GetNumberOfConstraintsOfGroup(CG_Algebraic);
+  if (n_alg_cons_ < n_alg_all)
+    MOSEK_CCALL(MSK_appendcons(lp(), n_alg_all - n_alg_cons_));
 }
 std::string& myreplace(std::string& s, const std::string& from, const std::string& to)
 {
@@ -61,6 +62,9 @@ void MosekModelAPI::SetLinearObjective( int iobj, const LinearObjective& lo ) {
   if (iobj < 1) {
     MOSEK_CCALL(MSK_putobjsense(lp(),
       obj::Type::MAX == lo.obj_sense() ? MSK_OBJECTIVE_SENSE_MAXIMIZE : MSK_OBJECTIVE_SENSE_MINIMIZE));
+    for (auto i=NumVars(); i--; )           // Zero out linear part
+      MOSEK_CCALL(MSK_putcj(lp(), i, 0.0));
+    MOSEK_CCALL( MSK_putqobj(lp(), 0, NULL, NULL, NULL) );  // and QP part
     for (int i = 0; i < lo.num_terms(); i++) {
       MOSEK_CCALL(MSK_putcj(lp(), lo.vars()[i], lo.coefs()[i]));
     }
@@ -73,9 +77,9 @@ void MosekModelAPI::SetLinearObjective( int iobj, const LinearObjective& lo ) {
 /// Add QP terms to objective
 void AddObjQuadraticPart(MSKtask_t lp,
                          const QuadTerms& qt) {
-  auto coefs = qt.coefs();
-  auto vars1 = qt.vars1();
-  auto vars2 = qt.vars2();
+  std::vector<double> coefs = qt.coefs();
+  std::vector<int> vars1 = qt.vars1();
+  std::vector<int> vars2 = qt.vars2();
   for (auto i=coefs.size(); i--; ) {
     if (vars1[i]==vars2[i])
       coefs[i] *= 2;                 // MOSEK represents lower submatrix
@@ -158,9 +162,9 @@ void MosekModelAPI::AddConstraint(const LinConGE& lc)
 void AddConQuadraticPart(MSKtask_t lp,
                          int i_con,
                          const QuadTerms& qt) {
-  auto coefs = qt.coefs();
-  auto vars1 = qt.vars1();
-  auto vars2 = qt.vars2();
+  std::vector<double> coefs = qt.coefs();
+  std::vector<int> vars1 = qt.vars1();
+  std::vector<int> vars2 = qt.vars2();
   for (auto i=coefs.size(); i--; ) {
     if (vars1[i]==vars2[i])
       coefs[i] *= 2;                 // MOSEK represents lower submatrix

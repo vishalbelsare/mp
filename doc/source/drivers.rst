@@ -6,8 +6,8 @@ Solver drivers
 
 .. _flat-solvers:
 
-'Flat API' solvers
-------------------
+'Flat API' and new expression-based solvers
+-----------------------------------------------
 
 For solvers with traditional 'flat' (no expression trees) APIs,
 non-linear AMPL expressions need to be reformulated.
@@ -19,20 +19,23 @@ For example, ``max(a, b)`` is translated into a constraint
 
 which is in turn reformulated for
 MIP or passed to the solver natively (e.g., Gurobi: `GRBaddgenconstrMax`).
-See the :ref:`modeling-guide`.
 
-There are several implementations, see :ref:`modeling-overview`.
+A late-2024 extension to MP allows passing expression trees
+to solvers, see :ref:`supported-constraints`.
+
+The implemented drivers are listed in :ref:`modeling-overview`.
 
 
 .. _expression-solvers:
 
-Expression-based solvers
-------------------------
+Old-API expression-based solvers
+--------------------------------------
 
-Expression-based solver APIs can efficiently map
-NL forests.
+Some older drivers map directly from NL file's model, without
+exploiting the automatic reformulation capabilites of MP.
 For example, AMPL expression
-``exp()`` maps to IBM ILOG Concert's ``IloExponent``. The library
+``exp()`` maps to IBM ILOG Concert's ``IloExponent``.
+The MP library
 has the following C++ drivers of this kind, all of which support
 `AMPL extensions for logic and constraint programming`__:
 
@@ -43,15 +46,18 @@ __ https://ampl.com/resources/logic-and-constraint-programming-extensions/
 
 - `Gecode <https://github.com/ampl/mp/tree/develop/solvers/gecode>`_
 
-- `JaCoP <https://github.com/ampl/mp/tree/develop/solvers/jacop>`_
+- `JaCoP <https://github.com/ampl/mp/tree/develop/solvers/jacop>`_ (unmaintained)
 
-- `LocalSolver <https://github.com/ampl/mp/tree/develop/solvers/localsolver>`_
+- `LocalSolver <https://github.com/ampl/mp/tree/develop/solvers/localsolver>`_ (unmaintained)
+
+For constraint programming with MP's reformulations, use the MP-based
+CP-SAT driver (see :ref:`modeling-overview`).
 
 
 Specialized drivers
 -------------------
 
-- `SOCP solver <https://github.com/ampl/mp/tree/develop/solvers/cplex>`_
+- `SOCP solver <https://github.com/ampl/mp/tree/develop/solvers/cplexsocp>`_
   uses IBM ILOG CPLEX to solve problems convertable to SOCP form.
 
 - `SSD solver <https://github.com/ampl/mp/tree/develop/solvers/ssdsolver>`_

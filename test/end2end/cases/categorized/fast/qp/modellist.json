@@ -13,7 +13,7 @@
     "name" : "ellipse_max_02",
     "objective" : 0.5312499452945747,
     "tags" : ["quadratic"],
-    "coment_options": "Not all constraints are cones, Mosek needs QP",
+    "comment_options": "Not all constraints are cones, Mosek needs QP",
     "options": {
       "mosek_options": "cvt:socp=0"
     }
@@ -23,10 +23,23 @@
     "objective" : -3.16227757,
     "tags" : ["quadratic", "qcpdual"],
     "options": {
-      "ANYSOLVER_options": "qcpdual=1"
+      "ANYSOLVER_options": "qcpdual=1",
+      "mp2nl_options": "solver_options='qcpdual=1'"
     },
     "values": {
-      "_con[1]": -1.5807796451888148
+      "_con[1]": -1.581437391665411
+    }
+  },
+  {
+    "name" : "ellipse_min_rot qcpdual=1",
+    "objective" : -4.09096180,
+    "tags" : ["quadratic", "qcpdual"],
+    "options": {
+      "ANYSOLVER_options": "qcpdual=1",
+      "mp2nl_options": "solver_options='qcpdual=1'"
+    },
+    "values": {
+      "_con[1]": -2.04401
     }
   },
   {
@@ -34,7 +47,8 @@
     "objective" : 1.4928017587112605,
     "tags" : ["quadratic", "qcpdual"],
     "options": {
-      "ANYSOLVER_options": "qcpdual=1"
+      "ANYSOLVER_options": "qcpdual=1",
+      "mp2nl_options": "solver_options='qcpdual=1'"
     },
     "values": {
       "_con[1]": 0.26111523051780217,
@@ -46,10 +60,11 @@
     "objective" : 0.5312499452945747,
     "tags" : ["quadratic", "qcpdual"],
     "options": {
-      "ANYSOLVER_options": "qcpdual=1"
+      "ANYSOLVER_options": "qcpdual=1",
+      "mp2nl_options": "solver_options='qcpdual=1'"
     },
     "values": {
-      "_con[3]": 1.000067023601818
+      "_con[3]": 1.000125448001466
     }
   },
   {
@@ -57,7 +72,8 @@
     "objective" : 0.8,
     "tags" : ["quadraticnonconvex", "mipstart"],
     "options": {
-      "gurobi_options": "nonconvex=2 debug=1"
+      "mp_options": "debug=1",
+      "copt_options": "debug=1 nonconvex=2"
     },
     "values": {
       "_var[1].test_ini_mip": 0.5,
@@ -69,7 +85,7 @@
     "objective" : 3.6,
     "tags" : ["quadraticnonconvex", "mipstart"],
     "options": {
-      "gurobi_options": "nonconvex=2 debug=1"
+      "mp_options": "debug=1 cvt:bigM=1e5"
     },
     "values": {
       "_var[1].test_ini_mip": 0.5,
@@ -82,7 +98,8 @@
     "tags" : ["quadratic_obj"],
     "options": {
       "highs_options": "timelim=3",
-      "comment_highs": "takes too long as of Sept 2022"
+      "comment_highs": "takes too long as of Sept 2022",
+      "scip_options": "timelim=3"
     }
   },
   {
@@ -91,19 +108,29 @@
     "tags" : ["quadratic_obj"]
   },
   {
+    "name" : "quad_obj_repeated cvt:quadobj=0",
+    "objective" : 0,
+    "tags" : ["quadratic_obj"],
+    "options": {
+      "mp_options": "cvt:quadobj=0"
+    }
+  },
+  {
     "name" : "prod_bin_var_01",
     "objective" : 5,
-    "tags" : ["quadratic", "quadraticnonconvex"],
+    "tags" : ["prod_with_bin_var"],
     "options": {
       "cplex_options": "qp:target=3",
       "copt_options": "cvt:quadcon=0",
       "comment_copt": "non convex constraint, linearise. But Gurobi convexifies it?"
-    }  },
+    }
+  },
   {
-    "name" : "prod_bin_var_02_obj",
+    "name" : "prod_bin_var_02_obj cvt:prod=0",
     "objective" : 1,
     "tags" : ["quadraticnonconvex", "quadratic_obj"],
     "options": {
+      "mp_options": "cvt:prod=0",
       "cplex_options": "qp:target=3",
       "highs_options": "cvt:quadobj=0",
       "copt_options": "cvt:quadobj=0 cvt:quadcon=0",
@@ -111,17 +138,238 @@
     }
   },
   {
+    "name" : "prod_bin_var_02_obj",
+    "objective" : 1,
+    "tags" : ["quadraticnonconvex", "quadratic_obj"],
+    "tags_do_to" : ["prod_with_bin_var"],
+    "comment": "For Highs we leave QP terms in the objective but it rejects MIQP"
+  },
+  {
     "name" : "prod_01_obj",
     "tags" : ["quadraticnonconvex", "quadratic_obj"],
     "options": {
       "gurobi_options": "nonconvex=2",
       "cplex_options": "qp:target=3",
-      "highs_options": "cvt:quadobj=0",
-      "copt_options": "cvt:quadobj=0 cvt:quadcon=0",
+      "highs_options": "cvt:quadobj=0 cvt:plapprox:reltol=0.001",
+      "copt_options": "cvt:quadobj=0 cvt:quadcon=0 cvt:plapprox:reltol=0.001",
       "comment_highs_copt": "non convex objective, linearise"
     },
     "values": {
       "if abs(Prod01+8.5)<0.01 then 1 else 0": 1
+    }
+  },
+  {
+    "name" : "prod_bin_03",
+    "objective" : 2,
+    "tags" : ["linear"]
+  },
+  {
+    "name" : "prod_bin_03 cvt:prod=0",
+    "objective" : 2,
+    "tags" : ["quadratic", "quadraticnonconvex"],
+    "options": {
+      "mp_options": "cvt:prod=0"
+    }
+  },
+  {
+    "name" : "prod_bin_04",
+    "objective" : -1,
+    "tags" : ["linear"]
+  },
+  {
+    "name" : "prod_bin_04 cvt:prod=0",
+    "objective" : -1,
+    "tags" : ["quadratic", "quadraticnonconvex"],
+    "options": {
+      "mp_options": "cvt:prod=0"
+    }
+  },
+  {
+    "name" : "prod_bin_06",
+    "objective" : -1,
+    "tags" : ["linear"]
+  },
+  {
+    "name" : "unify_quad_expr_01",
+    "objective" : 20.08553692214343,
+    "tags" : ["quadratic", "quadraticnonconvex"],
+    "options": {
+      "mp_options": "debug=1"
+    },
+    "values": {
+      "Initial.flat0__quadfn": 1
+    }
+  },
+  {
+    "name" : "regr",
+    "objective" : 10164.112986010467,
+    "tags" : ["quadratic_obj"],
+    "options": {
+      "mp_options": "debug=2"
+    },
+    "values": {
+      "Initial.stat__qp2p_complete_runs": 1,
+      "Initial.stat__qp2p_outmults": 80,
+      "Initial.stat__qp2p_qpterms": 465,
+      "Initial.stat__qp_outmults": 0,
+      "Initial.flat1_obj_quad + (1-Initial.option___cvt_quadobj)": 1,
+      "Initial.flat1__quadfn": 0,
+      "Initial.flat1__quadle - (1-Initial.option___cvt_quadobj)": 0,
+      "Initial.flat1__quadeq": 0,
+      "Initial.flat1__quadge": 0,
+      "Initial.flat1__quadrange": 0,
+      "Initial.flat0__linfn": 0,
+      "Initial.flat0__linle": 0,
+      "Initial.flat0__lineq": 0,
+      "Initial.flat0__linge": 0,
+      "Initial.flat0__linrange": 1
+    }
+  },
+  {
+    "name" : "regr cvt:dvelim=0",
+    "objective" : 10164.112986010467,
+    "tags" : ["quadratic"],
+    "options": {
+      "mp_options": "debug=1 dvelim=0"
+    },
+    "values": {
+      "Initial.stat__qp2p_complete_runs": 0,
+      "Initial.stat__qp2p_bucket_runs": 2,
+      "Initial.stat__qp2p_outmults": 0,
+      "Initial.stat__qp2p_qpterms": 80,
+      "Initial.stat__qp_outmults": 110,
+      "Initial.stat__qp_outmult_qpterms": 110,
+      "Initial.flat1_obj_quad + (1-Initial.option___cvt_quadobj)": 1,
+      "Initial.flat1__quadfn": 0,
+      "Initial.flat1__quadle - (1-Initial.option___cvt_quadobj)": 1,
+      "Initial.flat1__quadeq": 0,
+      "Initial.flat1__quadge": 0,
+      "Initial.flat1__quadrange": 0,
+      "Initial.flat0__linfn": 50,
+      "Initial.flat0__linle": 0,
+      "Initial.flat1__lineq + Initial.flat1__linrange": 51,
+      "Initial.flat0__linge": 0
+    }
+  },
+  {
+    "name" : "regr cvt:pow2_as_qp=0",
+    "objective" : 10164.112986010467,
+    "tags" : ["nonlinear", "formulas"],
+    "options": {
+      "mp_options": "debug=1 pow2_as_qp=0",
+      "copt_options": "debug=1 pow2_as_qp=0 acc:_expr=1"
+    },
+    "values": {
+      "Initial.stat__qp2p_complete_runs": 0,
+      "Initial.stat__qp2p_bucket_runs": 2,
+      "Initial.stat__qp2p_outmults": 0,
+      "Initial.stat__qp2p_qpterms": 0,
+      "Initial.stat__qp_outmults": 30,
+      "Initial.stat__qp_outmult_qpterms": 0,
+      "Initial.flat1_obj_lin + Initial.flat1_obj_nonlin": 1,
+      "Initial.flat1__quadfn": 0,
+      "Initial.flat1__quadle": 0,
+      "Initial.flat1__quadeq": 0,
+      "Initial.flat1__quadge": 0,
+      "Initial.flat1__quadrange": 0,
+      "Initial.flat0__powc": 80,
+      "Initial.flat0__linfn": 80,
+      "Initial.flat0__linle": 0,
+      "Initial.flat0__lineq": 0,
+      "Initial.flat0__linge": 0,
+      "Initial.flat0__linrange": 1
+    }
+  },
+  {
+    "name" : "regr cvt:qp2passes=0",
+    "objective" : 10164.112986010467,
+    "tags" : ["quadratic_obj"],
+    "options": {
+      "mp_options": "debug=1 cvt:qp2passes=0"
+    },
+    "values": {
+      "Initial.stat__qp2p_complete_runs": 0,
+      "Initial.stat__qp2p_bucket_runs": 0,
+      "Initial.stat__qp2p_outmults": 0,
+      "Initial.stat__qp2p_qpterms": 0,
+      "Initial.stat__visitsum_bucket_runs": 2,
+      "Initial.stat__visitsum_bucket_outmults": 170,
+      "Initial.stat__visitsum_bucket_qpterms": 495,
+      "Initial.stat__qp_outmults": 110,
+      "Initial.stat__qp_outmult_qpterms": 23310,
+      "Initial.flat1_obj_quad + (1-Initial.option___cvt_quadobj)": 1,
+      "Initial.flat1__quadfn": 0,
+      "Initial.flat1__quadle - (1-Initial.option___cvt_quadobj)": 0,
+      "Initial.flat1__quadeq": 0,
+      "Initial.flat1__quadge": 0,
+      "Initial.flat1__quadrange": 0,
+      "Initial.flat0__linfn": 0,
+      "Initial.flat0__linle": 0,
+      "Initial.flat0__lineq": 0,
+      "Initial.flat0__linge": 0,
+      "Initial.flat0__linrange": 1
+    }
+  },
+  {
+    "name" : "regr cvt:multoutcard=0",
+    "objective" : 10164.112986010467,
+    "tags" : ["quadratic_obj"],
+    "options": {
+      "mp_options": "debug=1 cvt:multoutcard=0"
+    },
+    "values": {
+      "Initial.stat__qp2p_complete_runs": 0,
+      "Initial.stat__qp2p_bucket_runs": 2,
+      "Initial.stat__qp2p_outmults": 0,
+      "Initial.stat__qp2p_qpterms": 110,
+      "Initial.stat__qp_outmults": 30,
+      "Initial.stat__qp_outmult_qpterms": 30,
+      "Initial.flat1_obj_quad + (1-Initial.option___cvt_quadobj)": 1,
+      "Initial.flat1__quadfn - (1-Initial.option___cvt_quadobj)": 0,
+      "Initial.flat1__quadle": 0,
+      "Initial.flat1__quadeq": 0,
+      "Initial.flat1__quadge": 0,
+      "Initial.flat1__quadrange": 0,
+      "Initial.flat0__linfn": 80,
+      "Initial.flat0__linle": 0,
+      "Initial.flat0__lineq": 0,
+      "Initial.flat0__linge": 0,
+      "Initial.flat0__linrange": 1
+    }
+  },
+  {
+    "name": "ellipse_max QCP options CPLEX",
+    "tags": [ "quadratic" ],
+    "objective": 1.4928017587112605,
+    "options": {
+      "cplex_options": "qcpconvergetol=1e-8 qtolin=0 miqcpstrat=1"
+    }
+  },
+  {
+    "name": "ellipse_max new MP options CPLEX",
+    "tags": [ "quadratic" ],
+    "objective": 1.4928017587112605,
+    "options": {
+      "cplex_options": "pre:folding=1 mip:dive=1 mip:cardls=1 lp:dynamicrows=0 pre:qcpduals=2 pre:qpmakepsd=0 mip:eplin=1e-4 alg:feasrelax:tol=1e-5 tech:writelevel=1 alg:siftalg=2 lim:siftiter=1000 tech:siftdisplay=1 tech:tunemeasure=2"
+    },
+    "solvers": ["cplex"]
+  },
+  {
+    "name": "mp2nl wrapper native",
+    "files": [
+      "mp2nl_wrapper_native.run"
+    ],
+    "tags": [
+      "script",
+      "quadratic_obj"
+    ],
+    "solvers": [
+      "knitro"
+    ],
+    "objective": 1,
+    "values": {
+      "x": 1,
+      "solve_result_num": 0
     }
   }
 ]

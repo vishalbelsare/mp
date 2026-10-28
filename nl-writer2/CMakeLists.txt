@@ -1,9 +1,28 @@
 cmake_minimum_required(VERSION 3.10)
 
+
+option(NLW2_LIB_DMGAY_DTOA
+  "NLW2_LIB: use David M. Gay's dtoa() implementation" OFF)
+if (NLW2_LIB_DMGAY_DTOA)
+  message(STATUS
+    "   NLW2_LIB: using David M. Gay's dtoa() implementation."
+  )
+  # Minimum MacOS target to enable C++17 std::filesystem
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15)
+else()
+  message(STATUS
+    "   NLW2_LIB: using std::to_chars().\n"
+    "     On MacOS, requires OS 13.4 or higher."
+  )
+  set(CMAKE_OSX_DEPLOYMENT_TARGET 13.4)
+endif()
+
+
+## project() after OSX_DEPLOYMENT_TARGET
 project(NLWriter2)
 
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 
@@ -20,16 +39,21 @@ set(NLW2_EXAMPLE_PATH ${NLW2_DIR}/examples)
 set(NLW2_LIB_FILES
 	${NLW2_SRC_PATH}/nl-writer2.cc
   ${NLW2_SRC_PATH}/nl-utils.cc
-	${NLW2_SRC_PATH}/dtoa.c
 	${NLW2_SRC_PATH}/nl-solver.cc
 )
+if (NLW2_LIB_DMGAY_DTOA)
+  set(NLW2_LIB_FILES
+    ${NLW2_LIB_FILES}
+    ${NLW2_SRC_PATH}/dtoa.cc
+  )
+endif()
 set(NLW2_INC_FILES
 	${NLW2_INCLUDE_PATH}/mp/nl-solver-basics-c.h
 	${NLW2_INCLUDE_PATH}/mp/nl-model.h
 	${NLW2_INCLUDE_PATH}/mp/nl-solver.h
 	${NLW2_INCLUDE_PATH}/mp/nl-solver.hpp
-	${NLW2_INCLUDE_PATH}/mp/nl-feeder.h
-	${NLW2_INCLUDE_PATH}/mp/nl-writer2.h
+  ${NLW2_INCLUDE_PATH}/mp/nl-feeder.h
+  ${NLW2_INCLUDE_PATH}/mp/nl-writer2.h
 	${NLW2_INCLUDE_PATH}/mp/nl-writer2.hpp
 	${NLW2_INCLUDE_PATH}/mp/nl-writer2-misc.h
   ${NLW2_INCLUDE_PATH}/mp/nl-utils.h
@@ -51,6 +75,15 @@ if (NLW2_LIB_ORIG_HDR)
 	target_compile_definitions(
 		${NLW2_LIB_NAME} PUBLIC NL_LIB2_ORIG_HDR)
 endif()
+if (NLW2_LIB_DMGAY_DTOA)
+  target_compile_definitions(
+    ${NLW2_LIB_NAME} PUBLIC NLW2_LIB_DMGAY_DTOA)
+endif()
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+  target_link_libraries(${NLW2_LIB_NAME} PRIVATE stdc++fs)
+endif()
+
 
 # C API sources
 set(NLW2_C_API_LIB_FILES

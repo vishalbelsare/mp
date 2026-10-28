@@ -1,6 +1,158 @@
 Summary of recent updates to CBCMP for AMPL
 ===========================================
 
+
+## 20260414
+- Changes in MP, in particular new naming for
+  auxiliaries.
+
+
+## 20251210
+- Option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- New option *obj:multi:options* to control
+  whether multi-objective option suffixes
+  are used.
+
+
+## 20251015
+- Changes in MP
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options cvt:pre:unnest, cvt:pre:sort).
+  - Option cvt:pre:boundlogarg (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    pre:feastolrel both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options cvt:compl, cvt:compl:eps control
+    complementarity reformulations.
+
+
+## 20250617
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250424
+- Changes in MP
+  - Option cvt:qp2pass (default even faster parsing
+    of quadratics)
+
+
+## 20250329
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250308
+- Changes in MP.
+
+
+## 20250206
+- Updated to CBC version 2.10.12
+
+
+## 20241128
+- Fixed a bug that made CBC segfault for some models
+
+
+## 20241124
+- Greatly improved model generation time by pushing all the model
+  at once to CBC
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+
+## 20240425
+- Fixed reporting of feasible solutions if time limits
+  are reached
+
+
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use 
+    MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
 ## 20240115
 - *Solve result codes*.
   - List codes by running (solver) -!

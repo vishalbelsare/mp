@@ -1,7 +1,9 @@
 #ifndef GCGCOMMON_H
 #define GCGCOMMON_H
 
+#include <vector>
 #include <string>
+#include <map>
 
 #include "mp/backend-to-model-api.h"
 
@@ -18,9 +20,9 @@ struct SCIP_ProbData
    SCIP_VAR**            vars;               /**< variables in the order given by AMPL */
    int                   nvars;              /**< number of variables */
 
-   SCIP_CONS**           linconss;           /**< linear constraints in the order given by AMPL */
-   int                   i;                  /**< shows free slot of linear constraints */
-   int                   nlinconss;          /**< number of linear constraints */
+   std::vector<SCIP_CONS*>  linconss;        /**< linear constraints in the order given by AMPL */
+   int                   i = 0;              /**< shows free slot of linear constraints */
+   int                   nlinconss = 0;      /**< number of linear constraints */
 
    gcg::PARTIALDECOMP*   decomp;             /**< user partialdecomp */
 };
@@ -30,6 +32,9 @@ namespace mp {
 /// Information shared by both
 /// `GcgBackend` and `GcgModelAPI`
 struct GcgCommonInfo {
+  GCG* getGCG() const { return gcg_; }
+  void setGCG(GCG* gcg) { gcg_ = gcg; }
+
   SCIP* getSCIP() const { return scip_; }
   void setSCIP(SCIP* scip) { scip_ = scip; }
 
@@ -37,6 +42,7 @@ struct GcgCommonInfo {
   void setPROBDATA(SCIP_PROBDATA* probdata) { probdata_ = probdata; }
 
 private:
+  GCG* gcg_ = NULL;
   SCIP* scip_ = NULL;
   SCIP_PROBDATA* probdata_;
 };
@@ -46,13 +52,30 @@ private:
 class GcgCommon :
     public Backend2ModelAPIConnector<GcgCommonInfo> {
 public:
-  /// These methods access Gcg options. Used by AddSolverOption()
+  /// These methods access Gcg options. Used by AddSolverOption().
+  /// A value rejected by GCG/SCIP raises with the AMPL option name
+  /// and the valid range.
   void GetSolverOption(const char* key, int& value) const;
   void SetSolverOption(const char* key, int value);
+  void GetSolverOption(const char* key, SCIP_Longint& value) const;
+  void SetSolverOption(const char* key, SCIP_Longint value);
   void GetSolverOption(const char* key, double& value) const;
   void SetSolverOption(const char* key, double value);
   void GetSolverOption(const char* key, std::string& value) const;
   void SetSolverOption(const char* key, const std::string& value);
+
+  /// Set a parameter of any type from its textual value
+  void SetNativeParam(const std::string& name, const std::string& value);
+
+  /// Remember the AMPL option name of a parameter (for messages)
+  void RecordOptionName(const char* key, const std::string& ampl_name)
+  { optNames_[key] = ampl_name; }
+  /// The AMPL option name recorded for a parameter, or the key
+  std::string AmplOptionName(const char* key) const;
+
+  /// The parameter record; raises for an unknown key
+  SCIP_PARAM* Param(const char* key) const;
+  SCIP_PARAMTYPE ParamType(const char* key) const;
 
   /// GCG own infinity
   double Infinity() const;
@@ -64,12 +87,19 @@ protected:
   void OpenSolver();
   void CloseSolver();
 
+  /// Raise on a failed parameter set
+  void CheckOptionSet(SCIP_RETCODE code, const char* key,
+                      const std::string& value) const;
+
   int NumLinCons() const;
   int NumVars() const;
   int NumObjs() const;
   int NumQPCons() const;
   int NumSOSCons() const;
   int NumIndicatorCons() const;
+
+private:
+  std::map<std::string, std::string> optNames_;
 };
 
 

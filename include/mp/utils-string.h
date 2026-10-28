@@ -1,7 +1,7 @@
 /*
- String utils
+ String utils.
 
- Copyright (C) 2021 AMPL Optimization Inc
+ Copyright (C) 2024 AMPL Optimization Inc.
 
  Permission to use, copy, modify, and distribute this software and its
  documentation for any purpose and without fee is hereby granted,
@@ -13,7 +13,7 @@
  regard to this software, including all implied warranties of
  merchantability and fitness.  In no event shall the author be liable
  for any special, indirect or consequential damages or any damages
- whatsoever resulting from loss of use	, data or profits, whether in an
+ whatsoever resulting from loss of use, data or profits, whether in an
  action of contract, negligence or other tortious action, arising out
  of or in connection with the use or performance of this software.
 
@@ -25,15 +25,55 @@
 
 #include <vector>
 #include <string>
+#include <string_view>
 
 namespace mp {
 
+/// Skip spaces
+const char *SkipSpaces(const char *s);
+/// Skip non-spaces
+const char *SkipNonSpaces(const char *s);
+/// Skip to end
+const char* SkipToEnd(const char* s);
+/// Skip to mathcing quote
+const char* SkipToMatchingQuote(const char* s);
+
+/// Split string
 std::vector<std::string> split_string(const char* );
 
+/// begins_with
+bool begins_with(std::string_view fullString, std::string_view start);
+
+/// https://stackoverflow.com/questions/874134/find-out-if-string-ends-with-another-string-in-c
+bool ends_with(std::string_view fullString, std::string_view ending);
+
+
+/// Split string
 template <class Str>
 inline
 std::vector<std::string> split_string(const Str& str)
 { return split_string(str.c_str()); }
+
+/// Class logging strings to file or screen or memory etc.
+class BasicLogger {
+public:
+  /// Destruct
+  virtual ~BasicLogger() { }
+
+  /// Is the log active and ok?
+  virtual bool IsOpen() const = 0;
+
+  /// append string.
+  ///
+  /// @return whether all ok.
+  template<class Str>
+  bool Append (const Str& s) { return Append(s.c_str()); }
+
+  /// Append string.
+  ///
+  /// @return whether all ok.
+  virtual bool Append(const char* ) = 0;
+};
 
 }  // namespace mp
 

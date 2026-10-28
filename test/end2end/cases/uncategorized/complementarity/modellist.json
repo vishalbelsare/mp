@@ -2,52 +2,100 @@
   {
     "name" : "bertsek",
     "tags" : ["linear", "continuous", "complementarity"],
-    "files" : ["bertsek.mod", "bertsek.dat"]
+    "files" : ["bertsek.mod", "bertsek.dat"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   },
   {
     "name" : "choi",
     "tags" : ["linear", "continuous", "complementarity"],
-    "files" : ["choi.mod", "choi.dat"]
+    "files" : ["choi.mod", "choi.dat"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   },
     {
     "name" : "econ",
     "tags" : ["linear", "continuous", "complementarity"],
-    "files" : ["econ.mod", "econ.dat"]
+    "files" : ["econ.mod", "econ.dat"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "econnl",
     "tags" : ["nonlinear", "continuous", "complementarity"],
-    "files" : ["econnl.mod", "econnl.dat"]
+    "files" : ["econnl.mod", "econnl.dat"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   } ,{
     "name" : "ehl_def",
     "tags" : ["nonlinear", "continuous", "complementarity"],
-    "files" : ["ehl_def.mod"]
+    "files" : ["ehl_def.mod"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "ehl_kost",
     "tags" : ["nonlinear", "continuous", "complementarity"],
-    "files" : ["ehl_kost.mod"]
+    "files" : ["ehl_kost.mod"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "josephy",
     "tags" : ["quadratic", "continuous", "complementarity"],
-    "files" : ["josephy.mod", "josephy.dat"]
+    "files" : ["josephy.mod", "josephy.dat"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "kojshin",
     "tags" : ["quadratic", "continuous", "complementarity"],
-    "files" : ["kojshin.mod"]
+    "files" : ["kojshin.mod"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "munson1",
     "tags" : ["linear", "continuous", "complementarity"],
-    "files" : ["munson1.mod"]
+    "files" : ["munson1.mod"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "nash",
     "tags" : ["nonlinear", "continuous", "complementarity"],
-    "files" : ["nash.run"]
+    "files" : ["nash.run"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "obstacle",
     "tags" : ["nonlinear", "continuous", "complementarity"],
-    "files" : ["obstacle.run"]
+    "files" : ["obstacle.run"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }, {
     "name" : "pies",
     "tags" : ["linear", "continuous", "complementarity"],
-    "files" : ["pies.mod", "pies.dat"]
+    "files" : ["pies.mod", "pies.dat"],
+    "values": {
+      "max{i in 1 .. _nccons} abs(_ccon[i])": { "max": 1e-5 },
+      "min{i in 1 .. _ncons} _con[i].slack": { "min": -1e-5 }
+    }
   }
 ]

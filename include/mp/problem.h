@@ -25,11 +25,18 @@
 
 #include <cstddef>  // for std::size_t
 #include <limits>
+#include <climits>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 
 #include "mp/expr.h"
+#include "mp/expr-linear.h"
 #include "mp/suffix.h"
+#include "mp/utils-vec.h"
+
+/// From asl e.g., when BUILD=asl,smpswriter
+#undef obj_name
 
 /// Maximum index of a variable, objective or constraint.
 #ifndef MP_MAX_PROBLEM_ITEMS
@@ -39,85 +46,12 @@
 
 namespace mp {
 
-/// Linear expression (not affine: no constant term)
-/// used in `mp::BasicProblem<>`
-class LinearExpr {
- private:
-  class Term {
-   private:
-    int var_index_;
-    double coef_;
-
-    friend class LinearExpr;
-
-    Term(int var_index, double coef) : var_index_(var_index), coef_(coef) {}
-
-   public:
-    int var_index() const { return var_index_; }
-    double coef() const { return coef_; }
-    void set_coef(double c) { coef_=c; }
-    void operator*=(double n) { coef_*=n; }
-  };
-  std::vector<Term> terms_;
-
- public:
-  LinearExpr() { }
-
-  template <class CoefVec=std::vector<double>, class VarVec=std::vector<int> >
-  LinearExpr(CoefVec&& c, VarVec&& v) {
-    ConstructFrom(std::forward<CoefVec>(c), std::forward<VarVec>(v));
-  }
-  template <int N>
-  LinearExpr(const std::array<double, N>& c, const std::array<int, N>& v) {
-    ConstructFrom(c, v);
-  }
-
-  int num_terms() const { return static_cast<int>(terms_.size()); }
-  int capacity() const { return static_cast<int>(terms_.capacity()); }
-
-  int var_index(int i) const { return terms_[i].var_index(); }
-  double coef(int i) const { return terms_[i].coef(); }
-  void set_coef(int i, double c) { terms_[i].set_coef(c); }
-
-  typedef std::vector<Term>::const_iterator const_iterator;
-
-  const_iterator begin() const { return terms_.begin(); }
-  const_iterator end() const { return terms_.end(); }
-
-  typedef std::vector<Term>::iterator iterator;
-
-  iterator begin() { return terms_.begin(); }
-  iterator end() { return terms_.end(); }
-
-  void AddTerm(int var_index, double coef) {
-    terms_.push_back(Term(var_index, coef));
-  }
-
-  void AddTerms(const LinearExpr& li) {
-    terms_.insert(end(), li.begin(), li.end());
-  }
-
-  template <class CoefVec=std::vector<double>, class VarVec=std::vector<int> >
-  void ConstructFrom(CoefVec&& c, VarVec&& v) {
-    assert(c.size()==v.size());
-    assert(0==num_terms());
-    Reserve(c.size());
-    for (size_t i=0; i<c.size(); ++i)
-      AddTerm(v[i], c[i]);
-  }
-
-  void Reserve(std::size_t num_terms) {
-    terms_.reserve(num_terms);
-  }
-
-  void SortTerms();
-};
-
 /// Placeholder for whatever params of BasicProblem<>
 template < class A = int >
 struct BasicProblemParams {
   using Alloc = A;
 };
+
 
 /// An optimization problem
 template <typename ProblemParams = BasicProblemParams<> >
@@ -130,6 +64,10 @@ class BasicProblem : public ExprFactory, public SuffixManager {
   typedef mp::CountExpr CountExpr;
   typedef mp::Reference Reference;
   typedef internal::ExprTypes ExprTypes;
+
+  /// Default value for 'common expression usage position',
+  /// means 'common expression not provided in the input'.
+  static constexpr int CommonExprPosDflt() { return INT_MIN; }
 
  private:
   /// Names
@@ -152,6 +90,10 @@ class BasicProblem : public ExprFactory, public SuffixManager {
   /// Variable deleted flags.
   /// Only markers
   std::vector<bool> is_var_deleted_;
+
+  int n_objs_total_ {};        // in the NL file
+  bool multiobj_ {};
+  int objno_used_ {};
 
   /// Packed objective type information.
   /// is_obj_max_[i] specifies whether objective i is maximization.
@@ -195,9 +137,17 @@ class BasicProblem : public ExprFactory, public SuffixManager {
 
   /// Linear parts of common expressions.
   std::vector<LinearExpr> linear_exprs_;
-
   /// Nonlinear parts of common expressions.
   std::vector<NumericExpr> nonlinear_exprs_;
+  /// Usage position k: <0 for objective -k-1,
+  /// >0 for constraint k-1, 0 if in several places.
+  /// @note The initial value means 'ce not provided'.
+  /// @warning This seems to be different between AMPL
+  /// versions: sometimes objectives follow above cons.
+  /// @note What if only used in other common expressions?
+  /// Then AMPL still seems to report the top-level item
+  /// where this DV is used.
+  std::vector<int> common_expr_positions_;
 
   /// Initial values for variables.
   std::vector<double> initial_values_;
@@ -269,6 +219,18 @@ class BasicProblem : public ExprFactory, public SuffixManager {
   }
 
 public:
+  /// Redefine MakeCommonExpr() to fail during NL input
+  /// when an unprovided common expr is referenced.
+  /// Only in debug build - those CEs which are indeed needed
+  /// are checked during expression visits.
+  auto MakeCommonExpr(int index) {
+    MP_ASSERT__RAISE(common_expr(index).is_known(),
+                     fmt::format(
+                         "Defined variable {} not provided in the input.\n"
+                         "Please contact AMPL support.",
+                         index));
+    return ExprFactory::MakeCommonExpr(index);
+  }
 
   ////////////////////////////////////////////////////////////////////
   /// BasicProblemItem
@@ -475,13 +437,72 @@ public:
   /** Returns the number of variables. */
   int num_vars() const { return static_cast<int>(vars_.size()); }
 
+  /// Normal variable name
+  const std::string& var_name(int i) {
+    assert(0<=i && i<num_vars());
+    return item_name(i, var_names_, num_vars(), "_x[");
+  }
+  /// Defined variable name
+  const std::string& dvar_name(int i) {
+    assert(0<=i && i<num_common_exprs());
+    i += num_vars();
+    return item_name(i, var_names_,
+                     num_vars()+num_common_exprs(), "_x[",
+                     num_vars(), "_sdvar[");
+  }
+  /// Constraint name
+  const std::string& con_name(int i) {
+    assert(0<=i && i<num_cons());
+    return item_name(i, con_names_,
+                     num_cons(),  "_CON",
+                     num_algebraic_cons(), "_LCON");
+  }
+  /// Objective name
+  const std::string& obj_name(int i) {
+    assert(0<=i && i<num_objs());
+    return item_name(i, obj_names_, num_objs(), "_OBJ");
+  }
 
-  /** Returns the variable names (if present). */
-  std::vector<std::string>& var_names() { return var_names_; }
+protected:
+  /// Return names[i].
+  /// Generate names[old_size...n-1] if needed,
+  /// so that the whole vector is valid,
+  /// even if only some variables/cons/objs were queried.
+  /// From [n2], name 'stub2'[i-n2] is given.
+  /// If stub/stub2 ends with a '[', ']' is added after the index.
+  static const std::string& item_name(
+      int i, std::vector<std::string>& names,
+      int n, const char* stub,
+      int n2=std::numeric_limits<int>::max(),
+      const char* stub2=nullptr);
+
+public:
+  /** Returns the variable names (if present).
+   *  After normal variables follow defined variables.
+   */
+  const std::vector<std::string>& var_names() { return var_names_; }
   /** Returns the constraint names (if present). */
-  std::vector<std::string>& con_names() { return con_names_; }
+  const std::vector<std::string>& con_names() { return con_names_; }
   /** Returns the objective names (if present). */
-  std::vector<std::string>& obj_names() { return obj_names_; }
+  const std::vector<std::string>& obj_names() { return obj_names_; }
+
+  /// Variable namer
+  class VarNamer {
+  public:
+    /// Construct
+    VarNamer(BasicProblem& p) : p_(p) { }
+    /// Normal var name
+    const std::string& vname(int i) const
+    { return p_.var_name(i); }
+    /// Defined var name
+    const std::string& dvname(int i) const
+    { return p_.dvar_name(i); }
+  private:
+    BasicProblem& p_;
+  };
+
+  /// Obtain variable  namer
+  VarNamer GetVarNamer() { return VarNamer(*this); }
 
   /** Returns the number of objectives. */
   int num_objs() const { return static_cast<int>(linear_objs_.size()); }
@@ -551,7 +572,14 @@ public:
     explicit Range(const BasicProblem *p) : problem_(p) {}
 
    public:
-    class iterator : public std::iterator<std::forward_iterator_tag, T> {
+    class iterator {
+     public:
+      using iterator_category = std::forward_iterator_tag;
+      using value_type = T;
+      using difference_type = std::ptrdiff_t;
+      using pointer = const T*;
+      using reference = T;
+
      private:
       T item_;
 
@@ -669,7 +697,7 @@ public:
 
   /// Set name vectors
   void SetVarNames(std::vector<std::string> names) {
-    assert((size_t)num_vars() == names.size());
+    assert((size_t)(num_vars() + num_common_exprs()) == names.size());
     var_names_ = std::move( names );
   }
   void SetConNames(std::vector<std::string> names) {
@@ -775,6 +803,7 @@ public:
 
   /// Adds an objective.
   /// Returns a builder for the linear part of an objective expression.
+  /// @note Not used from NL Reader.
   LinearObjBuilder AddObj(obj::Type type, NumericExpr expr,
                           int num_linear_terms = 0);
 
@@ -782,6 +811,20 @@ public:
     return AddObj(type, NumericExpr(), num_linear_terms);
   }
 
+  /// Receive info on the objective numbers
+  /// and multiobj/objno selection
+  void NotifyObjChoice(int n_obj_total, bool multiobj, int objno) {
+    n_objs_total_ = n_obj_total;
+    assert(linear_objs_.capacity()   // GetSuffixSize() uses this
+           == (size_t)n_obj_total);
+    multiobj_ = multiobj;
+    objno_used_ = objno;
+  }
+
+  /// This is called in the very beginning with the total number
+  /// of objectives (properly considering possible objno option).
+  /// However the capacity of \a linear_objs_, etc. is the total
+  /// number of objectives in the NL file, reserved in SetInfo().
   void AddObjs(int num_objs) {
     linear_objs_.resize(num_objs);
     is_obj_max_.resize(num_objs);
@@ -986,6 +1029,9 @@ public:
     BasicCommonExpr(typename Item::Problem *p, int index) : Item(p, index) {}
 
    public:
+    /// Whether the common expression has been provided in the input
+    bool is_known() const { return CommonExprPosDflt() != position(); }
+
     /// Returns the linear part of the common expression.
     const LinearExpr &linear_expr() const {
       return this->problem_->linear_exprs_[this->index_];
@@ -996,6 +1042,12 @@ public:
       std::size_t index = this->index_;
       return index < this->problem_->nonlinear_exprs_.size() ?
             this->problem_->nonlinear_exprs_[index] : NumericExpr();
+    }
+
+    /// Usage position k: 0 if used in several places
+    /// (even when nested.)
+    int position() const {
+      return this->problem_->common_expr_positions_[this->index_];
     }
 
     template <typename OtherItem>
@@ -1031,7 +1083,14 @@ public:
       this->problem_->nonlinear_exprs_[this->index_] = expr;
     }
 
-    void set_position(int) const {}
+    /// Not useful yet:
+    /// AMPL seems to report this considering top-level usage
+    void set_position(int k) const {
+      MP_ASSERT_ALWAYS(!this->is_known(),
+                       fmt::format("Defined variable {} repeated",
+                                   this->index_));
+      this->problem_->common_expr_positions_[this->index_] = k;
+    }
   };
 
   /// Returns the common expression at the specified index.
@@ -1050,6 +1109,7 @@ public:
     MP_ASSERT(num_exprs < MP_MAX_PROBLEM_ITEMS, "too many expressions");
     linear_exprs_.push_back(LinearExpr());
     nonlinear_exprs_.push_back(expr);
+    common_expr_positions_.push_back(CommonExprPosDflt());
     return MutCommonExpr(this, static_cast<int>(num_exprs));
   }
 
@@ -1058,6 +1118,7 @@ public:
     std::size_t new_size = val(SafeInt<int>(linear_exprs_.size()) + num_exprs);
     linear_exprs_.resize(new_size, LinearExpr());
     nonlinear_exprs_.resize(new_size, NumericExpr());
+    common_expr_positions_.resize(new_size, CommonExprPosDflt());
   }
 
   /// Sets a complementarity condition.
@@ -1130,50 +1191,94 @@ public:
   }
 
   ////////////////////////// HIGH-LEVEL SUFFIX I/O //////////////////////////////
+
+  /// \brief Resultant subvector for suffix type #184.
+  /// Design like this because
+  /// we manage suffix sizes in BasicProblem<>.
+  template <class T>
+  std::pair<int, int> GetSufSubvec(
+      const BasicMutSuffix<T>& suf) const {
+    if (mp::suf::OBJ == suf.kind_pure())
+      if (!multiobj_ && objno_used_) {
+        // objno==0: no objective... but we ignore it
+        return {objno_used_-1, 1};
+      }
+    return {0, suf.num_values()};
+  }
+
+  /// Report suffix.
+  /// For multiple objectives, receives 1-element vectors
+  /// when solving with objno>0.
   template <class T>
   void ReportSuffix(const SuffixDef<T>& sufdef,
                     ArrayRef<T> values) {
     if (values.empty())
       return;
     auto suf = FindOrCreateSuffix(sufdef);
-    auto suf_size = suf.num_values();
-    /// Check this because Converter or solver can add more variables
-    assert(suf_size <= (int)values.size());
-    for (auto i=suf_size; i--; ) {
-      suf.set_value(i, values[i]);
+    auto subvec = GetSufSubvec(suf);
+    /// Check "<=" because Converter or solver can add more variables
+    assert(subvec.second <= (int)values.size());
+    for (auto i=std::min(subvec.second, (int)values.size());
+         i--; ) {
+      suf.set_value(i + subvec.first, values[i]);
     }
   }
 
   template <class T>
   ArrayRef<T> ReadSuffix_OneTypeOnly(const SuffixDef<T>& sufdef) {
-    auto suf = FindSuffix(sufdef);
+    auto suf = FindSuffix(sufdef, true);
     if (!suf)
       return {};
-    return suf.get_values();
+    auto subvec = GetSufSubvec(suf);
+    auto suf_full = suf.get_values();
+    return
+        {suf_full.begin() + subvec.first, (size_t)subvec.second};
   }
 
-  /// Read integer suffix
-  ArrayRef<int> ReadIntSuffix(const SuffixDef<int>& sufdef)
-  { return ReadSuffix_OneTypeOnly(sufdef); }
+  /// Read integer suffix.
+  /// Fails if the suffix as available as double.
+  ArrayRef<int> ReadIntSuffix(const SuffixDef<int>& sufdef) {
+    auto suf_int = ReadSuffix_OneTypeOnly(sufdef);
+    if (!suf_int) {
+      auto suf_dbl = ReadSuffix_OneTypeOnly(sufdef.to_type<double>());
+      MP_ASSERT_ALWAYS(!suf_dbl,
+                       fmt::format("Expected integer suffix .{}, kind {},\n"
+                                   "but fractional values provided",
+                                   sufdef.name(), sufdef.kind()));
+      return {};
+    }
+    return suf_int;
+  }
 
   /// Read double suffix.
   /// If absent but an integer suffix with the same name exists,
-  /// take that
-  ArrayRef<double> ReadDblSuffix(const SuffixDef<double>& sufdef) {
+  /// take that.
+  /// @param fint: if not NULL,
+  ///   is set to 1 iff the suffix was integer.
+  ArrayRef<double> ReadDblSuffix(
+      const SuffixDef<double>& sufdef, int* fint=nullptr) {
     auto suf_dbl = ReadSuffix_OneTypeOnly(sufdef);
+    if (fint)
+      *fint = 0;
     if (!suf_dbl) {
       auto suf_int = ReadSuffix_OneTypeOnly(sufdef.to_type<int>());
+      if (fint)
+        *fint = int(bool(suf_int));
       if (suf_int)
         return std::vector<double>(suf_int.begin(), suf_int.end());
     }
     return suf_dbl;
   }
 
+  /// @param noOutSuf: don't return out-only suffixes,
+  ///   useful for MP2NL with *debug=1*.
   template <class T>
-  BasicMutSuffix<T> FindSuffix(const SuffixDef<T>& sufdef) {
+  BasicMutSuffix<T> FindSuffix(
+      const SuffixDef<T>& sufdef, bool noOutSuf = false) {
     auto main_kind = (suf::Kind)(sufdef.kind() & suf::KIND_MASK);
     auto suf_raw = suffixes(main_kind).Find(sufdef.name());
-    if (suf_raw)
+    if (suf_raw &&
+        (!noOutSuf || !(suf::OUTONLY & suf_raw.kind())))
       return Cast< BasicMutSuffix<T> >( suf_raw );
     return BasicMutSuffix<T>();
   }
@@ -1182,11 +1287,11 @@ public:
   BasicMutSuffix<T> FindOrCreateSuffix(const SuffixDef<T>& sufdef) {
     auto main_kind = (suf::Kind)(sufdef.kind() & suf::KIND_MASK);
     auto suf_raw = FindSuffix(sufdef);
-    auto suf_size = GetSuffixSize(main_kind);    // can be < values.size()
     if (suf_raw) {
       suf_raw.or_kind(suf::OUTPUT);
       return suf_raw;
     }
+    auto suf_size = GetSuffixSize(main_kind);
     return suffixes(main_kind).template
             Add<T>(sufdef.name(), sufdef.kind() | suf::OUTPUT,
                    suf_size, sufdef.table());

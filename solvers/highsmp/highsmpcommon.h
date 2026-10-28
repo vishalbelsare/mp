@@ -2,6 +2,9 @@
 #define HIGHSCOMMON_H
 
 #include <string>
+#include <memory> // For std::unique_ptr
+#include <vector>
+#include <map>
 
 extern "C" {
   #include "interfaces/highs_c_api.h"
@@ -9,59 +12,145 @@ extern "C" {
 
 #include "mp/backend-to-model-api.h"
 #include "mp/format.h"
+#include "mp/arrayref.h"
+#include "highsmploader.h"
 
-namespace mp {
+namespace mp{ 
+
+
+  /// Class to store the objectives as they are added from the Model API.
+  /// Need a shared reference because priorities and other properties are known
+  /// only in the backend, and all info must be set at the same time
+  /// (currently in HighsBackend::InputExtras)
+  class AccObjectives {
+    int numVars_;
+    std::vector<double> coeffs;
+    std::vector<HighsInt> senses;
+    bool hadNativeMultiObj_ = false;
+    bool clearedOnce_, hadEmulatedMultiObj_ = false;
+    std::vector<double> weight, offset, reltol, abstol;
+    std::vector<int> priority;
+    HighsLoader* parent_;
+  public:
+    void setLoader(HighsLoader * l) {
+      parent_ = l;
+    }
+    AccObjectives() : hadNativeMultiObj_(false), 
+                      clearedOnce_(false),
+                      hadEmulatedMultiObj_(false) {    
+    }
+    void setNumVars(int numVars) {
+      numVars_ = numVars;
+    }
+    void add(const ::std::vector<int>& indices,
+      const ::std::vector<double>& c, bool max) {
+      if (clearedOnce_) hadEmulatedMultiObj_ = true;
+      if (senses.size() > 0) hadNativeMultiObj_ = true;
+      coeffs.resize(coeffs.size() + numVars_);
+      for (auto i = 0; i < c.size(); i++)
+        coeffs[senses.size() * numVars_ + indices[i]] = c[i];
+      senses.push_back(max ? kHighsObjSenseMaximize : kHighsObjSenseMinimize);
+    }
+    void setInHighs(void* highs) const;
+    void setAllInHighs(void* highs) const;
+    void setWeights(ArrayRef<double> w);
+    void setOffsets(ArrayRef<double> o);
+    void setRelTols(ArrayRef<double> r);
+    void setAbsTols(ArrayRef<double> r);
+    void setPriorities(ArrayRef<int> p);
+    int numObjs() const { return senses.size(); }
+    bool hadNativeMultiObj() { return hadNativeMultiObj_; }
+    bool hadEmulatedMultiObj() { return hadEmulatedMultiObj_; }
+    void clear() {
+      coeffs.clear();
+      senses.clear();
+      weight.clear();
+      offset.clear();
+      reltol.clear();
+      abstol.clear();
+      priority.clear();
+      clearedOnce_ = true;
+      
+    }
+  };
+
 
 /// Information shared by both
 /// `HighsBackend` and `HighsModelAPI`
-struct HighsCommonInfo {
-  void* lp() const { return lp_; }
-  void set_lp(void* lp) { lp_ = lp; }
-private:
-  void*      lp_ = nullptr;
-};
+  struct HighsCommonInfo {
+    void* lp() const { return lp_; }
+    void set_lp(void* lp) { lp_ = lp; }
+    HighsCommonInfo() { }
+
+    AccObjectives& accObjectives() {
+      return *accobjs_;
+    }
+    HighsLoader& loader() const { return *loader_; }
+    void setLoader(std::shared_ptr<HighsLoader> l) {
+      loader_ = std::move(l);
+      
+    }
+    void setObjectiveAccumulator(std::shared_ptr<AccObjectives> acc) {
+      accobjs_ = std::move(acc);
+      accobjs_->setLoader(loader_.get());
+    }
+  private:
+    std::shared_ptr<AccObjectives> accobjs_;
+    void* lp_ = nullptr;
+    mutable std::shared_ptr <HighsLoader> loader_;
+  };
 
 
 /// Common API for Highs classes
-class HighsCommon :
+  class HighsCommon :
     public Backend2ModelAPIConnector<HighsCommonInfo> {
-public:
-  /// These methods access Highs options. Used by AddSolverOption()
-  void GetSolverOption(const char* key, int& value) const;
-  void SetSolverOption(const char* key, int value);
-  void GetSolverOption(const char* key, double& value) const;
-  void SetSolverOption(const char* key, double value);
-  void GetSolverOption(const char* key, std::string& value) const;
-  void SetSolverOption(const char* key, const std::string& value);
+  public:
+    /// These methods access HiGHS options. Used by AddSolverOption()
+    void GetSolverOption(const char* key, int& value) const;
+    void SetSolverOption(const char* key, int value);
+    void GetSolverOption(const char* key, double& value) const;
+    void SetSolverOption(const char* key, double value);
+    void GetSolverOption(const char* key, std::string& value) const;
+    void SetSolverOption(const char* key, const std::string& value);
 
-  double myinf = 0;
-  double Infinity() {
-     if (!myinf) myinf = Highs_getInfinity(lp());
-     return myinf;
-  }
-  double MinusInfinity() { return -Infinity(); }
+    /// Remember the AMPL option name(s) of a HiGHS option, for messages
+    void RememberOptionName(const char* key, const char* names);
+    /// AMPL option name of a HiGHS option, or the HiGHS name itself
+    std::string AmplOptionName(const char* key) const;
 
-protected:
-  void OpenSolver();
-  void CloseSolver();
+    double myinf = 0;
+    double Infinity() {
+      if (!myinf) myinf = loader().Highs_getInfinity(lp());
+      return myinf;
+    }
+    double MinusInfinity() { return -Infinity(); }
 
-  int64_t getInt64Attr(const char* name)  const;
-  int getIntAttr(const char* name) const;
-  double getDblAttr(const char* name) const;
+  protected:
+    /// Report a value rejected by HiGHS: let HiGHS print its own
+    /// diagnostic (the valid range) by retrying with logging on,
+    /// then throw with the AMPL option name.
+    template <class Setter>
+    void RaiseOptionRejected(const char* key, const std::string& value,
+                             Setter retry);
+    std::map<std::string, std::string> optNames_;
+    // Only successfully applied options; query current values when cloning.
+    // This avoids option-name allocations owned by the vendor DLL's CRT.
+    std::map<std::string, int> appliedOptions_;
 
-  int NumLinCons() const;
-  int NumVars() const;
-  int NumObjs() const;
-  int NumQPCons() const;
-  int NumSOSCons() const;
-  int NumIndicatorCons() const;
-};
+    void LoadHighsLibrary(bool gpu);
+    void OpenSolver();
+    void CloseSolver();
 
+    int64_t getInt64Attr(const char* name)  const;
+    int getIntAttr(const char* name) const;
+    double getDblAttr(const char* name) const;
 
-/// Convenience macro
-// TODO This macro is useful to automatically throw an error if a function in the 
-// solver API does not return a valid errorcode. In this mock driver, we define it 
-// ourselves, normally this constant would be defined in the solver's API.
+    int NumLinCons() const;
+    int NumVars() const;
+    int NumObjs();
+
+  };
+
 #define HIGHS_CCALL( call ) do { \
   int e = (call); \
   if (e != kHighsStatusOk && e != kHighsStatusWarning) \

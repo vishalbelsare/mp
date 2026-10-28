@@ -1,3 +1,7 @@
+#include <algorithm>
+#include <cstdio>
+#include <memory>
+#include <sstream>
 #include <vector>
 #include <climits>
 #include <cfloat>
@@ -88,10 +92,12 @@ bool GcgBackend::IsQCP() const {
 
 ArrayRef<double> GcgBackend::PrimalSolution() {
   SCIP* scip = getSCIP();
+  auto sol = SCIPgetBestSol(scip);
+  if (!sol)
+    return {};
   int num_vars = NumVars();
   std::vector<double> x(num_vars);
-  for (int i = 0; i < num_vars; i++)
-    x[i] = SCIPgetSolVal(scip, SCIPgetBestSol(scip), getPROBDATA()->vars[i]);
+  GCG_CCALL( SCIPgetSolVals(scip, sol, num_vars, getPROBDATA()->vars, x.data()) );
   return x;
 }
 
@@ -100,12 +106,13 @@ pre::ValueMapDbl GcgBackend::DualSolution() {
 }
 
 ArrayRef<double> GcgBackend::DualSolution_LP() {
+  // SCIP prints the reason (presolving performed, ...) if asked
+  if (IsMIP() || !SCIPisDualSolAvailable(getSCIP(), verbose_mode()))
+    return {};
   int num_cons = NumLinCons();
   std::vector<double> pi(num_cons);
-  if (SCIPisDualSolAvailable(getSCIP(), TRUE)) {
-    for (int i=0; i < num_cons; i++)
-      GCG_CCALL( SCIPgetDualSolVal(getSCIP(), getPROBDATA()->linconss[i], pi.data() + i, NULL) );
-  }
+  for (int i=0; i < num_cons; i++)
+    GCG_CCALL( SCIPgetDualSolVal(getSCIP(), getPROBDATA()->linconss[i], pi.data() + i, NULL) );
   return pi;
 }
 
@@ -113,11 +120,11 @@ double GcgBackend::ObjectiveValue() const {
   return SCIPgetPrimalbound(getSCIP());
 }
 
-double GcgBackend::NodeCount() const {
+int GcgBackend::NodeCount() const {
   return SCIPgetNNodes(getSCIP());
 }
 
-double GcgBackend::SimplexIterations() const {
+int GcgBackend::SimplexIterations() const {
   return SCIPgetNPrimalLPIterations(getSCIP()) + SCIPgetNDualLPIterations(getSCIP());
 }
 
@@ -125,8 +132,29 @@ int GcgBackend::BarrierIterations() const {
   return SCIPgetNBarrierLPIterations(getSCIP());
 }
 
+std::map<std::string, std::variant<int, double, std::string>>
+GcgBackend::SolutionStats() {
+    std::map<std::string, std::variant<int, double, std::string>> stats;
+    stats["simplex_iterations"] = SimplexIterations();
+    stats["barrier_iterations"] = BarrierIterations();
+    stats["node_count"] = NodeCount();
+    return stats;
+}
+
+
 void GcgBackend::ExportModel(const std::string &file) {
   GCG_CCALL( SCIPwriteOrigProblem(getSCIP(), file.data(), NULL, FALSE) );
+}
+
+void GcgBackend::DoWriteProblem(const std::string& name) {
+  ExportModel(name);
+}
+
+void GcgBackend::DoWriteSolution(const std::string& name) {
+  std::unique_ptr<FILE, int(*)(FILE*)> file(std::fopen(name.c_str(), "w"), std::fclose);
+  if (!file)
+    MP_RAISE(fmt::format("Cannot open '{}' for writing the solution", name));
+  GCG_CCALL( SCIPprintBestSol(getSCIP(), file.get(), FALSE) );
 }
 
 
@@ -136,24 +164,24 @@ void GcgBackend::SetInterrupter(mp::Interrupter *inter) {
   //GCG_CCALL( CPXsetterminate (env(), &terminate_flag) );
 }
 
-void GcgBackend::Solve() {
-  InputDecomposition();
-
-  if (!storedOptions_.exportFile_.empty())
-    ExportModel(storedOptions_.exportFile_);
-  if (!storedOptions_.paramRead_.empty())
-    GCG_CCALL( SCIPreadParams(getSCIP(), storedOptions_.paramRead_.c_str()) );
-  if (!storedOptions_.logFile_.empty())
-    SCIPsetMessagehdlrLogfile(getSCIP(), storedOptions_.logFile_.c_str());
+void GcgBackend::ApplyParamSettings() {
+  auto* scip = getSCIP();
   if (storedOptions_.heuristics_ != 0)
-    GCG_CCALL( SCIPsetHeuristics(getSCIP(), (SCIP_PARAMSETTING)storedOptions_.heuristics_, TRUE) );
+    GCG_CCALL( SCIPsetHeuristics(scip, (SCIP_PARAMSETTING)storedOptions_.heuristics_, TRUE) );
   if (storedOptions_.cuts_ != 0)
-    GCG_CCALL( SCIPsetSeparating(getSCIP(), (SCIP_PARAMSETTING)storedOptions_.cuts_, TRUE) );
+    GCG_CCALL( SCIPsetSeparating(scip, (SCIP_PARAMSETTING)storedOptions_.cuts_, TRUE) );
   if (storedOptions_.presolvings_ != 0)
-    GCG_CCALL( SCIPsetSeparating(getSCIP(), (SCIP_PARAMSETTING)storedOptions_.presolvings_, TRUE) );
-  
-  GCG_CCALL(GCGsolve(getSCIP()));
+    GCG_CCALL( SCIPsetPresolving(scip, (SCIP_PARAMSETTING)storedOptions_.presolvings_, TRUE) );
+  if (0 == storedOptions_.presolve_)
+    GCG_CCALL( SCIPsetPresolving(scip, SCIP_PARAMSETTING_OFF, TRUE) );
+}
 
+void GcgBackend::Solve() {
+  ApplyParamSettings();
+  InputDecomposition();
+  if (!storedOptions_.paramWrite_.empty())
+    GCG_CCALL( SCIPwriteParams(getSCIP(), storedOptions_.paramWrite_.c_str(), FALSE, FALSE) );
+  GCG_CCALL(GCGsolve(getGCG()));
   WindupGCGSolve();
 }
 
@@ -165,7 +193,7 @@ void GcgBackend::ReportResults() {
 }
 
 void GcgBackend::ReportGCGResults() {
-  SetStatus( ConvertGCGStatus() );
+  SetStatus( GetSolveResult() );
   AddGCGMessages();
   if (need_multiple_solutions())
     ReportGCGPool();
@@ -186,16 +214,27 @@ double GcgBackend::getPoolObjective(int i)
   obj = SCIPgetSolOrigObj(getSCIP(), SCIPgetSols(getSCIP())[i]);
   return obj;
 }
+bool GcgBackend::AcceptPoolSolution(double obj, double best) const {
+  double gap = std::fabs(obj - best);
+  if (storedOptions_.poolGapAbs_ >= 0.0 && gap > storedOptions_.poolGapAbs_)
+    return false;
+  if (storedOptions_.poolGap_ >= 0.0 && gap > storedOptions_.poolGap_ * std::fabs(best))
+    return false;
+  return true;
+}
+
 void GcgBackend::ReportGCGPool() {
   if (!IsMIP())
     return;
-  int iPoolSolution = -1;
-  int nsolutions = SCIPgetNSols(getSCIP());
-  
-  while (++iPoolSolution < nsolutions) {
-    ReportIntermediateSolution(
-      { getPoolSolution(iPoolSolution),
-        {}, { getPoolObjective(iPoolSolution) } });
+  int nsolutions = SCIPgetNSols(getSCIP());        // sorted best-first
+  if (storedOptions_.poolLimit_ >= 0)
+    nsolutions = std::min(nsolutions, storedOptions_.poolLimit_);
+  double best = nsolutions ? getPoolObjective(0) : 0.0;
+  for (int i = 0; i < nsolutions; ++i) {
+    double obj = getPoolObjective(i);
+    if (!AcceptPoolSolution(obj, best))
+      break;                                       // sorted: the rest is worse
+    ReportIntermediateSolution({ getPoolSolution(i), {}, { obj } });
   }
 }
 
@@ -213,7 +252,7 @@ void GcgBackend::AddGCGMessages() {
   }
 }
 
-std::pair<int, std::string> GcgBackend::ConvertGCGStatus() {
+std::pair<int, std::string> GcgBackend::GetSolveResult() {
   namespace sol = mp::sol;
   SCIP_STATUS status = SCIPgetStatus(getSCIP());
   auto solu = SCIPgetBestSol(getSCIP());
@@ -251,6 +290,12 @@ std::pair<int, std::string> GcgBackend::ConvertGCGStatus() {
     return { sol::LIMIT_NO_FEAS_SOFTMEM, "memory limit, no solution" };
   case SCIP_STATUS_GAPLIMIT:
     return { sol::LIMIT_FEAS_GAP, "gap limit" };
+  case SCIP_STATUS_PRIMALLIMIT:
+    return { sol::LIMIT_FEAS_BESTOBJ, "primal bound limit (lim:bestobjstop)" };
+  case SCIP_STATUS_DUALLIMIT:
+    if (hasSol)
+      return { sol::LIMIT_FEAS_BESTBND, "dual bound limit (lim:bestbndstop), feasible solution" };
+    return { sol::LIMIT_NO_FEAS_BESTBND, "dual bound limit (lim:bestbndstop), no solution" };
   case SCIP_STATUS_SOLLIMIT:
     return { sol::LIMIT_FEAS_NUMSOLS, "solution limit" };
   case SCIP_STATUS_BESTSOLLIMIT:
@@ -285,11 +330,41 @@ std::pair<int, std::string> GcgBackend::ConvertGCGStatus() {
 
 
 void GcgBackend::FinishOptionParsing() {
+  if (!storedOptions_.paramRead_.empty())
+    GCG_CCALL( SCIPreadParams(getSCIP(), storedOptions_.paramRead_.c_str()) );
+  ApplyInlineParams();
+  SetUpLogging();
+}
+
+void GcgBackend::ApplyInlineParams() {
+  for (const auto& text: storedOptions_.inlineParams_) {
+    std::string pairs = text;
+    std::replace(pairs.begin(), pairs.end(), '=', ' ');
+    std::istringstream in(pairs);
+    std::string name, value;
+    while (in >> name) {
+      if (!(in >> value))
+        MP_RAISE(fmt::format(
+            "tech:optionnative: no value for GCG parameter '{}'", name));
+      SetNativeParam(name, value);
+    }
+  }
+}
+
+void GcgBackend::SetUpLogging() {
   if (storedOptions_.outlev_ == 1)
-     SetSolverOption("display/verblevel", 4);
-  int v=-1;
-  GetSolverOption("display/verblevel", v);
-  set_verbose_mode(v>0);
+    SetSolverOption("display/verblevel", 4);
+  int verblevel = 0;
+  GetSolverOption("display/verblevel", verblevel);
+  bool console_log = verblevel > 0;
+  if (!storedOptions_.logFile_.empty()) {
+    SCIPsetMessagehdlrLogfile(getSCIP(), storedOptions_.logFile_.c_str());
+    if (!console_log)             // log file only: full log, quiet console
+      SetSolverOption("display/verblevel", 4);
+  }
+  // Quiet also hides GCG's detection messages at verblevel 0
+  SCIPsetMessagehdlrQuiet(getSCIP(), !console_log);
+  set_verbose_mode(console_log);
 }
 
 
@@ -298,8 +373,8 @@ static const mp::OptionValueInfo lp_values_method[] = {
   { "s", "automatic simplex (default)", -1},
   { "p", "primal simplex", 0},
   { "d", "dual simplex", 1},
-  { "b", "barrier", 2},
-  { "c", "barrier with crossover", 3},
+  { "b", "barrier (SoPlex has none: runs the dual simplex)", 2},
+  { "c", "barrier with crossover (SoPlex: dual simplex)", 3},
 };
 
 static const mp::OptionValueInfo values_pricing[] = {
@@ -323,15 +398,22 @@ static const mp::OptionValueInfo childsel[] = {
 };
 
 static const mp::OptionValueInfo scoretype[] = {
-  { "maxwhi", "max white", 0},
-  { "border", "border area", 1},
-  { "classi", "classic", 2},
-  { "forswh", "max foreseeing white", 3},
-  { "spfwh", "ppc-max-white (default)", 4},
-  { "fawh", "max foreseeing white with aggregation info", 5},
-  { "spfawh", "ppc-max-white with aggregation info", 6},
-  { "bender", "experimental benders score", 7},
-  { "strong", "strong decomposition score", 8}
+  { "maxwhi", "max white", "maxwhi"},
+  { "border", "border area", "border"},
+  { "classi", "classic", "classi"},
+  { "forswh", "max foreseeing white", "forswh"},
+  { "spfwh", "ppc-max-white (default)", "spfwh"},
+  { "fawh", "max foreseeing white with aggregation info", "fawh"},
+  { "spfawh", "ppc-max-white with aggregation info", "spfawh"},
+  { "bender", "experimental benders score", "bender"},
+  { "strong", "strong decomposition score", "strong"}
+};
+
+static const mp::OptionValueInfo values_pricing_sorting[] = {
+  { "i", "indices", 0},
+  { "d", "dual solutions of the convexity constraints", 1},
+  { "r", "reliability (default)", 2},
+  { "l", "last pricing results", 3}
 };
 
 static const mp::OptionValueInfo mode[] = {
@@ -355,18 +437,13 @@ void GcgBackend::InitCustomOptions() {
     "0*/1: Whether to write GCG log lines (chatter) to stdout and to file.",
     storedOptions_.outlev_);
 
-  AddSolverOption("tech:outlev-native outlev-native",
-    "0*/1/2/3/4/5: Whether to write GCG log lines (chatter) to stdout and to file (native output level of SCIP).",
+  AddGcgOption("tech:outlevnative outlevnative tech:outlev-native outlev-native",
+    "0*/1/2/3/4/5: Native SCIP verbosity level (display/verblevel; the SCIP "
+    "default is 4, the driver's is 0). tech:outlev=1 selects 4.",
     "display/verblevel", 0, 5);
 
-  AddStoredOption("tech:exportfile writeprob writemodel",
-    "Specifies the name of a file where to export the model before "
-    "solving it. This file name can have extension ``.lp``, ``.mps``, etc. "
-    "Default = \"\" (don't export the model).",
-    storedOptions_.exportFile_);
-
   AddStoredOption("tech:logfile logfile",
-    "Log file name.",
+    "Log file name. Without tech:outlev=1 the log goes to the file only.",
     storedOptions_.logFile_);
 
   AddStoredOption("tech:optionnativeread optionnativeread tech:param:read param:read",
@@ -374,16 +451,30 @@ void GcgBackend::InitCustomOptions() {
     "The suffix on a parameter file should be .set.\n",
     storedOptions_.paramRead_);
 
-  AddSolverOption("alg:method method lpmethod",
+  AddStoredOption("tech:optionnativewrite optionnativewrite tech:param:write param:write",
+    "Name of a GCG parameter file (.set) to write before solving, "
+    "with all parameters of the original problem.",
+    storedOptions_.paramWrite_);
+
+  AddListOption("tech:optionnative optionnative optnative tech:param param",
+    "General way to set any GCG/SCIP parameter of the original problem; "
+    "the value should be a quoted string (delimited by ' or \") containing "
+    "one or more 'name=value' or 'name value' pairs separated by spaces, "
+    "for example 'pricing/masterpricer/eagerfreq=5 detection/maxrounds 2'. "
+    "Can appear more than once. Cannot be used to query current "
+    "parameter values.",
+    storedOptions_.inlineParams_);
+
+  AddGcgOption("alg:method method lpmethod",
     "LP algorithm for solving initial LP relaxations:\n"
     "\n.. value-table::\n", "lp/initalgorithm", lp_values_method, "s");
 
-  AddSolverOption("alg:remethod remethod relpmethod",
+  AddGcgOption("alg:remethod remethod relpmethod",
     "LP algorithm for resolving LP relaxations if a starting basis exists:\n"
     "\n.. value-table::\n", "lp/resolvealgorithm", lp_values_method, "s");
 
   /////////////////////// BRANCHING ///////////////////////
-  AddSolverOption("branch:preferbinary preferbinary",
+  AddGcgOption("branch:preferbinary preferbinary",
     "0/1: whether branching on binary variables should be preferred"
     "\n"
     "  | 0 - Binary variables should not be preferred on branching (default)\n"
@@ -391,68 +482,68 @@ void GcgBackend::InitCustomOptions() {
     "branching/preferbinary", 0, 1);
 
   //////////////////////// CUTS //////////////////////////
-  AddSolverOption("cut:dircutoffdistweight dircutoffdistweight",
+  AddGcgOption("cut:dircutoffdistweight dircutoffdistweight",
     "Weight of directed cutoff distance in cut score calculation (default: 0.0)",
     "cutselection/hybrid/dircutoffdistweight", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("cut:efficacyweight efficacyweight",
+  AddGcgOption("cut:efficacyweight efficacyweight",
     "Weight of efficacy in cut score calculation (default: 1.0)",
     "cutselection/hybrid/efficacyweight", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("cut:intsupportweight intsupportweight",
+  AddGcgOption("cut:intsupportweight intsupportweight",
     "Weight of integral support in cut score calculation (default: 0.1)",
     "cutselection/hybrid/intsupportweight", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("cut:minortho minortho",
-    "Minimal orthogonality for a cut to enter the LP (default: 0.9)",
-    "cutselection/hybrid/minortho", 0.0, SCIP_REAL_MAX);
+  AddGcgOption("cut:minortho minortho",
+    "Minimal orthogonality for a cut to enter the LP (0..1; default: 0.9)",
+    "cutselection/hybrid/minortho", 0.0, 1.0);
 
-  AddSolverOption("cut:minorthoroot minorthoroot",
-    "Minimal orthogonality for a cut to enter the LP in the root node (default: 0.1)",
-    "cutselection/hybrid/minorthoroot", 0.0, SCIP_REAL_MAX);
+  AddGcgOption("cut:minorthoroot minorthoroot",
+    "Minimal orthogonality for a cut to enter the LP in the root node (0..1; default: 0.9)",
+    "cutselection/hybrid/minorthoroot", 0.0, 1.0);
 
-  AddSolverOption("cut:objparalweight objparalweight",
+  AddGcgOption("cut:objparalweight objparalweight",
     "Weight of objective parallelism in cut score calculation (default: 0.1)",
     "cutselection/hybrid/objparalweight", 0.0, SCIP_REAL_MAX);
 
 
-  AddSolverOption("cut:maxcuts maxcuts",
+  AddGcgOption("cut:maxcuts maxcuts",
     "Maximal number of cuts separated per separation round (0: disable local separation; default: 100)",
     "separating/maxcuts", 0, INT_MAX);
 
-  AddSolverOption("cut:maxcutsroot maxcutsroot",
-    "Maximal number of separated cuts at the root node (0: disable root node separation; default: 2000)",
+  AddGcgOption("cut:maxcutsroot maxcutsroot",
+    "Maximal number of separated cuts per separation round at the root node (0: disable root node separation; default: 2000)",
     "separating/maxcutsroot", 0, INT_MAX);
 
-  AddSolverOption("cut:maxrounds",
+  AddGcgOption("cut:maxrounds",
     "Maximal number of separation rounds per node (default: -1: unlimited)",
     "separating/maxrounds", -1, INT_MAX);
 
-  AddSolverOption("cut:maxroundsroot",
+  AddGcgOption("cut:maxroundsroot",
     "Maximal number of separation rounds in the root node (default: -1: unlimited)",
     "separating/maxroundsroot", -1, INT_MAX);
 
-  AddSolverOption("cut:maxstallrounds",
+  AddGcgOption("cut:maxstallrounds",
     "Maximal number of consecutive separation rounds without objective or integrality improvement in local nodes (-1: no additional restriction; default: 1)",
     "separating/maxstallrounds", -1, INT_MAX);
 
-  AddSolverOption("cut:maxstallroundsroot",
+  AddGcgOption("cut:maxstallroundsroot",
     "Maximal number of consecutive separation rounds without objective or integrality improvement in the root node (-1: no additional restriction; default: 10)",
     "separating/maxstallroundsroot", -1, INT_MAX);
 
-  AddSolverOption("cut:minactivityquot",
+  AddGcgOption("cut:minactivityquot",
     "Minimum cut activity quotient to convert cuts into constraints during a restart (0.0: all cuts are converted; default: 0.8)",
     "separating/minactivityquot", 0.0, 1.0);
 
-  AddSolverOption("cut:minefficacy",
+  AddGcgOption("cut:minefficacy",
     "Minimal efficacy for a cut to enter the LP (default: 0.0001)",
     "separating/minefficacy", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("cut:minefficacyroot",
+  AddGcgOption("cut:minefficacyroot",
     "Minimal efficacy for a cut to enter the LP in the root node (default: 0.0001)",
     "separating/minefficacyroot", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("cut:poolfreq",
+  AddGcgOption("cut:poolfreq",
     "Separation frequency for the global cut pool (-1: disable global cut pool; 0: only separate pool at the root; default: 10)",
     "separating/poolfreq", -1, SCIP_MAXTREEDEPTH);
 
@@ -476,106 +567,141 @@ void GcgBackend::InitCustomOptions() {
     storedOptions_.heuristics_, 0, 3);
 
   //////////////////////// LIMITS ////////////////////////
-  AddSolverOption("lim:absgap absgap",
+  AddGcgOption("mip:gapabs mipgapabs lim:absgap absgap",
     "Solving stops, if the absolute gap = |primalbound - dualbound| is below the given value (default: 0.0)",
     "limits/absgap", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("lim:autorestartnodes",
+  AddGcgOption("lim:autorestartnodes",
     "If solve exceeds this number of nodes for the first time, an automatic restart is triggered (default: -1: no automatic restart)",
     "limits/autorestartnodes", -1, INT_MAX);
 
-  AddSolverOption("lim:bestsol",
+  AddGcgOption("lim:bestbndstop bestbndstop lim:dual",
+    "Solving stops, if the dual bound is at least as good as this value (default: no limit)",
+    "limits/dual", -SCIP_REAL_MAX, SCIP_REAL_MAX);
+
+  AddGcgOption("lim:bestobjstop bestobjstop lim:primal",
+    "Solving stops, if the primal bound is at least as good as this value (default: no limit)",
+    "limits/primal", -SCIP_REAL_MAX, SCIP_REAL_MAX);
+
+  AddGcgOption("lim:iter iterlim lp:iterlim",
+    "Iteration limit for each single LP solve of the original problem "
+    "(default: -1: no limit). Not a total limit.",
+    "lp/iterlim", -1, INT_MAX);
+
+  AddGcgOption("lim:bestsol",
     "Solving stops, if the given number of solution improvements were found (default: -1: no limit)",
     "limits/bestsol", -1, INT_MAX);
 
-  AddSolverOption("lim:gap gap",
+  AddGcgOption("mip:gap mipgap lim:gap gap",
     "Solving stops, if the relative gap = |primal - dual|/MIN(|dual|,|primal|) is below the given value, the gap is 'Infinity', if primal and dual bound have opposite signs (default: 0.0)",
     "limits/gap", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("lim:maxorigsol",
+  AddGcgOption("lim:maxorigsol",
     "Maximal number of solutions candidates to store in the solution storage of the original problem (default: 10)",
     "limits/maxorigsol", 0, INT_MAX);
 
-  AddSolverOption("lim:maxsol",
+  AddGcgOption("lim:maxsol",
     "Maximal number of solutions to store in the solution storage (default: 100)",
     "limits/maxsol", 1, INT_MAX);
 
-  AddSolverOption("lim:memory memory",
+  AddGcgOption("lim:memory memory memlim",
     "#maximal memory usage in MB; reported memory usage is lower than real memory usage! (default: 8796093022207.0)",
     "limits/memory", 0.0, (SCIP_Real)SCIP_MEM_NOLIMIT);
 
-  AddSolverOption("lim:nodes",
+  AddGcgOption("lim:nodes nodelim nodelimit",
     "Maximal number of nodes to process (default: -1: no limit)",
-    "limits/nodes", -1, (int)SCIP_LONGINT_MAX);
+    "limits/nodes", -1, INT_MAX);
 
-  AddSolverOption("lim:restarts",
+  AddGcgOption("lim:restarts",
     "Solving stops, if the given number of restarts was triggered (default: -1: no limit)",
     "limits/restarts", -1, INT_MAX);
 
-  AddSolverOption("lim:solutions",
+  AddGcgOption("lim:sol sollim solutionlimit lim:solutions",
     "Solving stops, if the given number of solutions were found (default: -1: no limit)",
     "limits/solutions", -1, INT_MAX);
 
-  AddSolverOption("lim:stallnodes",
+  AddGcgOption("lim:stallnodes",
     "Solving stops, if the given number of nodes was processed since the last improvement of the primal solution value (default: -1: no limit)",
-    "limits/stallnodes", -1, (int)SCIP_LONGINT_MAX);
+    "limits/stallnodes", -1, INT_MAX);
 
-  AddSolverOption("lim:time timelim timelimit time_limit",
+  AddGcgOption("lim:time timelim timelimit time_limit",
     "Limit on solve time (in seconds; default: 1e+20).",
     "limits/time", 0.0, 1e+20);
 
-  AddSolverOption("lim:totalnodes",
+  AddGcgOption("lim:totalnodes",
     "Maximal number of total nodes (incl. restarts) to process (default: -1: no limit)",
-    "limits/totalnodes", -1, (int)SCIP_LONGINT_MAX);
+    "limits/totalnodes", -1, INT_MAX);
 
   ////////////////////////// LP //////////////////////////
-  AddSolverOption("lp:pricing pricing",
+  AddGcgOption("lp:pricing pricing",
     "Pricing strategy:\n"
     "\n.. value-table::",
     "lp/pricing", values_pricing, "l");
 
-  AddSolverOption("lp:presolving",
+  AddGcgOption("lp:presolving",
     "0/1: whether presolving of LP solver should be used"
     "\n"
     "  | 0 - Presolving of LP solver should not be used\n"
     "  | 1 - Presolving of LP solver should be used (default).",
-    "lp/advanced/presolving", 0, 1);
+    "lp/presolving", 0, 1);
 
-  AddSolverOption("lp:threads",
+  AddGcgOption("lp:scaling pre:scale scale",
+    "LP scaling: 0 none, 1 normal (default), 2 aggressive.",
+    "lp/scaling", 0, 2);
+
+  AddGcgOption("lp:threads",
     "Number of threads used for solving the LP (default: 0: automatic)",
-    "lp/advanced/threads", 0, 64);
+    "lp/threads", 0, 64);
 
-  AddSolverOption("lp:alwaysgetduals alwaysgetfarkasduals alwaysgetduals",
+  AddGcgOption("lp:alwaysgetduals alwaysgetfarkasduals alwaysgetduals",
     "0/1: whether the Farkas duals should always be collected when an LP is found to be infeasible"
     "\n"
     "  | 0 - The Farkas duals should not always be collected when an LP is found to be infeasible (default)\n"
     "  | 1 - The Farkas duals should always be collected when an LP is found to be infeasible.",
     "lp/alwaysgetduals", 0, 1);
 
-  AddSolverOption("lp:solvedepth",
+  AddGcgOption("lp:solvedepth",
     "Maximal depth for solving LP at the nodes (default: -1: no depth limit)",
     "lp/solvedepth", -1, SCIP_MAXTREEDEPTH);
 
-  AddSolverOption("lp:solvefreq",
-    "Frequency for solving LP at the nodes (-1: never; 0: only root LP; default: 0)",
+  AddGcgOption("lp:solvefreq",
+    "Frequency for solving LP at the nodes (-1: never; 0: only root LP; default: 1)",
     "lp/solvefreq", -1, SCIP_MAXTREEDEPTH);
 
+  ///////////////////////// SOLUTION POOL /////////////////////////
+  AddStoredOption("sol:poollimit poollimit ams_limit solnlimit",
+    "Limit on the number of alternative solutions reported "
+    "(options sol:stub, sol:count); default 10, -1: all solutions stored "
+    "by GCG (at most lim:maxsol).",
+    storedOptions_.poolLimit_, -1, INT_MAX);
+
+  AddStoredOption("sol:poolgap poolgap ams_eps",
+    "Relative tolerance for reporting alternative solutions "
+    "(default: no limit).",
+    storedOptions_.poolGap_, -1.0, SCIP_REAL_MAX);
+
+  AddStoredOption("sol:poolgapabs poolgapabs ams_epsabs",
+    "Absolute tolerance for reporting alternative solutions "
+    "(default: no limit).",
+    storedOptions_.poolGapAbs_, -1.0, SCIP_REAL_MAX);
+  AddOptionSynonyms_Inline_Front("ams_stub", "sol:stub");
+
   ///////////////////////// MISC /////////////////////////
-  AddSolverOption("misc:allowstrongdualreds allowstrongdualreds",
+  AddGcgOption("misc:allowstrongdualreds allowstrongdualreds",
     "0/1: whether strong dual reductions should be allowed in propagation and presolving"
     "\n"
     "  | 0 - Strong dual reductions should not be allowed in propagation and presolving\n"
     "  | 1 - Strong dual reductions should be allowed in propagation and presolving (default).",
     "misc/allowstrongdualreds", 0, 1);
 
-  AddSolverOption("misc:allowweakdualreds allowweakdualreds",
+  AddGcgOption("misc:allowweakdualreds allowweakdualreds",
     "0/1: whether weak dual reductions should be allowed in propagation and presolving"
     "\n"
     "  | 0 - Weak dual reductions should not be allowed in propagation and presolving\n"
     "  | 1 - Weak dual reductions should be allowed in propagation and presolving (default).",
     "misc/allowweakdualreds", 0, 1);
 
-  AddSolverOption("misc:scaleobj scaleobj",
+  AddGcgOption("misc:scaleobj scaleobj",
     "0/1: whether the objective function should be scaled so that it is always integer"
     "\n"
     "  | 0 - The objective function should not be scaled so that it is always integer\n"
@@ -583,101 +709,106 @@ void GcgBackend::InitCustomOptions() {
     "misc/scaleobj", 0, 1);
 
   ////////////////////// NUMERICS ////////////////////////
-  AddSolverOption("num:checkfeastolfac checkfeastolfac",
+  AddGcgOption("num:checkfeastolfac checkfeastolfac",
     "Feasibility tolerance factor; for checking the feasibility of the best solution (default: 1.0)",
     "numerics/checkfeastolfac", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("num:dualfeastol dualfeastol",
+  AddGcgOption("alg:dualfeastol dualfeastol num:dualfeastol",
     "Feasibility tolerance for reduced costs in LP solution (default: 1e-07)",
     "numerics/dualfeastol", SCIP_MINEPSILON*1e+03, SCIP_MAXEPSILON);
 
-  AddSolverOption("num:epsilon epsilon",
+  AddGcgOption("num:epsilon epsilon",
     "Absolute values smaller than this are considered zero (default: 1e-09)",
     "numerics/epsilon", SCIP_MINEPSILON, SCIP_MAXEPSILON);
 
-  AddSolverOption("num:feastol feastol",
+  AddGcgOption("alg:feastol feastol num:feastol",
     "Feasibility tolerance for constraints (default: 1e-06)",
     "numerics/feastol", SCIP_MINEPSILON*1e+03, SCIP_MAXEPSILON);
 
-  AddSolverOption("num:infinity infinity",
+  AddGcgOption("num:infinity infinity",
     "Values larger than this are considered infinity (default: 1e+20)",
     "numerics/infinity", 1e+10, SCIP_INVALID/10.0);
 
-  AddSolverOption("num:lpfeastolfactor lpfeastolfactor",
+  AddGcgOption("num:lpfeastolfactor lpfeastolfactor",
     "Factor w.r.t. primal feasibility tolerance that determines default (and maximal) primal feasibility tolerance of LP solver (default: 1.0)",
     "numerics/lpfeastolfactor", 1e-6, 1.0);
 
-  AddSolverOption("num:sumepsilon sumepsilon",
-    "Absolute values of sums smaller than this are considered (default: 1e-06)",
+  AddGcgOption("num:sumepsilon sumepsilon",
+    "Absolute values of sums smaller than this are considered zero (default: 1e-06)",
     "numerics/sumepsilon", SCIP_MINEPSILON*1e+03, SCIP_MAXEPSILON);
 
   //////////////////// NODESELECTION /////////////////////
-  AddSolverOption("nod:childsel",
+  AddGcgOption("nod:childsel",
     "Child selection rule:\n"
     "\n.. value-table::\n", "nodeselection/childsel", childsel, "h");
 
   ////////////////////// PARALLEL ////////////////////////
-  AddSolverOption("par:maxnthreads maxnthreads",
+  AddGcgOption("par:maxnthreads maxnthreads",
     "Maximum number of threads used during parallel solve (default: 8)",
     "parallel/maxnthreads", 0, 64);
 
-  AddSolverOption("par:minnthreads minnthreads",
+  AddGcgOption("par:minnthreads minnthreads",
     "Minimum number of threads used during parallel solve (default: 1)",
     "parallel/minnthreads", 0, 64);
 
-  AddSolverOption("par:mode mode",
-    "0/1: Parallel optimisation mode"
+  AddGcgOption("par:mode parallelmode",
+    "0/1: Parallel optimisation mode (SCIP's concurrent solve, not used by GCG)"
     "\n"
     "  | 0 - Opportunistic\n"
     "  | 1 - Deterministic (default)",
     "parallel/mode", 0, 1);
 
   ////////////////////// PRESOLVE ////////////////////////
-  AddSolverOption("pre:abortfac abortfac",
+  AddGcgOption("pre:abortfac abortfac",
     "Abort presolve, if at most this fraction of the problem was changed in last presolve round (default: 0.0008)",
-    "presolving/advanced/abortfac", 0.0, 1.0);
+    "presolving/abortfac", 0.0, 1.0);
 
-  AddSolverOption("pre:clqtablefac clqtablefac",
+  AddGcgOption("pre:clqtablefac clqtablefac",
     "Limit on number of entries in clique table relative to number of problem nonzeros (default: 2.0)",
-    "presolving/advanced/clqtablefac", 0.0, SCIP_REAL_MAX);
+    "presolving/clqtablefac", 0.0, SCIP_REAL_MAX);
 
-  AddSolverOption("pre:donotaggr donotaggr",
+  AddGcgOption("pre:donotaggr donotaggr",
     "0/1: whether aggregation of variables should be forbidden"
     "\n"
     "  | 0 - Aggregation of variables should not be forbidden (default)\n"
     "  | 1 - Aggregation of variables should be forbidden.",
-    "presolving/advanced/donotaggr", 0, 1);
+    "presolving/donotaggr", 0, 1);
 
-  AddSolverOption("pre:donotmultaggr donotmultaggr",
+  AddGcgOption("pre:donotmultaggr donotmultaggr",
     "0/1: whether multi-aggregation of variables should be forbidden"
     "\n"
     "  | 0 - Multi-aggregation of variables should not be forbidden (default)\n"
     "  | 1 - Multi-aggregation of variables should be forbidden.",
-    "presolving/advanced/donotmultaggr", 0, 1);
+    "presolving/donotmultaggr", 0, 1);
 
-  AddSolverOption("pre:immrestartfac immrestartfac",
-    "Fraction of integer variables that were fixed in the root node triggering an immediate restart with preprocessing (default: 0.1)",
-    "presolving/advanced/immrestartfac", 0.0, 1.0);
+  AddGcgOption("pre:immrestartfac immrestartfac",
+    "Fraction of integer variables that were fixed in the root node triggering an immediate restart with preprocessing (default: 0.05)",
+    "presolving/immrestartfac", 0.0, 1.0);
 
-  AddSolverOption("pre:restartfac restartfac",
+  AddGcgOption("pre:restartfac restartfac",
     "Fraction of integer variables that were fixed in the root node triggering a restart with preprocessing after root node evaluation (default: 0.025)",
-    "presolving/advanced/restartfac", 0.0, 1.0);
+    "presolving/restartfac", 0.0, 1.0);
 
-  AddSolverOption("pre:restartminred restartminred",
-    "Minimal fraction of integer variables removed after restart to allow for an additional restart (default: 0.1)",
-    "presolving/advanced/restartminred", 0.0, 1.0);
+  AddGcgOption("pre:restartminred restartminred",
+    "Minimal fraction of integer variables removed after restart to allow for an additional restart (default: 0.05)",
+    "presolving/restartminred", 0.0, 1.0);
 
-  AddSolverOption("pre:subrestartfac subrestartfac",
+  AddGcgOption("pre:subrestartfac subrestartfac",
     "Fraction of integer variables that were globally fixed during the solving process triggering a restart with preprocessing (default: 1.0)",
-    "presolving/advanced/subrestartfac", 0.0, 1.0);
+    "presolving/subrestartfac", 0.0, 1.0);
 
-  AddSolverOption("pre:maxrestarts",
+  AddGcgOption("pre:maxrestarts",
     "Maximal number of restarts (default: -1: unlimited)",
     "presolving/maxrestarts", -1, INT_MAX);
 
-  AddSolverOption("pre:maxrounds",
+  AddGcgOption("pre:maxrounds",
     "Maximal number of presolving rounds (default: -1: unlimited; 0: off)",
     "presolving/maxrounds", -1, INT_MAX);
+
+  AddStoredOption("pre:solve presolve",
+    "0/1: whether to use SCIP presolving on the original problem "
+    "(default 1); 0 is the same as pre:settings=3.",
+    storedOptions_.presolve_, 0, 1);
 
   AddStoredOption("pre:settings",
     "0/1/2/3: sets presolvings settings"
@@ -689,120 +820,210 @@ void GcgBackend::InitCustomOptions() {
     storedOptions_.presolvings_, 0, 3);
 
   ////////////////////// PROPAGATE ///////////////////////
-  AddSolverOption("pro:abortoncutoff",
+  AddGcgOption("pro:abortoncutoff",
     "0/1: whether propagation should be aborted immediately (setting this to 0 could help conflict analysis to produce more conflict constraints)"
     "\n"
     "  | 0 - Propagation should not be aborted immediately\n"
     "  | 1 - Propagation should be aborted immediately (default).",
     "propagating/abortoncutoff", 0, 1);
 
-  AddSolverOption("pro:maxrounds",
+  AddGcgOption("pro:maxrounds",
     "Maximal number of propagation rounds per node (-1: unlimited; 0: off; default: 100)",
     "propagating/maxrounds", -1, INT_MAX);
 
-  AddSolverOption("pro:maxroundsroot",
+  AddGcgOption("pro:maxroundsroot",
     "Maximal number of propagation rounds in the root node (-1: unlimited; 0: off; default: 1000)",
     "propagating/maxroundsroot", -1, INT_MAX);
   
   //////////////////// RANDOMIZATION /////////////////////
-  AddSolverOption("ran:permuteconss permuteconss",
+  AddGcgOption("ran:permuteconss permuteconss",
     "0/1: whether the order of constraints should be permuted (depends on permutationseed)? "
     "\n"
     "  | 0 - Order of constraints should not be permuted\n"
     "  | 1 - Order of constraints should be permuted (default).",
-    "randomization/advanced/permuteconss", 0, 1);
+    "randomization/permuteconss", 0, 1);
 
-  AddSolverOption("ran:permutevars permutevars",
+  AddGcgOption("ran:permutevars permutevars",
     "0/1: whether the order of variables should be permuted (depends on permutationseed)? "
     "\n"
     "  | 0 - Order of variables should not be permuted (default)\n"
     "  | 1 - Order of variables should be permuted.",
-    "randomization/advanced/permutevars", 0, 1);
+    "randomization/permutevars", 0, 1);
 
-  AddSolverOption("ran:lpseed lpseed",
+  AddGcgOption("tech:lpseed lpseed ran:lpseed",
     "Random seed for LP solver, e.g. for perturbations in the simplex (default: 0: LP default)",
     "randomization/lpseed", 0, INT_MAX);
 
-  AddSolverOption("ran:permutationseed permutationseed",
+  AddGcgOption("tech:permseed permseed ran:permutationseed permutationseed",
     "Seed value for permuting the problem after reading/transformation (default: 0: no permutation) ",
     "randomization/permutationseed", 0, INT_MAX);
 
-  AddSolverOption("ran:randomseedshift randomseedshift",
+  AddGcgOption("tech:seed seed ran:randomseedshift randomseedshift",
     "Global shift of all random seeds in the plugins and the LP random seed (default: 0) ",
     "randomization/randomseedshift", 0, INT_MAX);
 
 
+  AddGcgOption("tech:clocktype clocktype",
+    "Clock type for time limits and reporting: 1 CPU user seconds, "
+    "2 wall clock time (default).",
+    "timing/clocktype", 1, 2);
+
+  ///////////////////////// PRICING //////////////////////
+  AddGcgOption("tech:threads threads pricing:threads",
+    "Maximum number of threads used to parallelize pricing "
+    "(default 1; 0: automatic, at most 8). The branch-and-price itself "
+    "is sequential.",
+    "pricing/masterpricer/nthreads", 0, 8);
+
+  AddGcgOption("pricing:stabilization stabilization",
+    "0/1: whether dual value stabilization should be performed in "
+    "pricing (default 1).",
+    "pricing/masterpricer/stabilization", 0, 1);
+
+  AddGcgOption("pricing:stabilizationtree stabilizationtree",
+    "0/1: whether stabilization should also be performed in the tree, "
+    "in nodes other than the root (default 0).",
+    "pricing/masterpricer/stabilizationtree", 0, 1);
+
+  // pricing/masterpricer/usecolpool is not exposed: GCG 4.0.2 crashes
+  // with usecolpool=FALSE (segmentation fault in pricing).
+
+  AddGcgOption("pricing:artificialvars useartificialvars",
+    "0/1: whether artificial variables are used to make the restricted "
+    "master feasible instead of Farkas pricing (default 0).",
+    "pricing/masterpricer/useartificialvars", 0, 1);
+
+  AddGcgOption("pricing:maxcolsround maxcolsroundredcost",
+    "Maximal number of columns per reduced cost pricing round (default 100)",
+    "pricing/masterpricer/maxcolsroundredcost", 0, INT_MAX);
+
+  AddGcgOption("pricing:maxcolsroundroot maxcolsroundredcostroot",
+    "Maximal number of columns per reduced cost pricing round at the "
+    "root node (default 100)",
+    "pricing/masterpricer/maxcolsroundredcostroot", 0, INT_MAX);
+
+  AddGcgOption("pricing:maxcolsprob maxcolsprobredcost",
+    "Maximal number of columns per pricing problem per reduced cost "
+    "pricing round (default 10)",
+    "pricing/masterpricer/maxcolsprobredcost", 0, INT_MAX);
+
+  AddGcgOption("pricing:maxrounds maxroundsredcost",
+    "Maximal number of pricing rounds per node after the root node "
+    "(default: no limit)",
+    "pricing/masterpricer/maxroundsredcost", 0, INT_MAX);
+
+  AddGcgOption("pricing:eagerfreq eagerfreq",
+    "Frequency at which all pricing problems are solved (default 10; "
+    "0: disabled)",
+    "pricing/masterpricer/eagerfreq", 0, INT_MAX);
+
+  AddGcgOption("pricing:heuriters heurpricingiters",
+    "Maximum number of heuristic pricing iterations per pricing call and "
+    "problem (default 1)",
+    "pricing/masterpricer/heurpricingiters", 0, INT_MAX);
+
+  AddGcgOption("pricing:maxheurdepth maxheurdepth",
+    "Maximum depth at which heuristic pricing is performed "
+    "(default -1: no limit)",
+    "pricing/masterpricer/maxheurdepth", -1, INT_MAX);
+
+  AddGcgOption("pricing:sorting sorting",
+    "Order in which the pricing problems are solved:\n"
+    "\n.. value-table::\n",
+    "pricing/masterpricer/sorting", values_pricing_sorting, "r");
+
+  AddGcgOption("pricing:dispinfos pricingdispinfos",
+    "0/1: whether additional information on the pricing process is "
+    "displayed (default 0).",
+    "pricing/masterpricer/dispinfos", 0, 1);
+
+  AddGcgOption("gcg:dispinfos dispinfos",
+    "0/1: whether additional information about the blocks is displayed "
+    "(default 0).",
+    "relaxing/gcg/dispinfos", 0, 1);
+
+  AddGcgOption("gcg:enforceproper enforceproper",
+    "0/1: whether propagated bound changes in the original problem are "
+    "enforced in the master (only proper variables; default 1).",
+    "relaxing/gcg/enforceproper", 0, 1);
+
   ////////////////////// DETECTION ///////////////////////
-  AddSolverOption("det:enabled",
+  AddGcgOption("det:enabled",
     "0/1: whether detection should be enabled? "
     "\n"
     "  | 0 - Detection not enabled\n"
     "  | 1 - Detection enabled (default).",
     "detection/enabled", 0, 1);
 
-  AddSolverOption("det:postprocess postprocess",
+  AddGcgOption("det:postprocess postprocess",
     "0/1: whether postprocessing of complete decompositions should be enabled? "
     "\n"
     "  | 0 - Postprocessing of complete decompositions not enabled\n"
     "  | 1 - Postprocessing of complete decompositions enabled (default).",
-    "detection/enabled", 0, 1);
+    "detection/postprocess", 0, 1);
 
-  AddSolverOption("det:maxrounds",
+  AddGcgOption("det:maxrounds",
     "Maximum number of detection loop rounds (default: 1) ",
     "detection/maxrounds", 0, INT_MAX);
 
-  AddSolverOption("det:maxtime",
+  AddGcgOption("det:maxnclasses maxnclasses",
+    "Maximum number of classes a partition can use for voting on the "
+    "number of blocks (default 18)",
+    "detection/blocknrcandidates/maxnclasses", 0, INT_MAX);
+
+  AddGcgOption("det:maxtime",
     "Maximum detection time in seconds (default: 600) ",
-    "detection/maxrounds", 0, INT_MAX);
+    "detection/maxtime", 0, INT_MAX);
 
-  AddSolverOption("det:scoretype scoretype",
+  AddGcgOption("det:scoretype scoretype",
     "Score calculation for comparing (partial) decompositions:\n"
-    "\n.. value-table::\n", "detection/scores/selected", scoretype, 4);
+    "\n.. value-table::\n", "detection/scores/selected", scoretype,
+    "spfwh");
 
-  AddSolverOption("det:origprob-classificationenabled origprob-classificationenabled",
+  AddGcgOption("det:origprobclassification det:origprob-classificationenabled origprob-classificationenabled",
     "0/1: whether classification for the original problem should be enabled? "
     "\n"
     "  | 0 - Classification for the original problem not enabled\n"
     "  | 1 - Classification for the original problem enabled (default).",
     "detection/origprob/classificationenabled", 0, 1);
 
-  AddSolverOption("det:origprob-enabled origprob-enabled",
+  AddGcgOption("det:origprob det:origprob-enabled origprob-enabled",
     "0/1: whether detection for the original problem should be enabled? "
     "\n"
     "  | 0 - Detection for the original problem not enabled\n"
     "  | 1 - Detection for the original problem enabled (default).",
     "detection/origprob/enabled", 0, 1);
 
-  AddSolverOption("det:classification-enabled classification-enabled",
+  AddGcgOption("det:classification det:classification-enabled classification-enabled",
     "0/1: whether classification should be enabled? "
     "\n"
     "  | 0 - Classification not enabled\n"
     "  | 1 - Classification enabled (default).",
     "detection/classification/enabled", 0, 1);
 
-  AddSolverOption("det:maxnclassesperpartition maxnclassesperpartition",
+  AddGcgOption("det:maxnclassesperpartition maxnclassesperpartition",
     "Maximum number of classes per partition (default: 9)",
     "detection/classification/maxnclassesperpartition", 0, INT_MAX);
 
-  AddSolverOption("det:maxnclassesperpartitionforlargeprobs maxnclassesperpartitionforlargeprobs",
+  AddGcgOption("det:maxnclassesperpartitionforlargeprobs maxnclassesperpartitionforlargeprobs",
     "Maximum number of classes per partition for large problems (nconss + nvars >= 50000) (default: 5)",
     "detection/classification/maxnclassesperpartitionforlargeprobs", 0, INT_MAX);
   
-  AddSolverOption("det:benders-enabled benders-enabled",
+  AddGcgOption("det:benders det:benders-enabled benders-enabled",
     "0/1: whether benders detection should be enabled? "
     "\n"
     "  | 0 - Benders detection not enabled (default)\n"
     "  | 1 - Benders detection enabled.",
     "detection/benders/enabled", 0, 1);
 
-  AddSolverOption("det:benders-onlybinmaster benders-onlybinmaster",
+  AddGcgOption("det:bendersonlybinmaster det:benders-onlybinmaster benders-onlybinmaster",
     "0/1: whether only decomposition with only binary variables in the master are searched? "
     "\n"
     "  | 0 - Not only decomposition with only binary variables in the master are searched (default)\n"
     "  | 1 - Only decomposition with only binary variables in the master are searched.",
     "detection/benders/onlybinmaster", 0, 1);
 
-  AddSolverOption("det:benders-onlycontsubpr benders-onlycontsubpr",
+  AddGcgOption("det:bendersonlycontsubpr det:benders-onlycontsubpr benders-onlycontsubpr",
     "0/1: whether only decomposition with only continiuous variables in the subproblems are searched? "
     "\n"
     "  | 0 - Not only decomposition with only continiuous variables in the subproblems are searched (default)\n"
@@ -810,35 +1031,38 @@ void GcgBackend::InitCustomOptions() {
     "detection/benders/onlycontsubpr", 0, 1);
 
   //////////////////// RELAXING-GCG //////////////////////
-  AddSolverOption("gcg:bliss-enabled bliss-enabled",
-    "0/1: whether bliss should be used to check for identical blocks? "
-    "\n"
-    "  | 0 - Bliss should not be used to check for identical blocks\n"
-    "  | 1 - Bliss should be used to check for identical blocks (default).",
-    "relaxing/gcg/bliss/enabled", 0, 1);
 
-  AddSolverOption("gcg:aggregation",
-    "0/1: whether identical blocks should be aggregated (only for discretization approach)? "
-    "\n"
-    "  | 0 - Identical blocks should not be aggregated (only for discretization approach)\n"
-    "  | 1 - Identical blocks should be aggregated (only for discretization approach) (default).",
-    "relaxing/gcg/aggregation", 0, 1);
+  /// Seems absent in SCIP 10.0.2
+  // AddSolverOption("gcg:bliss-enabled bliss-enabled",
+  //   "0/1: whether bliss should be used to check for identical blocks? "
+  //   "\n"
+  //   "  | 0 - Bliss should not be used to check for identical blocks\n"
+  //   "  | 1 - Bliss should be used to check for identical blocks (default).",
+  //   "relaxing/gcg/bliss/enabled", 0, 1);
 
-  AddSolverOption("gcg:discretization discretization",
+  /// Seems absent in SCIP 10.0.2
+  // AddSolverOption("gcg:aggregation aggregation",
+  //   "0/1: whether identical blocks should be aggregated (only for discretization approach)? "
+  //   "\n"
+  //   "  | 0 - Identical blocks should not be aggregated (only for discretization approach)\n"
+  //   "  | 1 - Identical blocks should be aggregated (only for discretization approach) (default).",
+  //   "relaxing/gcg/aggregation", 0, 1);
+
+  AddGcgOption("gcg:discretization discretization",
     "0/1: whether discretization (TRUE) or convexification (FALSE) approach should be used? "
     "\n"
     "  | 0 - convexification approach should be used\n"
     "  | 1 - discretization approach should be used (default).",
     "relaxing/gcg/discretization", 0, 1);
 
-  AddSolverOption("gcg:mipdiscretization mipdiscretization",
+  AddGcgOption("gcg:mipdiscretization mipdiscretization",
     "0/1: whether discretization (TRUE) or convexification (FALSE) approach should be used in mixed-integer programs?"
     "\n"
     "  | 0 - convexification approach should be used in mixed-integer programs\n"
     "  | 1 - discretization approach should be used in mixed-integer programs (default).",
-    "relaxing/gcg/discretization", 0, 1);
+    "relaxing/gcg/mipdiscretization", 0, 1);
 
-  AddSolverOption("gcg:mode mode",
+  AddGcgOption("gcg:mode mode",
     "The decomposition mode that GCG will use:\n"
     "\n.. value-table::\n", "relaxing/gcg/mode", mode, 0);
 }
@@ -846,7 +1070,7 @@ void GcgBackend::InitCustomOptions() {
 void GcgBackend::InputDecomposition() {
   bool is_presolved = SCIPgetStage(getSCIP()) >= SCIP_STAGE_PRESOLVED;
   GCG_CCALL( SCIPallocClearMemory(scip, &getPROBDATA()->decomp) );
-  gcg::PARTIALDECOMP* decomp = new gcg::PARTIALDECOMP(getSCIP(), !is_presolved);
+  gcg::PARTIALDECOMP* decomp = new gcg::PARTIALDECOMP(getGCG(), !is_presolved);
   getPROBDATA()->decomp = decomp;
 
   if (auto block0 = ReadModelSuffixInt({"block", suf::Kind::CON_BIT | suf::Kind::VAR_BIT})) {
@@ -903,8 +1127,8 @@ void GcgBackend::InputDecomposition() {
       getPROBDATA()->decomp->setUsergiven(gcg::USERGIVEN::COMPLETE);
     else
       getPROBDATA()->decomp->setUsergiven(gcg::USERGIVEN::PARTIAL);
-    GCGconshdlrDecompAddPreexisitingPartialDec(getSCIP(), getPROBDATA()->decomp);
-    GCGpresolve(getSCIP());
+    GCGconshdlrDecompAddPreexisitingPartialDec(getGCG(), getPROBDATA()->decomp);
+    GCGpresolve(getGCG());
   }
 }
 
@@ -918,203 +1142,6 @@ double GcgBackend::BestDualBound() {
 double GcgBackend::MIPGapAbs() {
   double gapabs = std::fabs(ObjectiveValue() - BestDualBound());
   return gapabs<Infinity() ? gapabs : AMPLInf();
-}
-
-
-ArrayRef<int> GcgBackend::VarStatii() {
-  
-  std::vector<int> vars(NumVars());
-  /*
-  GCG_GetBasis(lp(), vars.data(), NULL);
-  for (auto& s : vars) {
-    switch (s) {
-    case GCG_BASIS_BASIC:
-      s = (int)BasicStatus::bas;
-      break;
-    case GCG_BASIS_LOWER:
-      s = (int)BasicStatus::low;
-      break;
-    case GCG_BASIS_UPPER:
-      s = (int)BasicStatus::upp;
-      break;
-    case GCG_BASIS_SUPERBASIC:
-      s = (int)BasicStatus::sup;
-      break;
-    case GCG_BASIS_FIXED:
-      s = (int)BasicStatus::equ;
-      break;
-    default:
-      MP_RAISE(fmt::format("Unknown Gcg VBasis value: {}", s));
-    }
-  }
-  */
-  return vars;
-}
-
-ArrayRef<int> GcgBackend::ConStatii() {
-
-  std::vector<int> cons(NumLinCons());
-  /*
-  GCG_GetBasis(lp(), NULL, cons.data());
-  for (auto& s : cons) {
-    switch (s) {
-    case GCG_BASIS_BASIC:
-      s = (int)BasicStatus::bas;
-      break;
-    case GCG_BASIS_LOWER:
-      s = (int)BasicStatus::low;
-      break;
-    case GCG_BASIS_UPPER:
-      s = (int)BasicStatus::upp;
-      break;
-    case GCG_BASIS_SUPERBASIC:
-      s = (int)BasicStatus::sup;
-      break;
-    case GCG_BASIS_FIXED:
-      s = (int)BasicStatus::equ;
-      break;
-    default:
-      MP_RAISE(fmt::format("Unknown Gcg VBasis value: {}", s));
-    }
-  }*/
-  return cons;
-}
-
-void GcgBackend::VarStatii(ArrayRef<int> vst) {
-  int index[1];
-  std::vector<int> stt(vst.data(), vst.data() + vst.size());
-  /*
-  for (auto j = stt.size(); j--; ) {
-    auto& s = stt[j];
-    switch ((BasicStatus)s) {
-    case BasicStatus::bas:
-      s = GCG_BASIS_BASIC;
-      break;
-    case BasicStatus::low:
-      s = GCG_BASIS_LOWER;
-      break;
-    case BasicStatus::equ:
-      s = GCG_BASIS_FIXED;
-      break;
-    case BasicStatus::upp:
-      s = GCG_BASIS_UPPER;
-      break;
-    case BasicStatus::sup:
-    case BasicStatus::btw:
-      s = GCG_BASIS_SUPERBASIC;
-      break;
-    case BasicStatus::none:
-      /// 'none' is assigned to new variables. Compute low/upp/sup:
-      /// Depending on where 0.0 is between bounds
-      double lb, ub;
-      index[0] = (int)j;
-      if(!GCG_GetColInfo(lp(), GCG_DBLINFO_LB, 1, index, &lb) && 
-        !GCG_GetColInfo(lp(), GCG_DBLINFO_UB, 1, index, &ub))
-      { 
-        if (lb >= -1e-6)
-          s = -1;
-        else if (ub <= 1e-6)
-          s = -2;
-        else
-          s = -3;  // or, leave at 0?
-      }
-      break;
-    default:
-      MP_RAISE(fmt::format("Unknown AMPL var status value: {}", s));
-    }
-  }
-  GCG_SetBasis(lp(), stt.data(), NULL);
-  */
-}
-
-void GcgBackend::ConStatii(ArrayRef<int> cst) {
-  /*
-  std::vector<int> stt(cst.data(), cst.data() + cst.size());
-  for (auto& s : stt) {
-    switch ((BasicStatus)s) {
-    case BasicStatus::bas:
-      s = GCG_BASIS_BASIC;
-      break;
-    case BasicStatus::none:   // for 'none', which is the status
-    case BasicStatus::upp:    // assigned to new rows, it seems good to guess
-    case BasicStatus::sup:    // a valid status.
-    case BasicStatus::low:    // 
-    case BasicStatus::equ:    // For active constraints, it is usually 'sup'.
-    case BasicStatus::btw:    // We could compute slack to decide though.
-      s = GCG_BASIS_SUPERBASIC;
-      break;
-    default:
-      MP_RAISE(fmt::format("Unknown AMPL con status value: {}", s));
-    }
-  }
-  GCG_SetBasis(lp(), NULL, stt.data());
-  */
-}
-
-SolutionBasis GcgBackend::GetBasis() {
-  std::vector<int> varstt = VarStatii();
-  std::vector<int> constt = ConStatii();
-  if (varstt.size() && constt.size()) {
-    auto mv = GetValuePresolver().PostsolveBasis(
-      { std::move(varstt),
-        {{{ CG_Linear, std::move(constt) }}} });
-    varstt = mv.GetVarValues()();
-    constt = mv.GetConValues()();
-    assert(varstt.size());
-  }
-  return { std::move(varstt), std::move(constt) };
-}
-
-void GcgBackend::SetBasis(SolutionBasis basis) {
-  auto mv = GetValuePresolver().PresolveBasis(
-    { basis.varstt, basis.constt });
-  auto varstt = mv.GetVarValues()();
-  auto constt = mv.GetConValues()(CG_Linear);
-  assert(varstt.size());
-  assert(constt.size());
-  VarStatii(varstt);
-  ConStatii(constt);
-}
-
-
-void GcgBackend::ComputeIIS() {
-  //GCG_CCALL(GCG_ComputeIIS(lp()));
-  SetStatus(ConvertGCGStatus());   // could be new information
-}
-
-IIS GcgBackend::GetIIS() {
-  auto variis = VarsIIS();
-  auto coniis = ConsIIS();
-  auto mv = GetValuePresolver().PostsolveIIS(
-    { variis, coniis });
-  return { mv.GetVarValues()(), mv.GetConValues()() };
-}
-
-ArrayRef<int> GcgBackend::VarsIIS() {
-  return ArrayRef<int>();
-//  return getIIS(lp(), NumVars(), GCG_GetColLowerIIS, GCG_GetColUpperIIS);
-}
-pre::ValueMapInt GcgBackend::ConsIIS() {
-  /*auto iis_lincon = getIIS(lp(), NumLinCons(), GCG_GetRowLowerIIS, GCG_GetRowUpperIIS);
-
-  std::vector<int> iis_soscon(NumSOSCons());
-  GCG_GetSOSIIS(lp(), NumSOSCons(), NULL, iis_soscon.data());
-  ConvertIIS2AMPL(iis_soscon);
-
-  std::vector<int> iis_indicon(NumIndicatorCons());
-  GCG_GetIndicatorIIS(lp(), NumIndicatorCons(), NULL, iis_indicon.data());
-  ConvertIIS2AMPL(iis_indicon);
-
-  return { {{ CG_Linear, iis_lincon },
-      { CG_SOS, iis_soscon },
-      { CG_Logical, iis_indicon }} };
-      */
-  return { {{ 0, std::vector<int>()}} };
-}
-
-void GcgBackend::AddMIPStart(ArrayRef<double> x0, ArrayRef<int> sparsity) {
-  //GCG_CCALL(GCG_AddMipStart(lp(), NumVars(), NULL, const_cast<double*>(x0.data())));
-
 }
 
 

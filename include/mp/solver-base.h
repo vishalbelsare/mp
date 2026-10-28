@@ -3,9 +3,12 @@
 
 #include <map>
 #include <set>
+#include <functional>
 
 #include "solver-opt.h"
 #include "common.h"
+#include "mp/utils-clock.h"
+#include "mp/ampls-ccallbacks.h"
 
 namespace mp {
 
@@ -224,6 +227,20 @@ public:
     objno_ = value;
   }
 
+  int GetTiming(const SolverOption&) const { return timing_; }
+  void SetTiming(const SolverOption& opt, int value)  {
+    if ((value < 0)||(value>2))
+      throw InvalidOptionValue(opt, value);
+    timing_= value;
+  }
+
+  int GetSolutionStats(const SolverOption&) const { return solution_stats_; }
+  void SetSolutionStats(const SolverOption& opt, int value) {
+      if ((value < 0) || (value > 3))
+          throw InvalidOptionValue(opt, value);
+      solution_stats_ = value;
+  }
+
   /// Returns the solver name.
   /// This is used to extract solver options from
   /// the env variable (solver_name)_options.
@@ -239,7 +256,10 @@ public:
 
   /// Returns the solver version.
   const char *version() const { return version_.c_str(); }
-
+  
+  // Returns the NL file currently read.
+  const char* stub() const { return stub_.c_str(); }
+  void set_stub(const char* stub) { stub_ = stub; }
   /// Returns the solver date in YYYYMMDD format.
   long date() const { return date_; }
 
@@ -270,14 +290,24 @@ public:
   /// Should be set by the implementation,
   /// otherwise it's true
   bool verbose_mode() const { return verbose_; }
-  /// Set verbosity, by the impl
-  void set_verbose_mode(bool f) { verbose_=f; }
+  /// Set verbosity, by the impl.
+  /// Do not disable, due to outlev_mp.
+  void set_verbose_mode(bool f) { if (f) verbose_=1; }
 
   /// True if need to debug.
   /// Outputs test infos etc
-  bool debug_mode() const { return debug_; }
+  int debug_mode() const { return debug_; }
 
+  /// Report obj value in solve_message
+  /// when the status is '?' (UNKNOWN)
+  bool report_uncertain_sol() const
+  { return report_uncertain_sol_; }
 
+  /// Set warning callback
+  void set_warn_cb(AMPLS_Warning_Callback_T cb);
+
+  /// Add warning from a callback
+  void warn_from_cb(const char* user_info) const;
 
   /// Returns the index of the objective to optimize starting from 1,
   /// 0 to not use objective.
@@ -303,12 +333,25 @@ public:
   void notify_end_opts() { opts_read_=true; }
 
   /// Returns true if multiobjective optimization is enabled.
+  /// In particular, 1 if enabled and preferred native handling,
+  /// or 2 if forcing emulation.
   /// Both multiobj and objno are used in NLReader to select
   /// the objective(s), solvers should not use these options.
-  bool multiobj() const { return multiobj_ && objno_<0; }
+  int multiobj() const { return (objno_<0) ? multiobj_ : 0; }
 
-  /// Returns true if the timing is enabled
-  bool timing() const { return timing_; }
+  /// Whether the solver natively supports multiobj
+  bool multiobj_has_native() const { return multiobj_has_native_; }
+
+  /// Option obj:multi:weight
+  int multiobj_weight() const { return multiobj_weight_; }
+
+  /// >0 if the timing is enabled
+  int timing() const { return timing_; }
+
+  /// >0 if solution stats output is enabled. It will output the suffixes
+  /// for all solution attributes (e.g. nodes explored, simplex iterations, etc).
+  /// and the suffix stats with the JSON representation of the statistics.
+  int solution_stats() const { return solution_stats_; }
 
   /// Return error handler
   ErrorHandler *error_handler() { return error_handler_; }
@@ -393,14 +436,14 @@ public:
   /// @param key: warning category
   /// @param msg: detailed message
   void AddWarning(
-      std::string key, std::string msg, bool replace=false);
+      std::string key, std::string msg, bool replace=false) const;
 
   /// Get a warning type
   const std::pair<int, std::string>&
-  GetWarning(const std::string& key);
+  GetWarning(const std::string& key) const;
 
   /// Clear a warning type
-  void ClearWarning(const std::string& key);
+  void ClearWarning(const std::string& key) const;
 
   /// Get warnings as string
   std::string GetWarnings() const;
@@ -441,7 +484,8 @@ public:
   /// false otherwise. It accepts a pointer to the problem because some
   /// options may depend on problem features.
   virtual bool ParseOptions(
-      char **argv, unsigned flags = 0, const ASLProblem *p = 0);
+      char **argv, unsigned flags = 0, const ASLProblem *p = 0,
+    char* additional_options=0);
 
   /// Solver flags
   enum {
@@ -453,7 +497,10 @@ public:
 
     /// Multiple objectives support.
     /// Makes Solver register the "multiobj" option
-    MULTIPLE_OBJ = 2
+    MULTIPLE_OBJ = 2,
+
+    /// If the multiobj support is solver-native (not emulated.)
+    MULTIPLE_OBJ_NATIVE = 4
   };
 
   /// Deafult / testing constructor
@@ -463,7 +510,8 @@ public:
   virtual ~BasicSolver() { }
 
   /// Parses a solver option string.
-  void ParseOptionString(const char *s, unsigned flags);
+  void ParseOptionString(
+      const char *s, unsigned flags=NO_OPTION_ECHO);
 
   /// Map to count warnings by types.
   /// Stores just 1 message for each type.
@@ -472,8 +520,7 @@ public:
       std::pair<int, std::string> >;    // total number, description of the 1st
 
   /// Get warnings map
-  const WarningsMap& GetWarningsMap() const { return warnings_; }
-  WarningsMap& GetWarningsMap() { return warnings_; }
+  WarningsMap& GetWarningsMap() const { return warnings_; }
 
   /// Stringify a WarningsMap entry
   static std::string ToString(const WarningsMap::value_type& wrn);
@@ -488,6 +535,27 @@ public:
 
   /// Show constraint descriptions
   bool ShowConstraintDescriptions();
+
+
+  virtual void RecordOutputTime() {
+    stats_.output_time += GetTimeAndReset(stats_.time);
+  }
+  /// Record setup time
+  virtual void RecordSetupTime() {
+    stats_.setup_time = GetTimeAndReset(stats_.time);
+  }
+  void SetReadTime(double read_time) {
+    stats_.read_time = read_time;
+  }
+  void SetConversionTime(double conv_time) {
+    stats_.conversion_time = conv_time;
+  }
+
+  /// Record solve time
+  virtual void RecordSolveTime() {
+    stats_.solution_time = GetTimeAndReset(stats_.time);
+  }
+
 
 protected:
   /// Constructs a BasicSolver object.
@@ -525,12 +593,24 @@ protected:
   /// Sets the flags for Problem::Read.
   void set_read_flags(unsigned flags) { read_flags_ = flags; }
 
+  struct Stats {
+    std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now();
+    // Total setup time, from initialization to 
+    double setup_time = 0.0; 
+    double solution_time = 0.0;
+    double read_time = 0.0;
+    double conversion_time = 0.0;
+    double output_time = 0.0;
+    int n_altern_sol_checks_failed_ = 0;
+  };
+  Stats& stats() { return stats_; }
 
 private:
   std::string name_;
   std::string long_name_;
   std::string exe_path_;
   std::string version_;
+  std::string stub_;
   std::string license_info_;
   long date_{0};
   int wantsol_ {0};
@@ -557,10 +637,19 @@ private:
 
   unsigned read_flags_ {0};  // flags passed to Problem::Read
 
-  bool verbose_ {true};
-  bool debug_ {false};
-  bool timing_ {false};
-  bool multiobj_ {false};
+  bool verbose_ {false};
+  int debug_ {0};
+  bool report_uncertain_sol_ {true};
+
+  int timing_ {0};
+  int solution_stats_{0};
+  Stats stats_;
+
+  std::function<std::pair<const char*, const char*>(const char*)> warn_cb_;
+
+  int multiobj_ {0};
+  bool multiobj_has_native_ {false};
+  int multiobj_weight_ {2};
 
   bool has_errors_ {false};
   OutputHandler *output_handler_ {this};
@@ -568,7 +657,7 @@ private:
   Interrupter *interrupter_ {this};
 
   /// Warnings
-  WarningsMap warnings_;
+  mutable WarningsMap warnings_;
 
   /// Constraint descriptions, printable by -c
   std::string constr_descr_header_;

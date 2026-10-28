@@ -28,14 +28,32 @@ void GurobiModelAPI::AddVariables(const VarArrayDef& v) {
                        (double*)v.plb(), (double*)v.pub(),
                        vtypes.data(), (char**)v.pnames()) );
 }
+void ThrowForUnsupportedObjectives()
+{
+  throw std::runtime_error(
+      format_error("Multiple quadratic objectives are not supported natively by Gurobi; "
+                   "enable multi-objective emulator by setting the option obj:multi=2"));
+}
 
-void GurobiModelAPI::SetLinearObjective( int iobj, const LinearObjective& lo ) {
+void GurobiModelAPI::SetLinearObjective(
+    int iobj, const LinearObjective& lo ) {
   if (1>iobj) {
     GrbSetIntAttr( GRB_INT_ATTR_MODELSENSE,
                   obj::Type::MAX==lo.obj_sense() ? GRB_MAXIMIZE : GRB_MINIMIZE);
     NoteGurobiMainObjSense(lo.obj_sense());
+    if (obj_ind_save_.size()) {             // zero out previous linear part
+      std::vector<double> obj_coef_0(obj_ind_save_.size(), 0.0);
+      GrbSetDblAttrList( GRB_DBL_ATTR_OBJ, obj_ind_save_, obj_coef_0 );
+    }
+    GRB_CALL( GRBdelq(model()) );           // zero out previous QP part
+#ifdef __GRB_NL_OBJCON__
+    GRB_CALL( GRBdelnlobj(model()) );
+#endif
     GrbSetDblAttrList( GRB_DBL_ATTR_OBJ, lo.vars(), lo.coefs() );
+    obj_ind_save_ = lo.vars();
   } else {
+    if (has_quadratic_obj_) ThrowForUnsupportedObjectives();
+
     GRB_CALL( GRBsetobjectiven(model(), iobj, 0,           // default priority 0
                                /// Gurobi allows opposite sense by weight sign
                                lo.obj_sense()==GetGurobiMainObjSense() ? 1.0 : -1.0,
@@ -45,17 +63,67 @@ void GurobiModelAPI::SetLinearObjective( int iobj, const LinearObjective& lo ) {
   }
 }
 
-void GurobiModelAPI::SetQuadraticObjective(int iobj, const QuadraticObjective &qo) {
+void GurobiModelAPI::SetQuadraticObjective(
+    int iobj, const QuadraticObjective &qo) {
+  has_quadratic_obj_ = true;
   if (1>iobj) {
+    GRB_CALL( GRBdelq(model()) );                         // delete current QP terms
     SetLinearObjective(iobj, qo);                         // add the linear part
     const auto& qt = qo.GetQPTerms();
     GRB_CALL( GRBaddqpterms(model(), qt.size(),
                                 (int*)qt.pvars1(), (int*)qt.pvars2(),
                             (double*)qt.pcoefs()) );
   } else {
-    throw std::runtime_error("Multiple quadratic objectives not supported");
+    ThrowForUnsupportedObjectives();
   }
 }
+
+#ifdef __GRB_NL_OBJCON__
+void GurobiModelAPI::SetNLObjective(int i, const NLObjective& nlo) {
+  if (i == 0)
+  {
+#define __GRB_NL_OBJCON__REUSE_LIN_QP_OBJ__
+#ifdef __GRB_NL_OBJCON__REUSE_LIN_QP_OBJ__
+    SetQuadraticObjective(i, (const QuadraticObjective&)nlo);  // Reuse Lin+QP part
+    const auto& frm = GetFormula(GetExpression(nlo));
+#else
+    GrbSetIntAttr( GRB_INT_ATTR_MODELSENSE,
+                  obj::Type::MAX==nlo.obj_sense() ?
+                      GRB_MAXIMIZE : GRB_MINIMIZE);
+    NoteGurobiMainObjSense(nlo.obj_sense());
+
+    auto frm = StartFormula(GRB_OPCODE_PLUS);
+    frm.Append( GetFormula(GetExpression(nlo)) );
+
+    MP_ASSERT_ALWAYS(((const QuadraticObjective&)nlo).GetQPTerms().empty(),
+                     "NL objective: QP terms.\n"
+                     "Please contact AMPL support.");
+
+    const auto& lint = nlo.GetLinTerms();
+    for (int i=0; i<(int)lint.size(); ++i) {     // TODO
+      if (double coef = lint.coef(i)) {
+        if (1.0 != coef) {
+          auto f1 = StartFormula(GRB_OPCODE_MULTIPLY);
+          AppendArgument(f1, MakeConstantExpr(coef));
+          AppendArgument(f1, MakeVarExpr(lint.var(i)));
+          frm.Append(f1);
+        } else {
+          AppendArgument(frm, MakeVarExpr(lint.var(i)));
+        }
+      }
+    }
+#endif  // __GRB_NL_OBJCON__REUSE_LIN_QP_OBJ__
+    GRB_CALL(GRBsetnlobj(model(), frm.size(),
+                         (int*)frm.opcodes(),
+                         (double*)frm.data(), (int*)frm.parents()));
+  }
+  else {
+    MP_RAISE("Multiple non-linear objectives not supported natively. "
+             "Use multi-objective emulator by setting obj:multi=2");
+  }
+}
+#endif
+
 
 void GurobiModelAPI::NoteGurobiMainObjSense(obj::Type s) { main_obj_sense_ = s; }
 
@@ -204,7 +272,7 @@ void GurobiModelAPI::AddConstraint(const LogAConstraint &cc)  {
               cc.GetArguments()[0], cc.GetResultVar(), cc.GetParameters()[0], "") );
 }
 
-void GurobiModelAPI::AddConstraint(const PowConstraint &cc)  {
+void GurobiModelAPI::AddConstraint(const PowConstExpConstraint &cc)  {
   GRB_CALL( GRBaddgenconstrPow(model(), cc.name(),
               cc.GetArguments()[0], cc.GetResultVar(), cc.GetParameters()[0], "") );
 }
@@ -232,5 +300,267 @@ void GurobiModelAPI::AddConstraint(const PLConstraint& plc) {
 }
 
 void GurobiModelAPI::InitCustomOptions() { }
+
+
+/////////////////////////////// EXPRESSIONS ////////////////////////////////////
+#ifdef GRB_OPCODE_CONSTANT
+
+#ifdef __GRB_NL_OBJCON__
+void GurobiModelAPI::AddConstraint(const NLConstraint& nl) {
+  double lb = GetLower(nl), ub = GetUpper(nl);
+  double rhs;
+  char sense;
+
+  if (lb > -GRB_INFINITY) {
+    rhs = lb;
+    if (ub < GRB_INFINITY) {
+      MP_ASSERT_ALWAYS(lb >= ub,            // TODO
+                     "Range NL constraint.\n"
+                     "Please contact AMPL Support.");
+      sense = GRB_EQUAL;
+    } else
+      sense = GRB_GREATER_EQUAL;
+  } else {
+    rhs = ub;
+    sense = GRB_LESS_EQUAL;
+  }
+
+  auto frm = StartFormula(GRB_OPCODE_PLUS);
+  frm.Append( GetFormula(GetExpression(nl)) );
+
+  for (int i=0; i<GetLinSize(nl); ++i) {     // TODO
+    if (double coef = GetLinCoef(nl, i)) {
+      if (1.0 != coef) {
+        auto f1 = StartFormula(GRB_OPCODE_MULTIPLY);
+        AppendArgument(f1, MakeConstantExpr(coef));
+        AppendArgument(f1, MakeVarExpr( GetLinVar(nl, i) ));
+        frm.Append(f1);
+      }  else {
+        AppendArgument(frm, MakeVarExpr( GetLinVar(nl, i) ));
+      }
+    }
+  }
+
+  GRB_CALL(GRBaddnlconstr(
+      model(), frm.size(),
+      (int*)frm.opcodes(), (double*)frm.data(), (int*)frm.parents(),
+      sense, rhs, GetName(nl)));
+}
+#endif  // __GRB_NL_OBJCON__
+
+void GurobiModelAPI::AddConstraint(const NLAssignEQ& nla) {
+#ifdef __GRB_NL_OBJCON__
+  auto frm = StartFormula(GRB_OPCODE_MINUS);
+  AppendArgument(frm, MakeVarExpr( GetVariable(nla) ));
+  frm.Append( GetFormula(GetExpression(nla)) );
+  GRB_CALL(GRBaddnlconstr(
+      model(), frm.size(),
+      (int*)frm.opcodes(), (double*)frm.data(), (int*)frm.parents(),
+      GRB_EQUAL, 0.0, GetName(nla)));
+#else
+  const auto& frm = GetFormula(GetExpression(nla));
+  GRB_CALL( GRBaddgenconstrNL(
+      model(), GetName(nla), GetVariable(nla), frm.size(),
+      frm.opcodes(), frm.data(), frm.parents()) );
+#endif
+}
+void GurobiModelAPI::AddConstraint(const NLAssignLE& nla) {
+#ifdef __GRB_NL_OBJCON__
+  auto frm = StartFormula(GRB_OPCODE_MINUS);
+  AppendArgument(frm, MakeVarExpr( GetVariable(nla) ));
+  frm.Append( GetFormula(GetExpression(nla)) );
+  GRB_CALL(GRBaddnlconstr(
+      model(), frm.size(),
+      (int*)frm.opcodes(), (double*)frm.data(), (int*)frm.parents(),
+      GRB_LESS_EQUAL, 0.0, GetName(nla)));
+#else
+  const auto& frm = GetFormula(GetExpression(nla));
+  GRB_CALL( GRBaddgenconstrNL(
+      model(), GetName(nla), GetVariable(nla), frm.size(),
+      frm.opcodes(), frm.data(), frm.parents()) );
+#endif
+}
+void GurobiModelAPI::AddConstraint(const NLAssignGE& nla) {
+#ifdef __GRB_NL_OBJCON__
+  auto frm = StartFormula(GRB_OPCODE_MINUS);
+  AppendArgument(frm, MakeVarExpr( GetVariable(nla) ));
+  frm.Append( GetFormula(GetExpression(nla)) );
+  GRB_CALL(GRBaddnlconstr(
+      model(), frm.size(),
+      (int*)frm.opcodes(), (double*)frm.data(), (int*)frm.parents(),
+      GRB_GREATER_EQUAL, 0.0, GetName(nla)));
+#else
+  const auto& frm = GetFormula(GetExpression(nla));
+  GRB_CALL( GRBaddgenconstrNL(
+      model(), GetName(nla), GetVariable(nla), frm.size(),
+      frm.opcodes(), frm.data(), frm.parents()) );
+#endif
+}
+
+GRB_Expr GurobiModelAPI::AddExpression(const NLAffineExpression& nla) {
+  int new_pos = (int)formulas_.size();   // we may add more in GetArg...
+  formulas_.push_back( StartFormula(GRB_OPCODE_PLUS) );
+  AppendLinAndConstTerms(formulas_[new_pos], nla);
+  return MakeExpr(new_pos);
+}
+
+GRB_Expr GurobiModelAPI::AddExpression(const NLQuadExpression& nlq) {
+  int new_pos = (int)formulas_.size();   // we may add more in GetArg...
+  formulas_.push_back( StartFormula(GRB_OPCODE_PLUS) );
+  AppendLinAndConstTerms(formulas_[new_pos], nlq);
+  AppendQuadTerms(formulas_[new_pos], nlq);
+  return MakeExpr(new_pos);
+}
+
+template <class MPExpr>
+void GurobiModelAPI::AppendLinAndConstTerms(
+    GurobiModelAPI::Formula& ff, const MPExpr& nla) {
+  if (double ct = GetConstTerm(nla))
+    AppendArgument(ff, MakeConstantExpr(ct));
+  for (int i=0; i<GetLinSize(nla); ++i) {
+    if (double coef = GetLinCoef(nla, i)) {
+      if (1.0 != coef) {
+        auto f1 = StartFormula(GRB_OPCODE_MULTIPLY);
+        AppendArgument(f1, MakeConstantExpr(coef));
+        AppendArgument(f1, GetLinTerm(nla, i));
+        ff.Append(f1);
+      }  else {
+        AppendArgument(ff, GetLinTerm(nla, i));
+      }
+    }
+  }
+}
+
+template <class MPExpr>
+void GurobiModelAPI::AppendQuadTerms(
+    GurobiModelAPI::Formula& ff, const MPExpr& nlq) {
+  for (int i=0; i<GetQuadSize(nlq); ++i) {
+    if (double coef = GetQuadCoef(nlq, i)) {
+      auto f1 = StartFormula(GRB_OPCODE_MULTIPLY);
+      AppendArgument(f1, GetQuadTerm1(nlq, i));
+      AppendArgument(f1, GetQuadTerm2(nlq, i));
+      if (1.0 != coef) {
+        AppendArgument(f1, MakeConstantExpr(coef));
+      }
+      ff.Append(f1);
+    }
+  }
+}
+
+
+GRB_Expr GurobiModelAPI::AddExpression(const ExpExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_EXP);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const ExpAExpression& e) {
+  int new_pos = (int)formulas_.size();   // we may add more in GetArg...
+  formulas_.push_back( StartFormula(GRB_OPCODE_EXP) );
+  auto f1 = StartFormula(GRB_OPCODE_MULTIPLY);
+  AppendArgument(f1,
+                 MakeConstantExpr(std::log(GetParameter(e, 0))));
+  AppendArgument(f1, GetArgExpression(e, 0));
+  formulas_[new_pos].Append(f1);
+  return MakeExpr(new_pos);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const LogExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_LOG);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const LogAExpression& e) {
+  int new_pos = (int)formulas_.size();   // we may add more in GetArg...
+  formulas_.push_back( StartFormula(GRB_OPCODE_MULTIPLY) );
+  auto a = GetParameter(e, 0);
+  if (1.0==a)
+    MP_RAISE("Logarithm with base 1");
+  AppendArgument(formulas_[new_pos],
+                 MakeConstantExpr(1.0 / std::log(a)));
+  auto f1 = StartFormula(GRB_OPCODE_LOG);
+  AppendArgument(f1, GetArgExpression(e, 0));
+  formulas_[new_pos].Append(f1);
+  return MakeExpr(new_pos);
+}
+
+GRB_Expr GurobiModelAPI::AddExpression(const PowConstExpExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_POW);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const SignpowConstExpExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_SIGNPOW);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const LogisticExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_LOGISTIC);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const SinExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_SIN);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const CosExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_COS);
+}
+GRB_Expr GurobiModelAPI::AddExpression(const TanExpression &e)
+{
+  return CreateFormula(e, GRB_OPCODE_TAN);
+}
+
+#ifdef GRB_OPCODE_TANH
+GRB_Expr GurobiModelAPI::AddExpression(const TanhExpression &e)
+{
+  return CreateFormula(e, GRB_OPCODE_TANH);
+}
+#endif
+
+GRB_Expr GurobiModelAPI::AddExpression(const DivExpression& e) {
+  return CreateFormula(e, GRB_OPCODE_DIVIDE);
+}
+
+
+template <class MPExpr>
+GRB_Expr GurobiModelAPI::CreateFormula(
+    const MPExpr& mpexpr, int opcode) {
+  int new_pos = (int)formulas_.size();   // we may add more in GetArg...
+  formulas_.push_back( StartFormula(opcode) );
+  for (int i=0; i<GetNumArguments(mpexpr); ++i)
+    AppendArgument(formulas_[new_pos], GetArgExpression(mpexpr, i));
+  for (int i=0; i<GetNumParameters(mpexpr); ++i)
+    AppendArgument(formulas_[new_pos],
+                   MakeConstantExpr(GetParameter(mpexpr, i)));
+
+  return MakeExpr(new_pos);
+}
+
+void GurobiModelAPI::AppendArgument(Formula& frm, Expr expr) {
+  frm.Append(GetFormula(expr));
+}
+
+const GurobiModelAPI::Formula&
+GurobiModelAPI::GetFormula(GRB_Expr expr) const {
+  if (expr.IsExpr())
+    return formulas_.at(expr.GetExprIndex());
+  if (expr.IsVar()) {
+    return
+        formula_tmp_ = {GRB_OPCODE_VARIABLE, (double)expr.GetVarIndex()};
+  }
+  assert(expr.IsConst());
+  return
+      formula_tmp_ = {GRB_OPCODE_CONSTANT, expr.GetConst()};
+}
+
+void GurobiModelAPI::Formula::Append(const Formula& frm) {
+  assert(size());
+  int sz_last = size();
+  assert(frm.size());
+  assert(-1==frm.parent_.front());
+  assert(is_length_ok());
+  if (capacity() < size()+frm.size()) {  // manually 2x size
+    size_t sz_new = std::max(size()*2, size()+frm.size());
+    opcode_.reserve(sz_new);
+    data_.reserve(sz_new);
+    parent_.reserve(sz_new);
+  }
+  opcode_.insert(opcode_.end(), frm.opcode_.begin(), frm.opcode_.end());
+  data_.insert(data_.end(), frm.data_.begin(), frm.data_.end());
+  parent_.insert(parent_.end(), frm.parent_.begin(), frm.parent_.end());
+  parent_[sz_last] = 0;           // make it child of the current root
+  for (int i=sz_last+1; i<size(); ++i)
+    parent_[i] += sz_last;
+}
+
+#endif  // GRB_OPCODE_CONSTANT
 
 } // namespace mp

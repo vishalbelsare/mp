@@ -39,4 +39,29 @@ TEST(ErrorTest, ThrowError) {
   }
   EXPECT_STREQ("test error message", error.what());
 }
+
+TEST(ErrorTest, UnwindsLocalObjects) {
+  bool destroyed = false;
+  struct Guard {
+    bool& destroyed;
+    ~Guard() { destroyed = true; }
+  };
+  try {
+    Guard guard{destroyed};
+    throw mp::Error("unwind");
+  } catch (const mp::Error&) {
+    EXPECT_TRUE(destroyed);
+  }
+}
+
+TEST(ErrorTest, IntegerMessageArgumentAndExplicitExitCode) {
+  mp::Error formatted(fmt::format("answer {}", 42));
+  EXPECT_STREQ("answer 42", formatted.what());
+  mp::Error coded("literal {}", 200);
+  EXPECT_STREQ("literal {}", coded.what());
+  EXPECT_EQ(200, coded.exit_code());
+  mp::Error both(fmt::format("answer {}", 42), 200);
+  EXPECT_STREQ("answer 42", both.what());
+  EXPECT_EQ(200, both.exit_code());
+}
 }

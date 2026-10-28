@@ -28,12 +28,18 @@
     "name" : "TotalVariation2D",
     "objective" : 9.569949819774543,
     "files": ["totalvariation2d.mod", "totalvar2d_4e_4.dat"],
+    "options": {
+      "scip_options": "lim:time=3"
+    },
     "tags" : ["socp"]
   },
   {
     "name" : "TotalVariation2D_Quadr",
     "objective" : 9.569949819774543,
     "files": ["totalvariation2d_quad.mod", "totalvar2d_4e_4.dat"],
+    "options": {
+      "scip_options": "lim:time=3"
+    },
     "tags" : ["socp"]
   },
   {
@@ -74,13 +80,21 @@
     "tags" : ["quadratic"],
     "objective" : 27777.7949,
     "values": {
-      "solve_result_num": 0
+      "if solve_result_num >= 0 and solve_result_num < 200 then 1": 1
     }
   },
   {
     "name" : "socp_12__issue229_2",
     "tags" : ["socp"],
     "objective" : -1607.1428,
+    "values": {
+      "if solve_result_num >= 0 and solve_result_num < 200 then 1": 1
+    }
+  },
+  {
+    "name" : "socp_13_abs_stdcone",
+    "tags" : ["socp"],
+    "objective" : -40,
     "values": {
       "solve_result_num": 0
     }

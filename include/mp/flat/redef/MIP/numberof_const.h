@@ -21,7 +21,8 @@ public:
   using ItemType = NumberofConstConstraint;
 
   /// Convert in any context
-  void Convert(const ItemType& nocc, int ) {
+  /// @todo Do use context?
+  Context Convert(const ItemType& nocc, int ) {
     const auto& args = nocc.GetArguments();
     const double k = nocc.GetParameters()[0];
     std::vector<double> coefs(args.size()+1, 1.0);
@@ -29,9 +30,12 @@ public:
     for (size_t ivar = 0; ivar < args.size(); ++ivar) {
       flags[ivar] = GetMC().AssignResultVar2Args(  // flag = (args[i]==k)
             CondLinConEQ( { {{1.0}, {args[ivar]}}, k } ) );
+      GetMC().PropagateResultOfInitExpr(
+          flags[ivar], nocc.GetContext());         // #267
     }
     coefs.back() = -1.0;
     GetMC().AddConstraint( LinConEQ( {coefs, flags}, {0.0} ) );
+    return Context::CTX_MIX;
   }
 
   /// Reuse the stored ModelConverter

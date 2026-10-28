@@ -5,6 +5,8 @@
  *  via piecewise-linear approximation
  */
 
+#include <type_traits>
+
 #include "mp/common.h"
 
 #include "mp/flat/redef/redef_base.h"
@@ -17,7 +19,7 @@ namespace mp {
 std::pair<std::string, std::string>
 GetWarningKeyAndText(const char* conName, double tol) {
   std::string key =
-      std::string("PLApprox");
+      std::string("PLApprox_") + conName;
   std::string txt =
       std::string("An expression of type '") + conName +
       "' has been\n"
@@ -42,12 +44,152 @@ public:
   using ItemType = FuncCon;
 
   /// Convert in any context
-  void Convert(const ItemType& con, int ) {
+  Context Convert(const ItemType& con, int i) {
+
+    if constexpr (
+        std::is_same_v<ItemType,SinhConstraint> ||
+        std::is_same_v<ItemType,CoshConstraint> ||
+        std::is_same_v<ItemType,TanhConstraint>
+        )
+      if(GetMC().template UserAcceptsConOrExpr<ExpConstraint>())
+        return Convert_ToExp(con, i);
+
+    if constexpr (
+        std::is_same_v<ItemType,AsinhConstraint> ||
+        std::is_same_v<ItemType,AcoshConstraint> ||
+        std::is_same_v<ItemType,AtanhConstraint>
+        )
+      if(GetMC().template UserAcceptsConOrExpr<LogConstraint>()
+          && GetMC().template UserAcceptsConOrExpr<PowConstExpConstraint>())
+        return Convert_ToLogPow(con, i);
+
+    return Convert_PLApprox(con, i);
+  }
+
+  Context Convert_ToLogPow(const AsinhConstraint & con, int ) {
+    /// log(x+sqrt(x^2+1))
+    auto x = con.GetArguments()[0];
+
+    auto x2 = GetMC().AssignResultVar2Args(
+        PowConstExpConstraint({{{x}}, {2.}}));
+    auto x2plus1 = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{1.0},{x2}}, 1.0}));
+    auto sq = GetMC().AssignResultVar2Args(
+        PowConstExpConstraint({{{x2plus1}}, {.5}}));
+    auto sqplusx = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{1.0, 1.0},{x, sq}}, 0.0}));
+    GetMC().RedefineVariable(con.GetResultVar(),
+                             LogConstraint ({sqplusx}));
+    GetMC().PropagateResultOfInitExpr(con.GetResultVar(), con.GetContext());
+
+    return Context::CTX_MIX;
+  }
+
+  Context Convert_ToLogPow(const AcoshConstraint & con, int ) {
+    /// log(x+sqrt(x^2-1))
+    auto x = con.GetArguments()[0];
+
+    auto x2 = GetMC().AssignResultVar2Args(
+        PowConstExpConstraint({{{x}}, {2.}}));
+    auto x2minus1 = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{1.0},{x2}}, -1.0}));
+    auto sq = GetMC().AssignResultVar2Args(
+        PowConstExpConstraint({{{x2minus1}}, {.5}}));
+    auto sqplusx = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{1.0, 1.0},{x, sq}}, 0.0}));
+    GetMC().RedefineVariable(con.GetResultVar(),
+                             LogConstraint ({sqplusx}));
+    GetMC().PropagateResultOfInitExpr(con.GetResultVar(), con.GetContext());
+
+    return Context::CTX_MIX;
+  }
+
+  Context Convert_ToLogPow(const AtanhConstraint & con, int ) {
+    /// .5*log(1+x) - .5*log(1-x)
+    auto x = con.GetArguments()[0];
+
+    auto res1 = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{1.0},{x}}, 1.0}));
+    auto res2 = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{-1.0},{x}}, 1.0}));
+    auto log1 = GetMC().AssignResultVar2Args(
+        LogConstraint ({res1}));
+    auto log2 = GetMC().AssignResultVar2Args(
+        LogConstraint ({res2}));
+    GetMC().RedefineVariable(
+        con.GetResultVar(),
+        LinearFunctionalConstraint({{{.5, -.5},{log1, log2}}, 0.}));
+    GetMC().PropagateResultOfInitExpr(con.GetResultVar(), con.GetContext());
+
+    return Context::CTX_MIX;
+  }
+
+  Context Convert_ToExp(const SinhConstraint & con, int ) {
+    /// 0.5*(exp(x)-exp(-x))
+    auto x = con.GetArguments()[0];
+
+    auto res1 = GetMC().AssignResultVar2Args(
+        ExpConstraint({x}));
+    auto x_neg = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{-1.0},{x}}, 0.0}));
+    auto res2 = GetMC().AssignResultVar2Args(
+        ExpConstraint({x_neg}));
+
+    GetMC().RedefineVariable(
+        con.GetResultVar(),
+        LinearFunctionalConstraint({{{.5, -.5}, {res1, res2}}, 0.0}));
+    GetMC().PropagateResultOfInitExpr(con.GetResultVar(), con.GetContext());
+
+    return Context::CTX_MIX;
+  }
+
+  Context Convert_ToExp(const CoshConstraint & con, int ) {
+    /// 0.5*(exp(x)+exp(-x))
+    auto x = con.GetArguments()[0];
+
+    auto res1 = GetMC().AssignResultVar2Args(
+        ExpConstraint({x}));
+    auto x_neg = GetMC().AssignResultVar2Args(
+        LinearFunctionalConstraint({{{-1.0},{x}}, 0.0}));
+    auto res2 = GetMC().AssignResultVar2Args(
+        ExpConstraint({x_neg}));
+
+    GetMC().RedefineVariable(
+        con.GetResultVar(),
+        LinearFunctionalConstraint({{{.5, .5}, {res1, res2}}, 0.0}));
+    GetMC().PropagateResultOfInitExpr(con.GetResultVar(), con.GetContext());
+
+    return Context::CTX_MIX;
+  }
+
+  Context Convert_ToExp(const TanhConstraint & con, int ) {
+    /// sinh(x)/cosh(x)
+    auto x = con.GetArguments()[0];
+
+    auto res1 = GetMC().AssignResultVar2Args(
+        SinhConstraint({x}));
+    auto res2 = GetMC().AssignResultVar2Args(
+        CoshConstraint({x}));
+
+    GetMC().RedefineVariable(
+        con.GetResultVar(),
+        DivConstraint({res1, res2}));
+    GetMC().PropagateResultOfInitExpr(con.GetResultVar(), con.GetContext());
+
+    return Context::CTX_MIX;
+  }
+
+  /// Convert in any context
+  Context Convert_PLApprox(const ItemType& con, int ) {
     assert(!con.GetContext().IsNone());
     assert(1==con.GetArguments().size());          // 1 argument var
     auto x = con.GetArguments()[0];
     auto y = con.GetResultVar();
     PLApproxParams laPrm;
+    laPrm.bnd_checker
+        = [this](double lb, double ub, const char* kind, int i) {
+            return this->GetMC().CheckVarConDomain(lb, ub, kind, i);
+          };
     laPrm.ubErr = GetMC().PLApproxRelTol();
     auto dm = GetMC().PLApproxDomain();
     /// Narrow graph domain to +-dm
@@ -70,39 +212,41 @@ public:
       auto ubx1 = GetMC().ub(x);
       if (lbx1 > lbx || ubx1 < ubx) {
         GetMC().AddWarning(
-              "PLApproxDomain",
-              std::string("Argument domain of a '")
-              + con.GetTypeName()
-              + "'\n"
-                "has been reduced to ["
-              + std::to_string(lbx1) + ", "
-              + std::to_string(ubx1)
-              + "] for numerical reasons\n"
-              "(partially controlled by cvt:plapprox:domain.)");
+            std::string("PLApproxDomain_") + con.GetTypeName(),
+            std::string("Argument domain of a '")
+                + con.GetTypeName()
+                + "'\n"
+                  "has been reduced to ["
+                + std::to_string(lbx1) + ", "
+                + std::to_string(ubx1)
+                + "] for numerical reasons\n"
+                  "(partially controlled by cvt:plapprox:domain.)");
       }
       GetMC().RedefineVariable(y,
                                PLConstraint({x}, laPrm.plPoints));
-      GetMC().PropagateResultOfInitExpr(
-            // propagate ctx into new constr
-            con.GetResultVar(), con.GetContext());
+      // No: GetMC().PropagateResultOfInitExpr(
+      // (see #248)     con.GetResultVar(), con.GetContext());
+      GetMC().SetInitExprContext_NoProp(con.GetResultVar(), con.GetContext());
     } else {
       auto rmd = GetMC().AddVar(
-            laPrm.periodRemainderRange.lb,
-            laPrm.periodRemainderRange.ub);
+          laPrm.periodRemainderRange.lb,
+          laPrm.periodRemainderRange.ub);
       auto factor = GetMC().AddVar(
-            laPrm.periodicFactorRange.lb,
-            laPrm.periodicFactorRange.ub,
-            var::INTEGER);
+          laPrm.periodicFactorRange.lb,
+          laPrm.periodicFactorRange.ub,
+          var::INTEGER);
       GetMC().RedefineVariable(y,
                                PLConstraint({int(rmd)}, laPrm.plPoints));
-      GetMC().PropagateResultOfInitExpr(
-            // propagate ctx into new constr
-            con.GetResultVar(), con.GetContext());
+      // No: GetMC().PropagateResultOfInitExpr(
+      // (see #248)     con.GetResultVar(), con.GetContext());
+      // -- this might put the opposite context on y?
+      GetMC().SetInitExprContext_NoProp(con.GetResultVar(), con.GetContext());
       GetMC().AddConstraint( LinConEQ{  // x = period * factor + rmd
-                               { {laPrm.periodLength, 1.0, -1.0},
-                                 {int(factor), int(rmd), x} },
-                               {0.0} } );
+                                     { {laPrm.periodLength, 1.0, -1.0},
+                                      {int(factor), int(rmd), x} },
+                                     {0.0} } );
     }
+    return Context::CTX_MIX;
   }
 
 

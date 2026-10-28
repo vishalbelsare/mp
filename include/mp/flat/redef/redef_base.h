@@ -2,6 +2,7 @@
 #define REDEF_BASE_H
 
 #include "mp/format.h"
+#include "mp/flat/context.h"
 
 namespace mp {
 
@@ -17,10 +18,20 @@ public:
   /// Generic check whether the constraint
   /// needs to be converted despite being recommended for
   /// acceptance by ModelAPI.
-  /// Example: PowConstraint(x, ...) with lb(x)<0.
+  /// Example: PowConstExpConstraint(x, ...) with lb(x)<0.
   /// Default: false.
   template <class ItemType>
   bool IfNeedsConversion(const ItemType& , int ) {
+    return false;
+  }
+
+  /// Generic check whether the constraint
+  /// needs to be skipped from conversion,
+  /// despite being not accepted by ModelAPI.
+  /// Example: CondLinEQ(x == const).
+  /// Default: false.
+  template <class ItemType>
+  bool IfDelayConversion(const ItemType& , int ) {
     return false;
   }
 
@@ -55,23 +66,40 @@ public:
   /// @param item: the item to be converted
   /// @param i: item index, used to create a presolve link
   ///
+  /// @return Context used for redefinition
+  ///
   /// The Impl can reimplement this
   template <class ItemType>
-  void Convert(const ItemType& item, int i) {
+  Context Convert(const ItemType& item, int i) {
     auto ctx = item.GetContext();
     assert(!ctx.IsNone());
     auto rv = item.GetResultVar();
     auto bnd00 = item.GetAprioriBounds();
-    if ( ctx.HasNegative() &&
-         GetMC().lb(rv) < bnd00.second ) {  // Need the negative direction
+    auto needNeg = ctx.HasNegative() &&
+                   GetMC().lb(rv) < bnd00.second;
+    auto needPos = ctx.HasPositive() &&
+                   GetMC().ub(rv) > bnd00.first;
+    if (needNeg && needPos) {
+      MPD( ConvertCtxMix(item, i) );
+    }
+    else if (needNeg) {
       MPD( ConvertCtxNeg(item, i) );
     }
-    if ( ctx.HasPositive() &&
-         GetMC().ub(rv) > bnd00.first ) {   // Need the positive direction
+    else if (needPos) {
       MPD( ConvertCtxPos(item, i) );
     }
+    // else, forget
+    return ctx;        // We assume the implementation just did that
   }
 
+  /// Convert in mixed context.
+  /// By default just separate neg & pos,
+  /// but implementation might know better.
+  template <class ItemType>
+  void ConvertCtxMix(const ItemType& item, int i) {
+    MPD( ConvertCtxNeg(item, i) );
+    MPD( ConvertCtxPos(item, i) );
+  }
   /// Convert in negative context
   template <class ItemType>
   void ConvertCtxNeg(const ItemType& item, int ) {
@@ -92,12 +120,14 @@ public:
 };
 
 
-/// To be used by descendants of BasicConverter
+/// To be used by descendants of BasicItemConverter
 #define GET_CONSTRAINT_VALUE_NODE(con_type) \
   this->GetMC().GetValueNode((con_type*)nullptr)
 
 /// In the ModelConverter: to use a specific item_cvt_type<>
 /// Assumes Impl is the final ModelConverter type
+/// @note IfNeedsConversion, IfDelayConversion are delegated
+///   to the item_cvt_type<>.
 #define INSTALL_ITEM_CONVERTER(item_cvt_type) \
   item_cvt_type<Impl> item_cvt__ ## item_cvt_type ## _ \
    { *static_cast<Impl*>(this) }; \
@@ -110,9 +140,14 @@ public:
     return item_cvt__ ## item_cvt_type ## _ . \
       IfNeedsConversion(con, i); \
   } \
-  void Convert(const typename \
+  bool IfDelayCvt_impl(const typename \
+                     item_cvt_type<Impl>::ItemType& con, int i) { \
+      return item_cvt__ ## item_cvt_type ## _ . \
+      IfDelayConversion(con, i); \
+  } \
+  Context Convert(const typename \
       item_cvt_type<Impl>::ItemType& con, int i) { \
-    item_cvt__ ## item_cvt_type ## _ . Convert(con, i); \
+    return item_cvt__ ## item_cvt_type ## _ . Convert(con, i); \
   }
 
 

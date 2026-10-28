@@ -4,22 +4,122 @@
 Tools & details
 ---------------------------
 
-This section highlight some tools aiding modeling and solving.
+This section highlights some tools aiding modeling and solving.
 
 
 .. _supported-constraints:
 
-Supported constraints
-***********************************
+Reformulation settings
+***************************************************************
 
-To find out which constraints are natively supported by the solver,
-or, more generally, understood by MP,
-there are two ways.
+This sections gives a technical list of solver-side constraints
+and expressions, as well as control options for their
+reformulations.
 
-Method 1: acceptance options
+.. _flat-vs-expressions:
+
+Flat constraints vs expression trees
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some solvers require each individual expression
+to be submitted as a *flat constraint*
+with an introduced auxiliary variable for the expression
+result:
+
+.. code-block:: ampl
+
+    aux_var = max(x, y);
+
+
+Same or different solvers allow an alternative way, namely
+*expression trees* or *complete formulas*:
+
+.. code-block:: ampl
+
+    s.t. NLConstraint1: 2*x + 4*exp(16 - 2*sin(x + y^2)) <= 19;
+
+
+In the latter case, expression ``exp(16 - 2*sin(x + y^2))``
+is passed to the solver as a single formula using
+an expression tree mechanism. This representation allows
+more general treatment of nonlinearities in the solver,
+usually resulting in better performance and numerical precision.
+MP solvers accepting expression trees include Gurobi, Xpress and SCIP
+(by default) and COPT (with ``acc:_expr=1``); MP2NL passes expression trees
+to NL solvers. Option ``acc:_expr`` in a solver's option list shows whether,
+and by default how, it accepts them.
+
+Next subsection explains how a user can switch between
+flat constraints and formulas, if available,
+or force reformulation.
+
+.. _acceptance-options:
+
+Acceptance options
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-List the solver's natively supported constraints,
+Sometimes it is handy to disable all automatic reformulations,
+for example, to test manual modeling of high-level constructs.
+For that, declare all contraints as natively accepted by the solver:
+set :ref:`MP solver option <solver-options>` ``acc:_all=2``.
+Vice versa, to force full linearization, set ``acc:_all=0``.
+
+For individual constraint types, to disable reformulations,
+declare them as natively accepted:
+e.g., ``acc:alldiff=2``. Or, to apply MP reformulation,
+despite the solver natively accepting the construct,
+set the option to 0: ``acc:or=0``.
+In detail, a constraint's or expression's
+individual
+acceptance option can have some or all of the following values:
+
+.. code-block:: bash
+
+    acc:sin
+      Solver acceptance level for 'SinConstraint' as either constraint or
+      expression, default 4:
+
+      0 - Not accepted natively, automatic redefinition will be attempted
+      1 - Accepted as constraint but automatic redefinition will be used
+          where possible
+      2 - Accepted as constraint natively and preferred
+      3 - Accepted as expression but automatic redefinition will be used
+          where possible
+      4 - Accepted as expression natively and preferred
+
+
+To uniformly control all expressions, use option `acc:_expr`:
+
+.. code-block:: bash
+
+    acc:_expr
+      Solver acceptance level for all expressions, default 1:
+
+      0 - Not accepted, all expressions will be treated as flat constraints,
+          or redefined
+      1 - Accepted. See the individual acc:... options
+
+
+Value 1 passes expression trees to the solver
+(if natively supported; corresponds to value 4 in the individual options),
+value 0 uses flat constraints
+(again, those which are natively supported;
+corresponds to value 2 or 0 in the individual options.)
+
+Finally, some kinds of reformulations which are applied when needed,
+along with corresponding configuration settings,
+are described in :ref:`expressions_supported`.
+
+To find out which constraints or expressions
+are natively supported by the solver,
+or, more generally, understood by MP,
+and to control which are reformulated,
+there are two ways.
+
+Querying acceptance options
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+List the solver's natively supported constraints and expressions,
 by running the solver executable with the ``-=acc`` command-line switch
 which lists all solver options starting with the ``acc:`` prefix:
 
@@ -33,7 +133,7 @@ at `AMPL Development <https://dev.ampl.com/solvers/index.html>`_.
 
 .. _full-cons-list:
 
-Method 2: full constraint list
+Full constraint list
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 List all constraints known by the MP model converter, including some
@@ -59,37 +159,233 @@ the following ways.
 
 .. _explore-final-model:
 
-Explore the final model
+Export the solver model
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 To explore the model received by the solver,
 export the model
 in one of the solver's general formats:
 
-.. code-block:: ampl
+.. tab-set::
 
-  ampl: option mosek_auxfiles rc;   ## To use var/con names
-  ampl: option mosek_options 'writeprob=/tmp/ell.jtask'; solve;
+   .. tab-item:: Python
 
-Some solvers can export their presolved model:
+      .. code-block:: python
 
-.. code-block:: ampl
+         ampl.option["mosek_auxfiles"] = "rc"     # to use var/con names
+         ampl.solve(solver="mosek", mosek_options="writeprob=/tmp/ell.jtask")
 
-  option gurobi_options 'outlev=1 writepresolved=disj_pre.lp';
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option mosek_auxfiles rc;   ## To use var/con names
+         ampl: option mosek_options 'writeprob=/tmp/ell.jtask'; solve;
+
+Some solvers can export their presolved model
+(``writepresolved``, for example ``gurobi_options="outlev=1 writepresolved=disj_pre.lp"``).
+
+In the exported model, the rows MP generated for a logical constraint show
+the constants it used. For an implication linearized with big-M, the
+coefficient of the binary variable is :math:`-M`; compare it with what the
+data allows (:ref:`declared-bounds-bigm`).
+
+
+.. _before-benchmarking:
+
+Before benchmarking a reformulation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Four checks take minutes and often save a long benchmark:
+
+1. **Does the construct bind?** Solve once and check that the constrained
+   quantity reaches its limit somewhere: perturb the limit (an unchanged
+   objective means the constraint is slack), or tabulate where the variable
+   landed. Slack constraints can hide each other: fix the loosest one first,
+   then check again.
+2. **Compare root bounds** of the formulations (:ref:`root-bound-check`).
+3. **Read what the solver receives**: export it as above, and count the
+   variables and rows each formulation adds or removes. A restatement that
+   changes neither probably expands to the same model.
+4. **Find out which solvers can solve the reference formulation at all.** A
+   solver that cannot solve it gives no evidence about variants of it.
+
+Which formulations are worth trying is discussed in
+:ref:`modeling-formulations`; how to compare the measurements fairly, in
+:ref:`comparing-formulations`.
 
 
 
 .. _reformulation-graph:
 
-Reformulation graph
+Reformulation explorer
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The flattening and reformulation graph can be exported
-by the ``cvt:writegraph`` option (WIP).
+MP provides a tool to explore and compare the model
+provided to an MP solver driver in the NL file, and the final model
+sent to the underlying solver. Moreover, intermediate reformulation
+steps can be seen in a tree representation.
 
-At the moment only arcs are exported. Terminal nodes (variables, constraints,
-objectives) can be seen in the NL model (ampl: ``expand``) and the
-final flat model (gurobi: option ``tech:writeprob``).
+.. image:: images/ref_explore.png
+  :width: 400
+  :align: center
+  :alt: Reformulation explorer interface
+
+Tool invocation
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To use the reformulation explorer online,
+go to `Reformulation Explorer <https://ampl.com/streamlit/Reformulation_Explorer>`_.
+
+To run locally, download the `MP repository <https://github.com/ampl/mp>`_.
+In subfolder `support/modelexplore`, run the command::
+
+  streamlit run modelexplore.py --server.maxUploadSize=1024
+
+
+Using the explorer
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To produce the input data for the tool, containing the reformulations,
+run an MP solver with the `writegraph` option, as follows.
+
+.. tab-set::
+
+   .. tab-item:: AMPL
+
+        .. code-block:: ampl
+
+            ampl: option solver gurobi;           # select solver
+            ampl: option gurobi_auxfiles rc;      # write var/con names
+            ampl: option gurobi_options 'writegraph=model.jsonl lim:time=0';
+            ampl: solve;                          # solve the problem
+
+   .. tab-item:: Python
+
+        How to install using `amplpy <https://amplpy.ampl.com>`_:
+
+        .. code-block:: bash
+
+            # Install Python API for AMPL:
+            $ python -m pip install amplpy --upgrade
+
+            # Install AMPL & solver modules:
+            $ python -m amplpy.modules install gurobi # install Gurobi
+
+            # Activate your license (e.g., free ampl.com/ce or ampl.com/courses licenses):
+            $ python -m amplpy.modules activate <your-license-uuid>
+
+        How to use:
+
+        .. code-block:: python
+
+            from amplpy import AMPL
+            ampl = AMPL()
+            ...
+            ampl.set_option("gurobi_auxfiles", "rc")
+            ampl.solve(solver="gurobi", gurobi_options="writegraph=graph.jsonl")
+
+        Learn more about what we have to offer to implement and deploy `Optimization in Python <https://ampl.com/python/>`_.
+
+   .. tab-item:: Other APIs
+
+       `AMPL APIs <https://ampl.com/apis/>`_ are interfaces
+       that allow developers to access the features of the AMPL interpreter
+       from within a programming language. We have APIs available for:
+
+       - `Python <https://ampl.com/api/latest/python>`_
+       - `R <https://ampl.com/api/latest/R>`_
+       - `C++ <https://ampl.com/api/latest/cpp>`_
+       - `C#/.NET <https://ampl.com/api/latest/dotnet>`_
+       - `Java <https://ampl.com/api/latest/java>`_
+       - `MATLAB <https://ampl.com/api/latest/matlab>`_
+
+   .. tab-item:: Command line
+
+       .. code-block:: bash
+
+           auxfiles=rc ampl -obmodel model.mod data.dat
+           gurobi model.nl writegraph=reformulations.jsonl lim:time=0
+
+
+In the Explorer, upload the JSONL file. The NL (source) and solver's
+(destination) models are displayed.
+
+.. note::
+   The NL model displayed in most cases coincides
+   with the output of AMPL's `solexpand` command.
+
+   The solver model is equivalent to the solver's exported model
+   via the `tech:writeprob` option.
+
+The following operations are possible:
+
+- *Search for a text pattern*. To display the subsets of the models
+  containing a certain name, enter that in the 'Search pattern' field.
+
+- *Download (subsets of) the models*. To download currently
+  displayed (sub)models, use the download buttons.
+
+
+Reformulation tree
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+To explore the reformulation tree, select
+*NL model presentation mode: Reformulation tree* on the left panel.
+
+Then, either explore the tree representation in the *NL model* panel,
+or click *Download NL model*. This downloads a (new) JSON file which
+can be vizualized with a JSON viewer.
+
+
+Example
+~~~~~~~~~~~~~~~~~~~~~
+
+Consider the following AMPL model.
+
+.. code-block:: ampl
+
+   var x binary;
+   var y binary;
+   var z binary;
+   minimize TotalSum: z + 1;
+   subj to C1: x+y >= 1;
+   subj to C2: x^2+y^2+(z-0.7)^2 <= 1.83;
+   subj to C3: z==1 ==> x-y <= 2;
+
+To see the reformulations applied to constraint `C3`,
+download the corresponding JSONL file in the Explorer
+and enter `C3` in the 'Search pattern' field. For Gurobi,
+the resulting subset of the Solver model can be as follows:
+
+.. code-block:: ampl
+
+   ##  Variables (3)
+   var C3 binary;
+   var C3_3_ binary;
+   var C3_5_ = 1;
+
+   ##  Constraints '_indle' (1)
+   C3_4_: C3_3_==1 ==> (1*x - 1*y <= 2);
+
+   ##  Constraints '_lineq' (1)
+   C3_2_: 1*z - 1*C3 == -1;
+
+   ##  Constraints '_or' (1)
+   C3_6_: C3_5_ == OrConstraint([C3, C3_3_], []);
+
+The constraint types (`_indle`, `_or`, etc.) are as explained
+in :ref:`supported-constraints`.
+
+Selecting *NL model representation model: Reformulation tree*
+and clicking *Download NL model* results in the following JSON
+file (visualized at *https://jsonformatter.org/json-viewer*):
+
+.. image:: images/RefTree.png
+  :width: 500
+  :align: center
+  :alt: Reformulation tree vizualization (partially collapsed)
+
 
 
 
@@ -100,8 +396,11 @@ Automatic solution check
 ******************************
 
 Solutions obtained from the solver are automatically checked
-for correctness with given tolerances
-(see :ref:`solver-options` ``sol:chk:...``.)
+for correctness with given tolerances. By default, only
+AMPL-side and solver-side models are checked; to add
+also intermediate reformulated expressions, see
+:ref:`solver options <solver-options>` ``sol:chk:mode``,
+as well as other related options to control tolerances, etc.
 
 There are two checking modes: "realistic" and "idealistic".
 For linear and quadratic models they are equivalent.
@@ -125,10 +424,11 @@ Consider the disjunction constraint
 With ``y=6.0000000001`` and ``z=9.9999999999``, and assuming the solver's
 feasibility tolerance is at a typical value (such as :math:`10^{-6}`),
 most Mathematical Programming solvers consider the disjunction satisfied.
-And, from a practical viewpoint, it is (given finite-precision
+And, from a practical viewpoint, it might be (given finite-precision
 computations).
 
-Our "realistic" checking mode does exactly this: it trusts the solver results
+Our :ref:`Realistic checking mode <realistic-viols>` does exactly this:
+it trusts solver results
 up to a tolerance.
 
 In contrast, AMPL reports the constraint violated:
@@ -142,15 +442,30 @@ In contrast, AMPL reports the constraint violated:
 
 That is, when expressions ``y<=6`` and ``z>=10`` are re-evaluated
 and their results substituted into ``C``, ``C`` holds false.
+To check validity of a group of logical constraints in AMPL,
+use a statement such as this:
 
-The role of the "idealistic" checking mode is to warn the user about the fact,
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         violated = ampl.get_data(
+             "{i in 1.._nlogcons: !_logcon[i].val} _logconname[i]").to_list()
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         display {i in 1.._nlogcons: !_logcon[i].val} (_logconname[i]);
+
+
+In contrast, the role of the :ref:`Idealistic mode <idealistic-viols>`
+is to warn the user about the fact,
 that even if the solver has a correct solution up to its tolerances
 (which is examined by the "realistic" mode),
 it can be wrong for a tolerance-unaware checker.
-
-By default, "idealistic" check is performed for objective values only,
-see example below. To enable it for constraints, use
-:ref:`option <solver-options>` ``chk:mode``.
 
 
 Warnings format
@@ -160,7 +475,7 @@ Example
 ~~~~~~~~~~~~~~~~~~~~~~
 
 To explain the solution check warning format, let's solve a relaxed version
-of the following model:
+of the following infeasible model:
 
 .. code-block:: ampl
 
@@ -179,57 +494,94 @@ Running Gurobi with option ``feasrelax 1``, we trick MP
     ampl: option solver gurobi;
     ampl: option gurobi_options 'feasrelax 1';
     ampl: option gurobi_auxfiles rc;      ## To pass model names
+    ampl: option presolve 0;              ## Otherwise AMPL tightens the model
     ampl: solve;
-    Gurobi 10.0.2:   alg:feasrelax = 1
-    Gurobi 10.0.2: optimal solution; feasrelax objective 160552
-    5 simplex iterations
-    1 branching nodes
-    absmipgap=2, relmipgap=1.2457e-05
+    Gurobi 11.0.2:   alg:feasrelax = 1
+    Gurobi 11.0.2: optimal solution; feasrelax objective 1
+    1 simplex iteration
+    1 branching node
+
     ------------ WARNINGS ------------
-    WARNING:  "Solution Check"
-         [ sol:chk:feastol=1e-06, :feastolrel=1e-06, :inttol=1e-05,
-           :round='', :prec='' ]
-      - 2 original variable(s) violate bounds,
-            up to 1E+05 (abs, item 'y'), up to 1E+00 (rel, item 'y')
-    Algebraic expression violations:
-      - 1 linear constraint(s),
-            up to 2E+00 (abs, item 'C1'), up to 1E+00 (rel, item 'C1')
-    Objective value violations:
-      - 1 objective value(s) violated,
-            up to 2E+05 (abs, item 'TotalSum')
+    WARNING.  2 case(s) of "Tolerance violations". One of them:
+      Type                         MaxAbs [Name]   MaxRel [Name]
+      objective(s)                 3E+00 [TotalSum]  2E+00 [TotalSum]
+    * algebraic con(s)             1E+00 [C2]      1E+00 [C2]
+    *: Using the solver's aux variable values.
+    Documentation: mp.ampl.com/modeling-tools.html#automatic-solution-check.
 
-    WARNING:  "Solution Check (Idealistic)"
-         [ sol:chk:feastol=1e-06, :feastolrel=1e-06, :inttol=1e-05,
-           :round='', :prec='' ]
-    Objective value violations:
-      - 1 objective value(s) violated,
-            up to 2E+05 (abs, item 'TotalSum')
-    AMPL may evaluate constraints/objectives differently
-    than the solver, see mp.ampl.com/solution-check.html.
+After the solver log we see a warning of type "Tolerance violations".
+There is an absolute violation of 3 and relative violation of 1 in the objective value.
+Linear constraint `C2` has its absolute and relative violations reported.
+Lines marked with a `*` report :ref:`Realistic violations <realistic-viols>`.
 
-After the solver log we see 2 warnings. The first is ``Solution Check``.
-This reports the "realistic" violations. In square brackets we see
-numeric solver options relevant for checking.
-Then follows information on variable bound violations.
-It includes the number of violations (2), maximal absolute violation
-and variable name, as well as maximal relative violation.
+If the relative violation is missing, the respective constraint has
+right-hand side 0:
 
-Paragraph ``Algebraic expression violations`` presents similar information,
-for each expression type (see the :ref:`full list <constr-list>`). Paragraph
-``Objective value violations`` does that for objectives.
+.. code-block:: ampl
 
-The 2nd warning is ``Solution Check (Idealistic)``.
-As the idealistic check is performed by default for objectives only,
-this warning repeats the information about objective value violation.
+    WARNING:  "Tolerance violations"
+      Type                         MaxAbs [Name]   MaxRel [Name]
+    * algebraic con(s)             9E-03           -
+    *: Using the solver's aux variable values.
+    Documentation: mp.ampl.com/modeling-tools.html#automatic-solution-check.
+
+
+For such constraints, the significance of the violation
+depends on the left-hand side coefficients and variable values.
+
+To check the violations, we can recompute objective value and constraint slacks,
+as follows:
+
+.. code-block:: ampl
+
+    ampl: display x, y, TotalSum, C2.slack;
+    x = 0
+    y = 1
+    TotalSum = -2
+    C2.slack = -1
+
+
+To check validity of a group of algebraic constraints in AMPL,
+use a statement such as this:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         violated = ampl.get_data(
+             "{i in 1.._ncons: _con[i].slack < -1e-3} (_conname[i], _con[i].slack)").to_list()
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         display {i in 1.._ncons: _con[i].slack < -1e-3} (_conname[i], _con[i].slack);
+
+
 
 .. _constr-list:
 
 Expression list
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+MP solvers can report violations of various expressions
+contained in non-linear models, as follows:
+
+.. code-block:: ampl
+
+    WARNING.  2 case(s) of "Tolerance violations". One of them:
+      Type                         MaxAbs [Name]   MaxRel [Name]
+    * expr '_pow'                  7E+01           6E-04
+
 The full list of expressions which can be reported is given
 in section :ref:`Full constraint list <full-cons-list>`.
+To find these expressions in the original model, use
+the :ref:`Reformulation explorer <reformulation-graph>`.
 
+
+.. _realistic-viols:
 
 "Realistic" solution check
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -242,19 +594,34 @@ that the solver's reported solution violates checking tolerances.
 
 .. code-block:: ampl
 
-    ------------ WARNINGS ------------
-    WARNING:  "Solution Check"
-         [ sol:chk:feastol=1e-06, :feastolrel=1e-06, :inttol=1e-05,
-           :round='', :prec='' ]
-    Algebraic expression violations:
-      - 1 quadratic constraint(s),
-          up to 1E+00 (item 'socp[13]')
+    WARNING.  2 case(s) of "Tolerance violations". One of them:
+      Type                         MaxAbs [Name]   MaxRel [Name]
+    * expr '_pow'                  7E+01 [c2_4_]   6E-04 [c2_4_]
+    *: Using the solver's aux variable values.
+    Documentation: mp.ampl.com/modeling-tools.html#automatic-solution-check.
 
-In this example, realistic check reports a constraint violation
-of 1.0, which can mean a significant violation if the constraint's
-right-hand side is of moderate magnitude (in this case zero,
-that's why the relative violation is missing).
+Lines marked with a `*` report the "realistic" violations.
+Such warning can appear when solving the following example with Gurobi 11
+which uses piecewise-linear approximation by default:
 
+.. code-block:: ampl
+
+    param N integer, := 2;
+    set I := 1..N;
+    var x{I} >= 2.8;
+    maximize Sum:
+       -5 * (x[1]-0.7)^2 + x[2]^7;
+    s.t. c1: 2 * x[1] + x[2] <= 10.2;
+    s.t. c2: (1.0 / 9) *
+               (2.3*x[1] + 1.57*x[2] - 3.4)^5 +
+               x[2]^2 >= 1;
+    s.t. c3: 8 * x[1]^2 + x[2] >= 0.5;
+
+To find which `_pow` expression is violated, use
+the :ref:`Reformulation explorer <reformulation-graph>`.
+
+
+.. _idealistic-viols:
 
 "Idealistic" solution check
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -262,17 +629,23 @@ that's why the relative violation is missing).
 In this mode, non-linear expressions are recomputed and compared to solver values.
 The recomputation is performed similar to how AMPL does it when asked to
 display objective value or constraint body / slack.
-Thus, "idealistic" violations mean objective and constraint expressions
+Thus, "idealistic" violations mean that objective and constraint expressions
 reported in AMPL may be different from the solver.
 While the most serious type of violations are the "realistic" ones,
 the "idealistic" mode warns about (significant) differences when expressions are
 recomputed from scratch.
+By default, "idealistic" check is performed for objective values only.
+To enable it for constraints, use
+:ref:`option <solver-options>` ``chk:mode``.
+
+
 Consider the following example.
 
 .. code-block:: ampl
 
     var x >=0, <=100;
-    maximize Total: if x<=5 and x>=5.00000000001 then 10;
+    maximize Total:
+       if x<=5 and x>=5.00000000001 then 10;
 
 Most solvers apply a constraint feasibility tolerance of the order :math:`10^{-6}`.
 
@@ -280,18 +653,14 @@ Most solvers apply a constraint feasibility tolerance of the order :math:`10^{-6
 
     ampl: option solver gurobi;
     ampl: solve;
-    Gurobi 10.0.2: optimal solution; objective 10
+    Gurobi 11.0.2: optimal solution; objective 10
     0 simplex iterations
 
     ------------ WARNINGS ------------
-    WARNING:  "Solution Check (Idealistic)"
-         [ sol:chk:feastol=1e-06, :feastolrel=1e-06, :inttol=1e-05,
-           :round='', :prec='' ]
-    Objective value violations:
-      - 1 objective value(s) violated,
-            up to 1E+01 (abs)
-    AMPL may evaluate constraints/objectives differently
-    than the solver, see mp.ampl.com/solution-check.html.
+    WARNING.  2 case(s) of "Tolerance violations". One of them:
+      Type                         MaxAbs [Name]   MaxRel [Name]
+      objective(s)                 1E+01 [Total]   -
+    Documentation: mp.ampl.com/modeling-tools.html#automatic-solution-check.
 
     ampl: display x;
     x = 5
@@ -312,55 +681,31 @@ or whether the user has provided variable values manually.)
 To see which expressions cause the violation,
 use driver option ``chk:mode``:
 
-.. code-block:: ampl
+.. tab-set::
 
-    ampl: option gurobi_options 'chk:mode=1023';
-    ampl: solve;
-    Gurobi 10.0.2:   sol:chk:mode = 1023
-    Gurobi 10.0.2: optimal solution; objective 10
-    0 simplex iterations
+   .. tab-item:: Python
 
-    ------------ WARNINGS ------------
-    WARNING:  "Solution Check (Idealistic)"
-         [ sol:chk:feastol=1e-06, :feastolrel=1e-06, :inttol=1e-05,
-           :round='', :prec='' ]
-    Algebraic expression violations:
-      - 1 constraint(s) of type ':ifthen',
-            up to 1E+01 (abs)
-    Logical expression violations:
-      - 1 constraint(s) of type ':and'
-    Objective value violations:
-      - 1 objective value(s) violated,
-            up to 1E+01 (abs)
-    AMPL may evaluate constraints/objectives differently
-    than the solver, see mp.ampl.com/solution-check.html.
+      .. code-block:: python
 
-*Hint*: to display AMPL model names,
-set ``option (solver_)auxfiles rc;`` as follows:
+         ampl.solve(solver="gurobi", mp_options="chk:mode=1023", verbose=True)
 
-.. code-block:: ampl
+   .. tab-item:: AMPL
 
-    ampl: option gurobi_auxfiles rc;
-    ampl: solve;
-    Gurobi 10.0.2:   sol:chk:mode = 1023
-    Gurobi 10.0.2: optimal solution; objective 10
-    0 simplex iterations
+      .. code-block:: ampl
 
-    ------------ WARNINGS ------------
-    WARNING:  "Solution Check (Idealistic)"
-         [ sol:chk:feastol=1e-06, :feastolrel=1e-06, :inttol=1e-05,
-           :round='', :prec='' ]
-    Algebraic expression violations:
-      - 1 constraint(s) of type ':ifthen',
-            up to 1E+01 (abs, item 'Total_11_')
-    Logical expression violations:
-      - 1 constraint(s) of type ':and',
-            (item 'Total_7_')
-    Objective value violations:
-      - 1 objective value(s) violated,
-            up to 1E+01 (abs, item 'Total')
-    AMPL may evaluate constraints/objectives differently
-    than the solver, see mp.ampl.com/solution-check.html.
+         ampl: option gurobi_options 'chk:mode=1023';
+         ampl: solve;
+         Gurobi 11.0.2:   sol:chk:mode = 1023
+         Gurobi 11.0.2: optimal solution; objective 10
+         0 simplex iterations
+
+         ------------ WARNINGS ------------
+         WARNING.  2 case(s) of "Tolerance violations". One of them:
+           Type                         MaxAbs [Name]   MaxRel [Name]
+           expr '_ifthen'               1E+01 [Total_11_]  -
+           expr '_and'                  [Total_7_]      -
+           objective(s)                 1E+01 [Total]   -
+         Documentation: mp.ampl.com/modeling-tools.html#automatic-solution-check.
 
 
 Remedies
@@ -375,3 +720,156 @@ objective value, see a
 detailing
 a more common case and a remedy consisting of an explicit
 variable for the objective value.
+
+
+.. _mp2nl:
+
+Meta-driver MP2NL
+***************************************************************
+
+MP2NL translates MP-compatible syntax and features to any AMPL solver.
+While this might mostly benefit MINLP solvers, such as
+`Knitro <https://dev.ampl.com/solvers/knitro/index.html#knitro>`_
+or `Couenne <https://dev.ampl.com/solvers/couenne/index.html#couenne>`_,
+NLP solvers (such as `Ipopt <https://dev.ampl.com/solvers/ipopt/index.html#ipopt>`_)
+could benefit from automatic reformulation
+of :ref:`complementarity constraints <complementarity>`
+or (convex) :ref:`piecewise-linear expressions <piecewise_linear_modeling>`.
+
+
+Invocation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Some of the
+`nonlinear AMPL solvers <https://dev.ampl.com/solvers/index.html#nonlinear-solvers>`_
+(currently `Knitro <https://dev.ampl.com/solvers/knitro/index.html#knitro>`_,
+`BARON <https://dev.ampl.com/solvers/baron/index.html#baron>`_,
+`CONOPT <https://dev.ampl.com/solvers/conopt/index.html#conopt>`_,
+`LINDO Global <https://dev.ampl.com/solvers/lindoglobal/index.html>`_),
+as well as the legacy solvers
+`gurobiasl <https://dev.ampl.com/solvers/gurobi/index.html#gurobi>`_,
+`cplexasl <https://dev.ampl.com/solvers/cplex/index.html#cplex>`_,
+`xpressasl <https://dev.ampl.com/solvers/xpress/index.html#xpress>`_
+include the bridge and support option ``mp2nl=1``.
+For any other AMPL solver, call ``mp2nl`` as the solver and name the real
+solver (the *subsolver*) inside it:
+
+.. tab-set::
+
+   .. tab-item:: Python
+
+      .. code-block:: python
+
+         # a driver with the bridge built in
+         ampl.solve(solver="knitro", knitro_options="mp2nl=1 outlev=1")
+
+         # any other NL solver: MP2NL is the solver, the real one is named inside
+         ampl.solve(solver="mp2nl",
+                    mp2nl_options="solver=ipopt cvt:compl=2 cvt:compl:eps=1e-8 lim:time=60",
+                    ipopt_options="print_level=0")
+
+   .. tab-item:: AMPL
+
+      .. code-block:: ampl
+
+         ampl: option knitro_options 'mp2nl=1 outlev=1';
+         ampl: option solver knitro; solve;
+
+         ampl: option solver mp2nl;
+         ampl: option mp2nl_options 'solver=ipopt cvt:compl=2 cvt:compl:eps=1e-8 lim:time=60';
+         ampl: option ipopt_options 'print_level=0';
+         ampl: solve;
+
+**Enable the bridge whenever the model uses MP's expressions**, including the
+``==>`` syntax of indicator constraints. A solver that does not understand
+such a construct may misread the model without any error message, and return
+a confident wrong status.
+
+
+Where the options go
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``mp2nl_options`` takes **MP's** options (see :ref:`solver-options` for how
+  option strings work): ``solver=``, the reformulation options ``cvt:...``,
+  the acceptance options ``acc:...`` (:ref:`acceptance-options`), the solution check
+  ``sol:chk:...``, and generic ones such as ``lim:time``, ``mip:gap``,
+  ``outlev``. The full list is printed by ``mp2nl -=``.
+- ``<subsolver>_options`` takes **the subsolver's own** keywords. An MP keyword
+  there is usually rejected by the subsolver, and the solve fails with a
+  message such as *NLSolver: call "..." failed*.
+- With a driver that has the bridge built in (``mp2nl=1``), pass MP's
+  ``cvt:...`` and ``sol:chk:...`` options through the AMPL option
+  ``mp_options``, not through the driver's own option string, for the same
+  reason.
+- ``lim:time`` (and ``mip:gap``) are translated into the subsolver's own
+  keyword when MP2NL knows it; with ``outlev=1`` the log shows the result,
+  for example *MP2NL: subsolver options 'max_cpu_time=60'*.
+
+
+Choosing the subsolver: the class after reformulation
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+MP reformulates logic with binary variables, so the subsolver has to accept
+the problem class *after* reformulation. With ``outlev=1`` MP2NL prints the
+model before and after, for example
+
+.. code-block::
+
+    AMPL MP initial flat model has 12 variables (0 integer, 0 binary);
+    ...
+    AMPL MP final model has 51 variables (0 integer, 4 binary);
+
+A continuous NLP subsolver relaxes those binaries (Ipopt says "Treating 4
+binary and 0 integer variables as continuous") and can report an optimal
+solution that violates the logic. The :ref:`solution check <solution-check>`
+compares the returned point with the original model and prints a
+"Tolerance violations" warning. Logical constraints violated by the returned
+point can be listed from Python:
+
+.. code-block:: python
+
+    ampl.get_data("{i in 1.._nlogcons: !_logcon[i].val} _logconname[i]").to_list()
+
+So: logic needs a subsolver for integer variables (an MINLP solver);
+complementarity alone, with a smooth reformulation, can go to an NLP solver.
+
+
+.. _mp2nl-complementarity:
+
+Complementarity reformulations
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For a subsolver without native complementarity support, *cvt:compl* selects
+the reformulation of :math:`a \ge 0,\ b \ge 0,\ a \perp b`:
+
+=========  ===============================================================
+value      reformulation
+=========  ===============================================================
+0          disjunction :math:`a \le 0 \lor b \le 0` (needs integer variables)
+1          product :math:`a \cdot b = \varepsilon`
+2          Fischer-Burmeister :math:`\sqrt{a^2+b^2+2\varepsilon} = a+b`
+3          :math:`\min(a,b) = 0` (nonsmooth)
+=========  ===============================================================
+
+:math:`\varepsilon` is *cvt:compl:tol*. Each subsolver configuration sets a
+default; the reformulations can lead a local solver to different points, or
+make it fail (the nonsmooth form), so compare them on your model.
+
+
+Subsolver configurations, files, statuses
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- ``mp2nl_options='printconfigs'`` lists the configuration for each known
+  subsolver: which constructs MP2NL linearizes for it (``acc:...=0``) and which
+  defaults it sets (e.g. *cvt:compl*). If the subsolver binary has a different
+  name, choose a configuration with ``config=<name>``.
+- ``stub=<path>`` keeps the reformulated NL file as ``<path>.nl``, to inspect
+  what the subsolver received or to attach to a support request.
+- The status is the subsolver's (codes in :ref:`solve-result-codes`). A local
+  solver's "optimal" on a nonconvex model is a local optimum; some subsolvers
+  report a time-limit stop as a failure. Read ``solve_message`` and the
+  solution-check warnings together with ``solve_result``; see
+  :ref:`reading-solver-results`.
+
+Worked example: the notebooks tagged
+`mp2nl <https://colab.ampl.com/tags/mp2nl.html>`__.

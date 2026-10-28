@@ -1,21 +1,57 @@
 #ifndef GUROBIMODELAPI_H
 #define GUROBIMODELAPI_H
 
-#include <memory>
+#include <deque>
+#include "mp/utils-vec.h"
 
 #include "mp/env.h"
-#include "mp/flat/model_api_base.h"
-#include "mp/flat/constr_std.h"
-
+#include "mp/flat/nl_expr/model_api_base.h"
 #include "gurobicommon.h"
 
 namespace mp {
 
+/// How we reference an expression.
+/// @note To create,
+///   use methods MakeConstantExpr(), MakeVarExpr(), MakeExpr()
+class GRB_Expr {
+public:
+  /// Default construct
+  GRB_Expr() : kind_(-1) { }
+  /// Construct a var/expr index.
+  GRB_Expr(bool isvar, int index)
+      : kind_(isvar), id_(index) { }
+  /// Construct constant expression.
+  GRB_Expr(double v) : val_(v), kind_(2) { }
+
+  /// Check validity
+  bool IsValid() const { return kind_>=0; }
+
+  /// Is an expression?
+  bool IsExpr() const { return 0==kind_; }
+  /// Get expr index
+  int GetExprIndex() const { assert(IsExpr()); return id_; }
+
+  /// Is an variable?
+  bool IsVar() const { return 1==kind_; }
+  /// Get var index
+  int GetVarIndex() const { assert(IsVar()); return id_; }
+
+  /// Is a constant?
+  bool IsConst() const { return 2==kind_; }
+  /// Get constant
+  double GetConst() const { assert(IsConst()); return val_; }
+private:
+  double val_; int kind_; int id_;
+};
+
+
+/// GurobiModelAPI
 class GurobiModelAPI :
     public GurobiCommon,
     public EnvKeeper,
-    public BasicFlatModelAPI {
-  using BaseModelAPI = BasicFlatModelAPI;
+    public BasicExprModelAPI<GurobiModelAPI, GRB_Expr> {
+  /// Typedef main base class
+  using BaseModelAPI = BasicExprModelAPI<GurobiModelAPI, GRB_Expr>;
 
 public:
   /// Model API name
@@ -64,6 +100,20 @@ public:
   /// Ask if the solver accepts non-convex quadratic constraints
   /// (Gurobi needs option nonconvex=2 for solving)
   static constexpr bool AcceptsNonconvexQC() { return true; }
+
+  /// If cvt:prod=7 (and not 5) default.
+  /// Recommendation to return the opposite value as
+  /// AcceptsNonconvexQC().
+  static constexpr bool WantLogicalizedProd2Bin()
+  { return !AcceptsNonconvexQC(); }
+
+  /// Should we by default recognize signpow() from the input?
+  /// See option cvt:pre:signpow.
+  static constexpr bool WantSignPow() { return true; }
+
+  /// Should we by default recognize logistic() from the input?
+  /// See option cvt:pre:logistic.
+  static constexpr bool WantLogistic() { return true; }
 
   /// Ask if the solver can recognize SOCP corner cases
   /// (non-std representations such as xy>=1, see tests)
@@ -116,8 +166,8 @@ public:
   void AddConstraint(const LogConstraint& cc);
   ACCEPT_CONSTRAINT(LogAConstraint, Recommended, CG_General)
   void AddConstraint(const LogAConstraint& cc);
-  ACCEPT_CONSTRAINT(PowConstraint, Recommended, CG_General)
-  void AddConstraint(const PowConstraint& cc);
+  ACCEPT_CONSTRAINT(PowConstExpConstraint, Recommended, CG_General)
+  void AddConstraint(const PowConstExpConstraint& cc);
   ACCEPT_CONSTRAINT(SinConstraint, Recommended, CG_General)
   void AddConstraint(const SinConstraint& cc);
   ACCEPT_CONSTRAINT(CosConstraint, Recommended, CG_General) // y = cos(x)
@@ -128,6 +178,196 @@ public:
   /// Init GurobiModelAPI driver options
   void InitCustomOptions();
 
+  //////////////////////////////////////////////////////////////////////////
+  /// Expressions
+#ifdef GRB_OPCODE_CONSTANT
+
+  /// Whether accepts NLObjective
+#if (GRB_VERSION_MAJOR==13 && GRB_VERSION_MINOR>=9) || GRB_VERSION_MAJOR>=14
+#define __GRB_NL_OBJCON__
+  static int AcceptsNLObj() { return 1; }
+  void SetNLObjective(int, const NLObjective&);
+#else
+  static int AcceptsNLObj() { return 0; }
+#endif  // GRBsetnlobj
+
+  //////////////////////////// EXPRESSION TREES ////////////////////////////
+  /// Handle expression trees: inherit basic API
+  USE_BASE_EXPRESSION_HANDLERS(BaseModelAPI)
+
+  /// Overall switch
+  ACCEPT_EXPRESSION_INTERFACE(Recommended)
+
+  /// GetVarExpression(\a i): expression representing variable 0<=i<n_var.
+  /// Only called for 'nonlinear' variables.
+  Expr GetVarExpression(int i) { return MakeVarExpr(i); }
+
+  /// GetZeroExpr(): constant 0.0 expression.
+  /// Can be used to represent empty expression in an NLConstraint.
+  Expr GetZeroExpression() { return MakeEmptyExpr(); }
+
+#ifdef __GRB_NL_OBJCON__
+  ACCEPT_CONSTRAINT(NLConstraint, Recommended, CG_Algebraic)
+  void AddConstraint(const NLConstraint& nl);
+#else
+  /// Gurobi 12 has no classical NL range constraint
+  ACCEPT_CONSTRAINT(NLConstraint, NotAccepted, CG_Algebraic)
+#endif  // __GRB_NL_OBJCON__
+
+  /// NLAssignEQ: algebraic expression expicifier.
+  /// Meaning: var == expr.
+  /// @note Accessors: GetName(), GetExpression(nle), GetVariable(nle).
+  ACCEPT_CONSTRAINT(NLAssignEQ, Recommended, CG_General)
+  void AddConstraint(const NLAssignEQ& nle);
+  /// NLAssignLE: algebraic expression expicifier in positive context.
+  /// Meaning: var <= expr.
+  /// @note Accessors: GetName(), GetExpression(nle), GetVariable(nle).
+  ACCEPT_CONSTRAINT(NLAssignLE, Recommended, CG_General)
+  void AddConstraint(const NLAssignLE& nle);
+  /// NLAssignGE: algebraic expression expicifier in negative context.
+  /// Meaning: var >= expr.
+  /// @note Accessors: GetName(), GetExpression(nle), GetVariable(nle).
+  ACCEPT_CONSTRAINT(NLAssignGE, Recommended, CG_General)
+  void AddConstraint(const NLAssignGE& nle);
+
+  /// @brief Accept NLAffineExpr.
+  /// @note Use accessors, not methods;
+  /// - GetLinSize(le), GetLinCoef(le, i), GetLinTerm(le, i);
+  ///   GetConstTerm(le).
+  ACCEPT_EXPRESSION(NLAffineExpression, Recommended);
+  Expr AddExpression(const NLAffineExpression& le);
+
+  /// Accept NLQuadExpr.
+  /// @note Use accessors, not methods;
+  /// - GetLinSize(le), GetLinCoef(le, i), GetLinTerm(le, i);
+  ///   GetQuadSize(le), GetQuadCoef(le, i),
+  ///   GetQuadTerm1(le, i), GetQuadTerm2(le, i);
+  ///   GetConstTerm(le).
+  ACCEPT_EXPRESSION(NLQuadExpression, Recommended);
+  Expr AddExpression(const NLQuadExpression& le);
+
+  /// Each expression can be accepted as a proper expression,
+  /// or as a flat functional constraint var <=/==/>= expr
+  /// (in this case, with variables as arguments).
+  /// The equality/inequality type of the flat constraint is
+  /// determied by GetContext().
+  ///
+  /// @note Use accessor: GetArgExpression(ee, 0)
+  /// - don't use ...Expression's methods.
+  ///
+  /// Similar for other expression types.
+
+
+  ACCEPT_EXPRESSION(ExpExpression, Recommended)
+  Expr AddExpression(const ExpExpression& );
+  ACCEPT_EXPRESSION(ExpAExpression, Recommended)
+  Expr AddExpression(const ExpAExpression& );
+  ACCEPT_EXPRESSION(LogExpression, Recommended)
+  Expr AddExpression(const LogExpression& );
+  ACCEPT_EXPRESSION(LogAExpression, Recommended)
+  Expr AddExpression(const LogAExpression& );
+  /// @note Use accessor: GetParameter(pe, 0)
+  ///   - don't use PowConstExpExpression's methods.
+  ACCEPT_EXPRESSION(PowConstExpExpression, Recommended)
+  Expr AddExpression(const PowConstExpExpression& );
+  ACCEPT_EXPRESSION(SignpowConstExpExpression, Recommended)
+  Expr AddExpression(const SignpowConstExpExpression& );
+  ACCEPT_EXPRESSION(LogisticExpression, Recommended)
+  Expr AddExpression(const LogisticExpression& );
+  ACCEPT_EXPRESSION(SinExpression, Recommended)
+  Expr AddExpression(const SinExpression& );
+  ACCEPT_EXPRESSION(CosExpression, Recommended)
+  Expr AddExpression(const CosExpression& );
+  ACCEPT_EXPRESSION(TanExpression, Recommended)
+  Expr AddExpression(const TanExpression& );
+
+#ifdef GRB_OPCODE_TANH
+  ACCEPT_EXPRESSION(TanhExpression, Recommended)
+  Expr AddExpression(const TanhExpression& );
+#endif
+
+  ACCEPT_EXPRESSION(DivExpression, Recommended)
+  Expr AddExpression(const DivExpression& );
+
+public:
+  /// Formula
+  class Formula {
+  public:
+    /// Construct with 1 entry
+    Formula(int oc=-1, double d=-1.0, int p=-1)
+        : opcode_(1, oc), data_(1, d), parent_(1, p) { }
+    /// Capacity
+    int capacity() const { return opcode_.capacity(); }
+    /// Length
+    int size() const { assert(is_length_ok()); return opcode_.size(); }
+    /// Opcodes
+    const int* opcodes() const { return opcode_.data(); }
+    /// Data
+    const double* data() const { return data_.data(); }
+    /// Opcodes
+    const int* parents() const { return parent_.data(); }
+  protected:
+    friend class GurobiModelAPI;
+    /// Are the array lengths equal?
+    bool is_length_ok() const {
+      return opcode_.size()==data_.size() && parent_.size()==data_.size();
+    }
+    /// Append a formula
+    void Append(const Formula& frm);
+  private:
+    SmallVec<int, 16> opcode_;
+    SmallVec<double, 16> data_;
+    SmallVec<int, 16> parent_;
+    // std::vector<int> opcode_;
+    // std::vector<double> data_;
+    // std::vector<int> parent_;
+  };
+
+protected:
+  /// Create and store a formula
+  template <class MPExpr>
+  Expr CreateFormula(const MPExpr& mpexpr, int opcode);
+
+  /// start formula with opcode
+  static Formula StartFormula(int opcode)
+  { return {opcode, -1.0, -1}; }
+
+  /// Append argument subformula
+  void AppendArgument(Formula& frm, Expr expr);
+
+  /// Get formula from ID
+  /// @note the reference should be used immediately and not stored;
+  /// when calling another GetFormula(),
+  /// the previous reference may become invalid.
+  const Formula& GetFormula(Expr expr) const;
+
+  /// Make a constant expression.
+  static Expr MakeConstantExpr(double v) { return {v}; }
+
+  /// Make an empty expression.
+  static Expr MakeEmptyExpr() { return MakeConstantExpr(0.0); }
+
+  /// Make an expression representing variable \a v.
+  static Expr MakeVarExpr(int v) { return {true, v}; }
+
+  /// Make a proper expression with index \a i.
+  static Expr MakeExpr(int i) { return {false, i}; }
+
+  template <class MPExpr>
+  void AppendLinAndConstTerms(Formula& , const MPExpr& );
+
+  template <class MPExpr>
+  void AppendQuadTerms(Formula& , const MPExpr& );
+
+private:
+  /// Store every subformula - @todo only repeated ones
+  /// @note deque: for references to stay valid
+  ///   while we add subformulas
+  std::deque<Formula> formulas_;
+  mutable Formula formula_tmp_;
+
+#endif  // GRB_OPCODE_CONSTANT
+//////////////////////////////////////////////////////////////////
 
 protected:
   /// First objective's sense
@@ -136,8 +376,12 @@ protected:
 
 
 private:
+  bool has_quadratic_obj_ = false;
   /// The sense of the main objective
   obj::Type main_obj_sense_;
+
+  /// To zero out last objective
+  std::vector<int> obj_ind_save_;
 
   /// These options are stored in the class as variables
   /// for direct access

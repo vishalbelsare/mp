@@ -34,15 +34,23 @@ public:
   /// @param argv: (remaining part of) vector of cmdline strings
   /// @param flags: 0 or \a Solver::NO_OPTION_ECHO
   virtual
-  bool ParseSolverOptions(char **argv, unsigned flags = 0) {
-    /// Chance e.g. for the Backend to init solver environment, etc
-    InitOptionParsing();
-    if (ParseOptions(argv, flags)) {
-      /// Chance to consider options immediately (open cloud, etc)
-      FinishOptionParsing();
-      return true;
+  bool ParseSolverOptions(char **argv, unsigned flags = 0,
+    ASLProblem* p=0, char* additional_options=0) {
+    bool result {};
+    if (additional_options)
+      result = ParseOptions(nullptr, flags, p, additional_options);
+    else {
+      /// Chance e.g. for the Backend to init solver environment, etc
+      InitOptionParsing();
+      if (ParseOptions(argv, flags, p, additional_options)) {
+        /// Chance to consider options immediately (open cloud, etc)
+        FinishOptionParsing();
+        result = true;
+      }
+      result = false;
     }
-    return false;
+    ReportOptions2Debug();
+    return result;
   }
 
   /// Runs Solver given the NL file name
@@ -56,7 +64,7 @@ public:
   /// Read NL.
   /// This is also used by the AMPLS C API.
   /// @param opts: 0-terminated list of extra options,
-  /// to be read after the [solver]_options nev var.
+  /// to be read after the [solver]_options env var.
   /// All model-related options should be here
   /// (obj:.../objno/multiobj, cvt:..., acc:...),
   /// they are not effective after NL input.
@@ -76,8 +84,13 @@ public:
   virtual void InitOptionParsing() { }
   /// Chance to consider options immediately (open cloud, etc)
   virtual void FinishOptionParsing() { }
-  /// Having everything set up, solve the problem
+  /// Having everything set up, (re)solve the problem.
+  /// This is to be overloaded by the implementation.
   virtual void Solve() { }
+  /// Solve as a driver does: Solve() for each iteration
+  /// (e.g., each pass of the multiobjective emulator).
+  /// This is used by the AMPLS C API.
+  virtual void RunSolveIterations() { Solve(); }
 
   /// Callbacks typedef
   using Callbacks = CCallbacks;
@@ -101,6 +114,9 @@ protected:
 
   /// option parser flags
   int GetOptionFlags() const { return flag_options_; }
+
+  /// Report options for debugging
+  virtual void ReportOptions2Debug() { }
 
 
 private:

@@ -3,6 +3,7 @@
 
 #include "mp/env.h"
 #include "mp/ampls-ccallbacks.h"
+#include "mp/obj-option-base.h"
 
 namespace mp {
 
@@ -31,6 +32,24 @@ public:
 
   /// Convert the model into the solver API
   virtual void ConvertModel() = 0;
+
+  /// Need and successfully prepared the next solve iteration?
+  virtual bool PrepareSolveIteration(
+      std::function<sol::Status(void)> get_stt, std::function<Solution(void)> get_sol)
+      = 0;
+
+  /// Is/was MultiObj Emulator used?
+  virtual bool IsMOEmulationOn() const = 0;
+
+  /// Vector of pass indexes for each original objective
+  /// @note 0 is the first index
+  virtual ArrayRef<int> GetMultiobjPasses() const = 0;
+
+  /// Objective weights
+  virtual ArrayRef<double> GetObjWeightsAdapted() = 0;
+
+  /// Get obj option setter
+  virtual BasicObjOptionSetter* GetObjOptionSetter() = 0;
 
   /// Fill model traits
   virtual void FillModelTraits(AMPLS_ModelTraits& ) = 0;

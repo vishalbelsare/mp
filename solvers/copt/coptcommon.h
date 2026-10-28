@@ -2,6 +2,7 @@
 #define COPTCOMMON_H
 
 #include <string>
+#include <map>
 
 extern "C" {
   #include "copt.h"
@@ -25,9 +26,21 @@ struct CoptCommonInfo {
   void set_lp(copt_prob* lp) { lp_ = lp; }
 
 
+
+  int num_lin_obj_ {0};          // @note this is not accessible in Backend
+                                 // unless via get_other()
+  int obj_sense0_ampl_ {-1};     // 0: min, 1: max
+  void set_current_objective_options(int options) {
+      _current_objective_options = options;
+  }
+  int current_objective_options() const {
+	  return _current_objective_options;
+  }
+  
 private:
   copt_env*      env_ = NULL;
   copt_prob*      lp_ = NULL;
+  int _current_objective_options = -1;
 };
 
 
@@ -43,12 +56,25 @@ public:
   void GetSolverOption(const char* key, std::string& value) const;
   void SetSolverOption(const char* key, const std::string& value);
 
+  /// Raise "Rejecting <param>=<value>; must be between L and U"
+  /// when the value is outside the parameter's range.
+  /// COPT itself would silently clamp the value.
+  void CheckParamRange(const char* key, int value) const;
+  void CheckParamRange(const char* key, double value) const;
+
+  /// Set a parameter given as "Name value" or "Name=value",
+  /// resolving its type via COPT_Get{Int,Dbl}ParamDef()
+  void SetNativeParam(const std::string& name_value);
+
   static constexpr double Infinity() { return COPT_INFINITY; }
   static constexpr double MinusInfinity() { return -COPT_INFINITY; }
 
 protected:
   int getIntAttr(const char* name) const;
   double getDblAttr(const char* name) const;
+  void setIntAttr(const char* name, int value);
+  void setDblAttr(const char* name, double value);
+
   std::vector<double> getVarInfo(const char* name);
   std::vector<double> getConInfo(const char* name);
 

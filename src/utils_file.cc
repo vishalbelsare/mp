@@ -32,6 +32,11 @@ namespace mp {
 /// Class appending strings to file with given name
 class FileAppender__fstream : public BasicFileAppender {
 public:
+  /// Is the log active and ok?
+  bool IsOpen() const override {
+    return fs_.is_open() ? fs_.good() : false;
+  }
+
   /// Open file
   bool Open(const std::string& fln, bool fErase=false) override {
     if (fErase) {
@@ -45,7 +50,8 @@ public:
   void Close() override { fs_.close(); }
 
   /// Append string
-  bool Append(const char* s) override { fs_ << s; return fs_.good(); }
+  bool Append(const char* s) override
+  { fs_ << s << std::flush; return fs_.good(); }
 
 
 private:

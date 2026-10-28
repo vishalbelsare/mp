@@ -1,6 +1,191 @@
 Summary of recent updates to GCG for AMPL
 =========================================
 
+
+## 20261101
+- 64-bit SCIP parameters (e.g., *lim:nodes*, *lim:stallnodes*)
+  accept values above 2^31.
+- Debug builds link again (the GCG 4 release library exports
+  GCGgetOrigprob only as a macro).
+- Options aligned with GCG 4.0.2 / SCIP 10.0.2: corrected defaults,
+  ranges and texts; *det:postprocess* now sets detection/postprocess
+  (it set the postprocess detector); *pre:settings* applied the cut
+  settings instead of presolving.
+- A value rejected by GCG now aborts with a message naming the AMPL
+  option, the value and the valid range.
+- MP-standard names with the previous spellings as synonyms:
+  *mip:gap*, *mip:gapabs*, *alg:feastol*, *alg:dualfeastol*, *lim:sol*,
+  *tech:seed*, *tech:lpseed*, *tech:permseed*, *tech:outlevnative*,
+  *det:origprob*, *det:classification*, *det:benders*, ...; the bare
+  *mode* synonym belongs to *gcg:mode* only.
+- *tech:writeprob* uses MP's standard write feature (*writeprobindex*
+  etc.), *tech:writesolution*, *tech:optionnative*,
+  *tech:optionnativewrite*, *pre:solve*, *lp:scaling*, *tech:clocktype*,
+  *lim:iter*, *lim:bestobjstop*, *lim:bestbndstop*, *tech:threads*
+  (parallel pricing) and the pricing options *pricing:stabilization*,
+  *pricing:maxcolsround*, *pricing:eagerfreq*, *pricing:sorting*, ...,
+  *gcg:dispinfos*, *gcg:enforceproper*, *det:maxnclasses*.
+- Alternative solutions: *sol:poollimit* (default 10), *sol:poolgap*,
+  *sol:poolgapabs*, *ams_stub*.
+- *tech:logfile* without *tech:outlev* writes the full log to the file
+  with a quiet console. No primal values are reported without an
+  incumbent; duals are absent for MIPs and after SCIP presolving.
+- Result codes for SCIP's primal and dual bound limits.
+- The inert *alg:basis* (BASIS) feature is removed.
+
+
+## 20260624
+- Option updates for GCG 4.0.2.
+
+
+## 20260526
+- Updated to GCG 4.0.2.
+
+
+## 20260414
+- Changes in MP, in particular new naming
+  for auxiliaries.
+
+
+## 20251210
+- Option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251126
+- Updated to GCG 4.0
+
+
+## 20251015
+- Changes in MP
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options cvt:pre:unnest, cvt:pre:sort).
+  - Option cvt:pre:boundlogarg (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    pre:feastolrel both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options cvt:compl, cvt:compl:eps control
+    complementarity reformulations.
+
+
+## 20250617
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+
+## unreleased
+- Ask MP to logicalize products of 2 binaries
+  (previously only for 3 or more).
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250426
+- Relinked with SCIP version 9.2.2
+- Changes in MP
+  - Option cvt:qp2pass (default even faster parsing
+    of quadratics)
+
+
+## 20250404
+- Fixed:
+  - Option lp:threads
+  - Option lp:presolving
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250308
+- Changes in MP.
+
+
+## ## 20250204
+- Updated to GCG 3.7
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+  
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use 
+    MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
 ## 20240221
 - Updated to GCG 400
 

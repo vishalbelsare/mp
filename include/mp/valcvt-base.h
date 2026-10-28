@@ -157,9 +157,15 @@ public:
     return map_.at(i);
   }
 
-  /// Move out the single array
-  Array MoveOut()
-  { assert(IsSingleKey()); return std::move(map_.at(0)); }
+  /// Move out the single array.
+  /// An empty map (e.g., constraint values of a model
+  /// without constraints) gives an empty array.
+  Array MoveOut() {
+    if (map_.empty())
+      return {};
+    assert(IsSingleKey());
+    return std::move(map_.at(0));
+  }
 
   /// Move out array \a i
   Array MoveOut(int i) { return std::move(map_.at(i)); }
@@ -207,6 +213,9 @@ public:
     objs_.SetName(nm+"_objs");
   }
 
+  /// Default copy construct
+  ModelValues(const ModelValues& ) = default;
+
   /// Default move-copy
   ModelValues(ModelValues&& ) = default;
 
@@ -223,16 +232,20 @@ public:
   /// Construct from ModelValues<AnotherVMap>
   template <class VM2>
   ModelValues(const ModelValues<VM2>& vm) :
-    vars_(vm.GetVarValues()),
-    cons_(vm.GetConValues()),
-    objs_(vm.GetObjValues()) { }
+      name_(vm.GetName()),
+      vars_(vm.GetVarValues()),
+      cons_(vm.GetConValues()),
+      objs_(vm.GetObjValues()),
+      p_extra_(vm.ExtraData())  { }
 
   /// Assign from ModelValues<AnotherVMap>
   template <class VM2>
   ModelValues& operator=(const ModelValues<VM2>& vm) {
+    name_ = vm.GetName();
     vars_ = vm.GetVarValues();
     cons_ = vm.GetConValues();
     objs_ = vm.GetObjValues();
+    p_extra_ = vm.ExtraData();
     return *this;
   }
 
@@ -242,6 +255,9 @@ public:
   /// Empty(). True when all VMaps are
   bool Empty() const
   { return vars_.Empty() && cons_.Empty() && objs_.Empty(); }
+
+  /// Get name
+  const std::string& GetName() const { return name_; }
 
   /// Retrieve vars map, const
   const VMap& GetVarValues() const { return vars_; }
@@ -319,10 +335,10 @@ public:
   /// Produce name s + '_<counter>_' if n_>0.
   /// Post-increment counter.
   std::string MakeCountedName() const {
-    return
+    return s_; /*
         n_++==0
         ? s_
-        : s_ + '_' + std::to_string(n_) + '_';
+        : s_ + '_' + std::to_string(n_) + '_'; */
   }
   /// Use MakeCountedName().
   operator std::string() const
@@ -334,6 +350,11 @@ public:
   template <class T>
   VCString operator+(const T& arg) const
   { return {s_ + arg}; }
+
+  /// Append
+  template <class T>
+  VCString& operator+=(const T& arg)
+  { s_ += arg; return *this; }
 
   /// empty?
   bool empty() const { return s_.empty(); }
@@ -365,6 +386,17 @@ private:
 // etc...
 
 
+/// How to resolve the conflict
+/// when several values are gathered in one
+/// source or dest node
+enum class ValueResolution {
+  ValResAll,       // All values transferred
+                   // and SetVal() decides what to do
+                   // (can max out non-0 values.)
+  ValResDefault = ValResAll,
+  ValResLast       // just the last connection is transferred
+};
+
 /// ValuePresolver interface.
 /// Addresses value pre- / postsolve (solutions, basis, etc)
 class BasicValuePresolver : public EnvKeeper {
@@ -380,10 +412,12 @@ public:
 #define PRESOLVE_KIND(name, ValType) \
   virtual MVOverEl<ValType> \
     Presolve ## name ( \
-      const MVOverEl<ValType> & mv) = 0; \
+      const MVOverEl<ValType> & mv, \
+      ValueResolution = ValueResolution::ValResDefault) = 0; \
   virtual MVOverEl<ValType> \
     Postsolve ## name ( \
-      const MVOverEl<ValType> & mv) = 0;
+      const MVOverEl<ValType> & mv, \
+      ValueResolution = ValueResolution::ValResDefault) = 0;
 
   LIST_PRESOLVE_METHODS
 
@@ -446,6 +480,7 @@ protected:
     pPresolver_ = pPre;
   }
 
+public:
   const pre::BasicValuePresolver& GetValuePresolver() const
   { assert(pPresolver_); return *pPresolver_; }
   pre::BasicValuePresolver& GetValuePresolver()

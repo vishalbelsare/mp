@@ -3,6 +3,7 @@
 
 #include <list>
 #include <string>
+#include <utility>
 
 #include "mp/backend-mip.h"
 #include "mp/flat/backend_flat.h"
@@ -53,10 +54,16 @@ public:
   // Use this section to declare and implement some standard features
   // that may or may not need additional functions. 
   USING_STD_FEATURES;
+  ALLOW_STD_FEATURE(FIX_MODEL, true)
+  bool IsFixedModelEmulated() const override { return true; }
+  FixedLPResult SolveFixedLP(ArrayRef<double>) override;
 
   // Export problem
   ALLOW_STD_FEATURE(WRITE_PROBLEM, true)
   void DoWriteProblem(const std::string& name) override;
+  // Export solution
+  ALLOW_STD_FEATURE(WRITE_SOLUTION, true)
+  void DoWriteSolution(const std::string& name) override;
 
   // LP basis info, status keys
   ALLOW_STD_FEATURE(BASIS, true)
@@ -110,7 +117,7 @@ public:
 
   ArrayRef<double> GetObjectiveValues() override
   {
-    return std::vector<double>{ObjectiveValue()};
+    return std::vector<double>{HasFixedLP() ? FixedLP().objective : ObjectiveValue()};
   }
 
 
@@ -142,12 +149,15 @@ protected:
   double getPoolObjective(int i);
 
   /// Solution attributes
-  double NodeCount() const;
-  double SimplexIterations() const;
+  int NodeCount() const;
+  int SimplexIterations() const;
   int BarrierIterations() const;
 
+  std::map<std::string, std::variant<int, double, std::string>>
+      SolutionStats() override;
+
   /// Solution + termination status
-  std::pair<int, std::string> ConvertMOSEKStatus();
+  std::pair<int, std::string> GetSolveResult() override;
   /// Text to add for termination status
   std::string ConvertMOSEKTermStatus();
   void AddMOSEKMessages();
@@ -163,8 +173,29 @@ protected:
   // utility function used to decide which solution to fetch after optimization
   // sets member solToFetch_ as side effect
   MSKsoltypee GetSolutionTypeToFetch();
+  /// The solution to receive a starting basis / point
+  MSKsoltypee GetSolutionTypeForStart();
+  /// Result for a termination code (limit, interrupt, numerical trouble)
+  std::pair<int, std::string> GetLimitResult(bool has_solution);
 
 private:
+  /// Register a MOSEK parameter as an AMPL option and remember
+  /// the AMPL name for rejection messages
+  template <class Key, class... Args>
+  void AddMosekOption(const char* names, const char* descr,
+                      Key key, Args&&... args) {
+    RecordOptionName(ParamTypeOf(key), (int)key, PrimaryName(names));
+    AddSolverOption(names, descr, key, std::forward<Args>(args)...);
+  }
+  static MSKparametertypee ParamTypeOf(MSKiparame) { return MSK_PAR_INT_TYPE; }
+  static MSKparametertypee ParamTypeOf(MSKdparame) { return MSK_PAR_DOU_TYPE; }
+  static MSKparametertypee ParamTypeOf(MSKsparame) { return MSK_PAR_STR_TYPE; }
+  static std::string PrimaryName(const char* names) {
+    std::string s(names);
+    return s.substr(0, s.find(' '));
+  }
+
+  MSKtask_t fixed_task_ = nullptr;
   MSKsoltypee solToFetch_;
   MSKrescodee termCode_;
   MSKprostae proSta_;
@@ -174,9 +205,10 @@ private:
   struct Options {
     // Whether to set MSK_IPAR_MIO_CONSTRUCT_SOL
     int MIPConstructSol_=0;
-
+    int PREScale_ = 0;
     std::string paramRead_, paramWrite_;
     std::list<std::string> inlineParams_;
+    std::string logFile_;
   };
   Options storedOptions_;
 
@@ -188,6 +220,7 @@ protected:
   { return storedOptions_.inlineParams_; }
   const std::string& paramfile_read() const { return storedOptions_.paramRead_; }
   const std::string& paramfile_write() const { return storedOptions_.paramWrite_; }
+  const std::string& logFile() const { return storedOptions_.logFile_; }
 };
 
 }  // namespace mp

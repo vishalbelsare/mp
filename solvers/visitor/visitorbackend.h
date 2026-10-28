@@ -54,7 +54,9 @@ public:
   /////////////// OPTIONAL STANDARD FEATURES /////////////////
   ////////////////////////////////////////////////////////////
   // Use this section to declare and implement some standard features
-  // that may or may not need additional functions. 
+  // that may or may not need additional functions.
+  // For a full list of features possible,
+  // grep "STD_FEATURE".
   USING_STD_FEATURES;
 
   /**
@@ -71,8 +73,9 @@ public:
 
 
   /**
-   * MULTISOL support
-   * No API, see ReportIntermediateSolution()
+   * MULTISOL support.
+   *  If (need_multiple_solutions()),
+   *  call ReportIntermediateSolution() during solve or after.
    **/
   ALLOW_STD_FEATURE(MULTISOL, true)
 
@@ -118,9 +121,12 @@ public:
   * Compute the IIS and obtain relevant values
   **/
   ALLOW_STD_FEATURE(IIS, true)
-  /// Compute IIS
+  /// Compute IIS.
+  /// This method can fail (MP_RAISE)
+  /// if it discovers a different problem status.
   void ComputeIIS() override;
-  /// Retrieve IIS elements
+  /// Retrieve IIS elements.
+  /// Only called if the status was confirmed Infeasible.
   IIS GetIIS() override;
 
   /////////////////////////// Model attributes /////////////////////////
@@ -138,9 +144,13 @@ public:
 
 
 public:  // public for static polymorphism
-  /// Solve, no model modification any more (such as feasrelax).
-  /// Can report intermediate results via ReportIntermediateSolution() during this,
-  /// otherwise/finally via ReportResults()
+  /// Solve, to be overloaded by the solver.
+  /// No model modification any more.
+  /// @note If using STD_FEATURE( MULTISOL ),
+  /// can report intermediate results
+  /// via ReportIntermediateSolution() during this
+  /// (check if (need_multiple_solutions())),
+  /// otherwise afterwards.
   void Solve() override;
 
   /// Default impl of GetObjValues()
@@ -165,6 +175,9 @@ protected:
 	/// Dual solution for the LP part only.
 	/// @return empty vector if none.
   ArrayRef<double> DualSolution_LP();
+  /// Dual solution for the QP part only.
+  /// @return empty vector if none.
+  ArrayRef<double> DualSolution_QP();
 
   void WindupVISITORSolve();
 
@@ -181,7 +194,7 @@ protected:
   double SimplexIterations() const;
   int BarrierIterations() const;
 
-  std::pair<int, std::string> ConvertVISITORStatus();
+  std::pair<int, std::string> GetSolveResult() override;
   void AddVISITORMessages();
 
   /// Return basis.
@@ -208,6 +221,8 @@ private:
 
 	  std::string paramread_, paramwrite_;
     std::list<std::string> inlineparams_;
+
+    int verbosity_= 1;
   };
   Options storedOptions_;
   void printModelStats();

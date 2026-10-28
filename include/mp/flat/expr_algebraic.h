@@ -9,7 +9,9 @@
 #include <string>
 #include <cmath>
 
+#include "mp/util-json-write.hpp"
 #include "mp/arrayref.h"
+#include "mp/flat/item_namer.h"
 
 namespace mp {
 
@@ -32,7 +34,9 @@ public:
 
   /// From Body and const_term
   AlgebraicExpression(Body bt, double ct) noexcept :
-    Body(std::move(bt)), constant_term_(ct) { }
+    Body(std::move(bt)), constant_term_(ct) {
+    Body::sort_terms();
+  }
 
   /// Helper to construct AlgebraicExpression
   /// to represent something special.
@@ -50,11 +54,17 @@ public:
   /// Constructor from helper "variable"
   AlgebraicExpression(Variable i) { Body::add_term(1.0, i.v); }
 
+  /// Is constant 0?
+  bool empty() const { return !constant_term() && is_constant(); }
+
+  /// booleanize
+  operator bool() const { return !empty(); }
+
   /// Whether AlgebraicExpression represents a constant
   bool is_constant() const { return Body::empty(); }
   /// true when constant=0 and 1 variable with coef 1.0
   bool is_variable() const {
-    return 0.0==std::fabs(constant_term()) && GetBody().is_variable();
+    return !constant_term() && GetBody().is_variable();
   }
   /// if affine
   bool is_affine() const { return Body::is_linear(); }
@@ -63,6 +73,11 @@ public:
   const Body& GetBody() const { return (const Body&)(*this); }
   /// Get the body
   Body& GetBody() { return (Body&)(*this); }
+
+  /// Get the body, const
+  const Body& GetArguments() const { return GetBody(); }
+  /// Get the body
+  Body& GetArguments() { return GetBody(); }
 
   /// Get the body (variable terms)
   /// of a corresponding algebraic constraint
@@ -101,6 +116,11 @@ public:
     constant_term_ *= n;
   }
 
+  /// Clear
+  void clear() {
+    GetBody().clear();
+    constant_term_ = 0.0;
+  }
   /// operator==
   bool operator==(const AlgebraicExpression& ae) const {
     return GetBody()==ae.GetBody() &&
@@ -110,6 +130,37 @@ public:
 private:
   double constant_term_ = 0.0;
 };
+
+
+/// Write algebraic expr.
+template <class Writer, class Terms, class Namer>
+inline void WriteModelItem(Writer& wrt,
+                    const AlgebraicExpression<Terms>& ale,
+                    Namer& vnam) {
+  WriteModelItem(wrt, ale.GetBody(), vnam);
+  wrt << (ale.constant_term()>=0 ? " + " : " - ")
+      << std::fabs(ale.constant_term());
+}
+
+
+/// Very general template to write
+/// a JSON-like representation of anything
+template <class Writer, class Obj>
+void WriteJSON(Writer w, const Obj& o) {
+  w = o;       // default: assume assignable
+}              // unless WriteJSON is specialized for Obj
+
+/// Specialize our JSON writer
+using JSONW = MiniJSONWriter<fmt::MemoryWriter>;
+
+/// Write an AlgebraicExpression
+template <class Terms>
+inline void WriteJSON(JSONW jw,
+                      const AlgebraicExpression<Terms>& ale) {
+  WriteJSON(jw["body"], ale.GetBody());
+  jw["const_term"] = ale.constant_term();
+}
+
 
 } // namespace mp
 

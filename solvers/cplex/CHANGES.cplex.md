@@ -1,0 +1,324 @@
+Summary of recent updates to CPLEX for AMPL
+==============================================
+
+
+## 20261101
+- Fix IIS reporting for mixed linear, quadratic, indicator, and SOS
+  constraints: keep their index spaces separate to prevent incorrect
+  linear IIS suffixes and out-of-bounds writes.
+- Option *obj:multi:stats=1* reports multi-objective pass
+  statistics in native mode (*obj:multi=1*).
+- Add separate fixed-model limits *mip:basis:timelimit* and
+  *mip:basis:iterlimit*.
+- Retain the MIP solution when a supplementary fixed solve reaches a limit.
+- Option fixes: *cut:cuts* had no effect; *bar:growth*, *bar:objrange*,
+  *tech:workfilelim*, *cut:factor* were rejected by CPLEX (wrong value type);
+  *alg:droptol* was truncated to an integer; *pre:reformulations* set the
+  wrong parameter (new *pre:reduce* for primal/dual reductions);
+  *alg:netfind* values are 1/2/3 as in CPLEX; *pre:node* accepts 2 and 3;
+  the primalopt/dualopt/barrier/network/sifting flags also select the
+  MIP node algorithm.
+- Rejected parameter values now abort with
+  "Rejecting <parameter>=<value>; must be between L and U"
+  instead of being silently ignored.
+- *bar:crossover* defaults to automatic crossover, so the barrier
+  method returns a basic LP solution as the ASL driver does.
+- Alignment with the ASL driver: many keyword synonyms
+  (cliques, feasibility, nodes, startalg, subalg, solutionlim, ...);
+  *perturb* is now a synonym of *lp:doperturb* (the perturbation constant
+  is *lp:perturb* with synonyms *perturbation*, *perturbconst*);
+  *cut:mfc* renamed to *cut:mcf* (old spelling kept).
+- New options for CPLEX parameters previously only in the ASL driver
+  (*lp:markowitz*, *lp:pgradient*, *lp:pricing*, *lp:refactor*,
+  *lp:singular*, *mip:heurfreq*, *mip:heureffort*, *mip:rinsheur*,
+  *mip:lbheur*, *mip:probe*, *mip:symmetry*, *pre:repeat*,
+  *mip:repairtries*, *mip:submipnodelim*, *mip:strongcand*, *mip:strongit*,
+  *lim:treememory*, *mip:polishafter:\**, *mip:kappastats*,
+  *mip:miqcpstrat*, *mip:ordertype*, *bar:ordering*, *bar:qcpcomptol*,
+  *pre:qtolin*, *tech:clocktype*, *tech:parallelmode*, *tech:datacheck*,
+  *tech:warninglimit*, *tech:record*) and further CPLEX parameters
+  (*pre:folding*, *mip:dive*, *mip:cardls*, *lp:dynamicrows*,
+  *pre:qcpduals*, *pre:qpmakepsd*, *mip:eplin*, *alg:feasrelax:tol*,
+  *tech:writelevel*, *tech:intsolfileprefix*, *tech:mpslong*,
+  *tech:clonelog*, *tech:tunemeasure*, *alg:siftalg*, *lim:siftiter*,
+  *tech:siftdisplay*).
+- New driver features from the ASL driver: *tech:tunefix*,
+  *tech:tunefixfile*, *mip:start:effort* (mipstartvalue),
+  *sol:poolpopulate=2*, *mip:basis:method* (finalmipalg), *alg:readbasis*,
+  *alg:concurrent*, *alg:feasopt*/*alg:feasoptobj*, *tech:prestats*.
+
+
+## 20260720
+- Fixed IIS reporting for range constraints.
+- Support IIS export to file: *writesol=(name).clp*.
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+  - The main driver code is separated into a shared
+    library and used commonly with AMPLS API.
+
+
+## 20260527
+- Updated CPLEX libraries to 22.2.0, which include some bug fixes.
+
+
+## 20260414
+- Changes in MP, see MP changelog.
+
+
+## 20260310
+- Added options `mip:objdiff` and `mip:relobjdiff`
+
+
+## 20251210
+- Option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- New option *obj:multi:options* to control
+  whether multi-objective option suffixes
+  are used.
+- Allow standalone *mipdisplay=..*,
+  *lpdisplay=..*, *bardisplay=..* without
+  *outlev*.
+
+
+## 20251015
+- Changes in MP
+- Fixed *multiobj=1/2* for a single objective.
+  Running multiobjective for a single-objective
+  model makes sense with a negative `.objweight`
+  suffix.
+
+
+## 20250924
+- Option *alg:start:advance*
+- Added options to execute the CPLEX tuner
+  (see *tech:tunebase* and other *tech:* options)
+
+
+## 20250828
+- Options *tech:optionnativeread*, *tech:optionnativewrite*
+  to read/write CPLEX PRM files.
+- Options *lim:(lower/upper)(cutoff/obj/objstop)* for
+  limiting search in the Simplex and Branch-and-Bound
+  algorithms.
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options *cvt:pre:unnest*, *cvt:pre:sort*).
+  - Option *cvt:pre:boundlogarg* (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+- Options *alg:numericalemphasis*, *tech:memoryemphasis*.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options pre:feastol,
+    pre:feastolrel both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options cvt:compl, cvt:compl:eps control
+    complementarity reformulations.
+
+
+## 20250617
+- Option lp:opttol (opttol).
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+## 20250429
+- Fix a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+- Options alg:dual and pre:dual are coordinated for
+	compatibility with the legacy ASL driver.
+
+
+## 20250424
+- Changes in MP
+  - Option cvt:qp2pass (default even faster parsing
+    of quadratics)
+- Compatibility updates
+  - Option netopt accepts numeric argument.
+    For keyword-only, use option alg:network.
+    Note the new default (compared to cplexasl):
+    netopt=0.
+  - Options netdisplay, netfeasibility, netfind,
+    netoptimality, and netpricing
+  - Options primal, dual (both dummy)
+- Fixed output logging incl. options mipdisplay,
+  mipinterval, lpdisplay, bardisplay, modisplay,
+  netdisplay
+
+
+## 20250329
+- Changes in MP:
+  - Option cvt:multoutcard to limit the size of
+    out-multiplied QP expressions. Can improve speed
+    on large models.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250308
+- Changes in MP.
+
+
+## 20241212
+- Releasing with CPLEX version 22.1.2
+
+
+## 20241206
+- Added support for sensitivity analysis (keyword `sensitivity`)
+- Added keywords `mip:nodefile`, `tech:workdir`, `tech:workfilelim`
+
+
+## 20240828
+- Options `primalopt`, `dualopt`, `baropt`, `siftopt`, `netopt`, `bendersopt` are now
+  flags (e.g. they have to be set without a value)
+
+
+## 20240823
+- CPLEX MP driver is now the default. To use the previous ASL-based driver set:
+  `option solver cplexasl;`
+- Added many options available in the ASL driver
+- Notable changes with ASL driver:
+   - Keyword 'basis_cond' is now 'kappa' and follows the standard MP implementation
+   - Multiobjective optimization follows the MP standard implementation
+   - Choosing solution algorithm for the LP problems or the initial MIP subproblem 
+     (formerly `mipstartalg`) now follows the same standard as other MP drivers: 
+     see `alg:method` in the `-=` output
+   - Former option `timing` is now implemented through the corresponding
+     MP feature. To print the number of available cores use
+     `tech:numcores`.
+   - Use MP feature `tech:writemodelonly` instead of `writeprob` + `nosolve`.
+     Note that `nosolve` still applies when specifying `writemipstart`
+- Conversion of basis status for constraints depending on sense
+
+## 20240801
+- Fix a problem that occured when reporting IIS
+- Removed some noise from console output
+
+
+## 20240724
+- Option *acc:_all*
+	- Useful to disable all reformulations (acc:_all=2),
+		or force linearization (acc:_all=0).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+	- obj:multi=2 forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+		.objasbtol, .objreltol.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints
+- Fix no-solution case in multi-objective emulator
+
+
+## 20240529
+- *Multi-objective emulator*
+	- All flat MP solvers support multi-objective mode (obj:multi=1),
+		either natively, or via emulation.
+	- Suffixes .objpriority, .objweight, .objabstol, .objreltol.
+	- [BREAKING] Default intuitive handling of .objweight,
+		see option obj:multi:weight, even when natively supported.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+  
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use the solver's
+    native PL functions or MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
+## 20240115
+- *Solve result codes*.
+  - List codes by running (solver) -!
+  - [BREAKING] Standardized codes. Major changes:
+    - 100-199 (solved?) means solution candidate
+      provided, but can be suboptimal/infeasible
+    - 300-349 means unbounded problem but
+      feasible solution returned
+    - 400-449 means limit/interrupt but feasible
+  - [BREAKING] sol:chk:fail returns code 150 (solved?)
+- Improved translation of *SOCP constraints*.
+  - Options cvt:socp, cvt:socp2qc.
+- Compact solution check warnings
+- Fixed presolve of the power function #226.
+- Added fixed model for `mip:basis`
+- Added options:
+  - `alg:method` and flags to choose the solution algorithm
+  - `mip:nodemethod` to choose the algorithm used for MIP node problems
+  - `lp:solutiontype` to choose if to use crossover to get a basis basis solution after barrier
+
+
+## 20231122
+- Public beta; implemented most [features](https://mp.ampl.com/features-guide.html) in MP:
+  model export, warm start, input and output basis, feasibility relaxation,
+  multiple solutions, kappa, unbounded rays, IIS, return MIP gap, 
+  return dual bound
+- Native Model support:
+    - continuous and integer variables
+    - multiple objectives, quadratic objectives
+    - linear and quadratic constraints, indicator constraints and PL functions
+    - special ordered sets (type 1 and 2)
+
+
+## 20231117
+- MP update: fixed graceful exit on Ctrl-C from AMPL in Linux
+  and fixed issue with reading text-format NL files
+
+
+## 20230815
+- Fixed a bug causing repeated names for
+  auxiliary variables and constraints.
+- Option values can be assigned without '='.
+- Changed default tolerance for strict comparisons
+  to 0 (option cmp:eps, #102.)
+- Fixed a bug where equivalent conditional
+  comparisons were not unified.
+
+ 

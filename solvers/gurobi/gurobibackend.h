@@ -66,6 +66,8 @@ public:
   void ObjWeights(ArrayRef<double>) override;
   void ObjAbsTol(ArrayRef<double>) override;
   void ObjRelTol(ArrayRef<double>) override;
+  void SetMultiobjOptions(BasicObjOptionSetter* ) override;
+  MultiobjPassStats GetMultiobjPassStats() override;
   /**
    * MULTISOL support.
    * No API, use ReportIntermediateSolution()
@@ -133,6 +135,8 @@ public:
   **/
   ALLOW_STD_FEATURE( KAPPA, true)
   double Kappa() override;
+  ALLOW_STD_FEATURE( KAPPA_EXACT, true)
+  double KappaExact() override;
   /**
   * FeasRelax
   **/
@@ -148,6 +152,15 @@ public:
   * Impl should check need_fixed_MIP()
   **/
   ALLOW_STD_FEATURE( FIX_MODEL, true )
+  /**
+  * Stop the MIP search on a plateau (mip:plateau* options).
+  * PLATEAU_STOP_BOUND is required too: without it, core never
+  * registers mip:plateauabsgaptol/mip:plateaurelgaptol as options, even
+  * though DoPlateauCallback() below always computes and reports gap.
+  **/
+  ALLOW_STD_FEATURE( PLATEAU_STOP, true )
+  ALLOW_STD_FEATURE( PLATEAU_STOP_BOUND, true )
+  void SetupPlateauCallbacks() override;
 
 
   ///////////////////// Model attributes /////////////////////
@@ -201,6 +214,7 @@ protected:
 
   void OpenGurobiComputeServer();
   void OpenGurobiCloud();
+  void OpenGurobiWLS();
 
   void InputGurobiExtras();
   /// .funcpieces etc.
@@ -220,6 +234,17 @@ protected:
   void PrepareGurobiSolve();
   void SetPartitionValues();
 
+  /// Native callback implementing PLATEAU_STOP / PLATEAU_STOP_BOUND:
+  /// forwards new incumbents (GRB_CB_MIPSOL) to ReportIncumbentForPlateau(),
+  /// and derives absgap/relgap from GRB_CB_MIPSOL_OBJ/OBJBND (at incumbent
+  /// time) and GRB_CB_MIP_OBJBST/OBJBND (periodically) to report via
+  /// ReportGapForPlateau(); GRB_CB_POLLING (Gurobi's generic, always-on
+  /// polling context) calls CheckTimeoutForPlateau() so the plateau clock
+  /// is still checked even between incumbents/gap ticks. Terminates the
+  /// solve when any of these signals a plateau.
+  static int __stdcall DoPlateauCallback(
+      GRBmodel* model, void* cbdata, int where, void* usrdata);
+
   void DoGurobiTune();
 
   void WindupGurobiSolve();
@@ -227,7 +252,9 @@ protected:
   void ReportResults() override;
   void ReportGurobiResults();
 
-  std::pair<int, std::string> ConvertGurobiStatus() const;
+  std::pair<int, std::string> GetSolveResult() override;
+  std::pair<int, std::string>
+  GetSolveResult(int optstat, int nsol);
   void AddGurobiMessage();
 
   void ReportGurobiPool();
@@ -265,7 +292,13 @@ protected:
   double NodeCount() const;
   double SimplexIterations() const;
   int BarrierIterations() const;
+  int NLBarrierIterations() const;
+  double PDHGIterations() const;
 
+  std::map<std::string, std::variant<int, double, std::string>>
+      SolutionStats() override;
+
+  void ReportGurobiWork();
 
 protected:  //  ///////////////// Utilities ///////////////////
   /// Swap 0 with -1.
@@ -282,7 +315,7 @@ private:
   struct Options {
     std::string paramRead_, paramWrite_, exportPresolvedFile_, logFile_;
     std::list<std::string> inlineParams_;
-
+    int reportWork_ = 0;
     int nMIPStart_=1;
     int nPoolMode_=2;
 
@@ -299,11 +332,19 @@ private:
     int server_priority_=0, server_insecure_=0;
     double server_timeout_=10.0;
 
+    // Web License Service
+    int wls_licenseid_=-1, wls_tokenduration_=0;
+    std::string wls_accessid_, wls_secret_, wls_token_;
+    double wls_tokenrefresh_=0;
+    
     std::string tunebase_;
   } storedOptions_;
 
 
 protected:  //////////// Option accessors ////////////////
+    
+
+
   int Gurobi_mipstart() const { return storedOptions_.nMIPStart_; }
 
   const std::string& paramfile_read() const { return storedOptions_.paramRead_; }
@@ -326,16 +367,26 @@ protected:  //////////// Option accessors ////////////////
   int server_insecure() const { return storedOptions_.server_insecure_; }
   int server_timeout() const { return storedOptions_.server_timeout_; }
 
+  // Web License Service
+  int wls_licenseid() const { return storedOptions_.wls_licenseid_; }
+  int wls_tokenduration() const { return storedOptions_.wls_tokenduration_; }
+  double wls_tokenrefresh() const { return storedOptions_.wls_tokenrefresh_; }
+  const std::string& wls_accessid() const { return storedOptions_.wls_accessid_; }
+  const std::string& wls_secret() const { return storedOptions_.wls_secret_; }
+  const std::string& wls_token() const { return storedOptions_.wls_token_; }
+
   const std::string& tunebase() const { return storedOptions_.tunebase_; }
 
   const std::string& logfile() const { return storedOptions_.logFile_; }
 
   const std::string& exportPresolvedFile() const { return storedOptions_.exportPresolvedFile_; }
 
+  int need_report_work() const { return storedOptions_.reportWork_; }
 
 private: /////////// Suffixes ///////////
   const SuffixDef<int> sufHintPri = { "hintpri", suf::VAR | suf::INPUT };
 
+  const SuffixDef<double> sufWork = { "work", suf::PROBLEM | suf::OUTONLY };
 
   /// For "obj:*:method" etc
 public:

@@ -324,10 +324,8 @@ Gecode::IntPropLevel MPToGecodeConverter::GetIPL(int con_index) const {
   if (!ipl_suffix_)
     return ipl_;
   int value = ipl_suffix_.value(con_index);
-  assert(value == Gecode::IPL_VAL || value == Gecode::IPL_BND ||
-         value == Gecode::IPL_DOM || value == Gecode::IPL_DEF);
-  if (value < 0 || value > Gecode::IPL_DEF)
-    throw Error("Invalid value \"{}\" for suffix \"ipl\"", value);
+  if (value < Gecode::IPL_DEF || value > Gecode::IPL_DOM)
+    throw Error(fmt::format("Invalid value \"{}\" for suffix \"ipl\"", value));
   return static_cast<Gecode::IntPropLevel>(value);
 }
 
@@ -518,14 +516,14 @@ GecodeSolver::Stop::Stop(GecodeSolver &solver)
 : solver_(solver) {
   output_or_limit_ = solver.output_ || solver.time_limit_ < DBL_MAX ||
       solver.node_limit_ != ULONG_MAX || solver.fail_limit_ != ULONG_MAX;
-  steady_clock::time_point start = steady_clock::now();
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
   double end_time_in_ticks = start.time_since_epoch().count() +
-      solver.time_limit_ * steady_clock::period::den /
-      steady_clock::period::num;
-  end_time_ = steady_clock::time_point(steady_clock::duration(
-      end_time_in_ticks >= std::numeric_limits<steady_clock::rep>::max() ?
-          std::numeric_limits<steady_clock::rep>::max() :
-          static_cast<steady_clock::rep>(end_time_in_ticks)));
+      solver.time_limit_ * std::chrono::steady_clock::period::den /
+      std::chrono::steady_clock::period::num;
+  end_time_ = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(
+      end_time_in_ticks >= std::numeric_limits<std::chrono::steady_clock::rep>::max() ?
+          std::numeric_limits<std::chrono::steady_clock::rep>::max() :
+          static_cast<std::chrono::steady_clock::rep>(end_time_in_ticks)));
   next_output_time_ = start + GetOutputInterval();
 }
 
@@ -536,7 +534,7 @@ bool GecodeSolver::Stop::stop(
     return true;
   }
   if (!output_or_limit_) return false;
-  steady_clock::time_point time = steady_clock::now();
+  std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now();
   if (solver_.output_ && time >= next_output_time_) {
     solver_.Output("{:10} {:10} {:10}\n", s.depth, s.node, s.fail);
     next_output_time_ += GetOutputInterval();
@@ -569,7 +567,7 @@ template <typename T>
 std::string GecodeSolver::GetEnumOption(const SolverOption &opt, T *ptr) const {
   for (mp::ValueArrayRef::iterator
       i = opt.values().begin(), e = opt.values().end(); i != e; ++i) {
-    if (*ptr == i->data)
+    if (static_cast<intptr_t>(*ptr) == std::get<intptr_t>(i->data))
       return i->value;
   }
   return fmt::format("{}", *ptr);
@@ -581,7 +579,7 @@ void GecodeSolver::SetEnumOption(
   for (mp::ValueArrayRef::iterator
       i = opt.values().begin(), e = opt.values().end(); i != e; ++i) {
     if (value == i->value) {
-      *ptr = static_cast<T>(i->data);
+      *ptr = static_cast<T>(std::get<intptr_t>(i->data));
       return;
     }
   }
@@ -603,9 +601,13 @@ void GecodeSolver::Output(fmt::CStringRef format, const fmt::ArgList &args) {
   Print(format, args);
 }
 
+#ifndef YYYYMMDD
+  #define YYYYMMDD 20261101             // Update with CHANGES.gecode.md
+#endif
+
 GecodeSolver::GecodeSolver()
 : SolverImpl<Problem>(
-    "gecode", "gecode " GECODE_VERSION, 20160205, MULTIPLE_SOL),
+    "gecode", "gecode " GECODE_VERSION, YYYYMMDD, MULTIPLE_SOL),
   output_(false), output_frequency_(1), output_count_(0), solve_code_(-1),
   ipl_(Gecode::IPL_DEF),
   var_branching_(IntVarBranch::SEL_SIZE_MIN),
@@ -783,7 +785,7 @@ GecodeSolver::ProblemPtr GecodeSolver::Search(
 }
 
 void GecodeSolver::Solve(Problem &p, SolutionHandler &sh) {
-  steady_clock::time_point time = steady_clock::now();
+  std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now();
 
   SetStatus(-1, "");
 

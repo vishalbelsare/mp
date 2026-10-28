@@ -1,6 +1,9 @@
 #include <vector>
 #include <climits>
 #include <cfloat>
+#include <cmath>
+#include <cstring>
+#include <cstdlib>
 #include <algorithm>
 
 #include "mp/env.h"
@@ -39,20 +42,78 @@ CreateHighsModelMgr(HighsCommon&, Env&, pre::BasicValuePresolver*&);
 
 
 HighsBackend::HighsBackend() {
-  OpenSolver();
-
+  LoadHighsLibrary(false);
+  OpenSolver(); 
   pre::BasicValuePresolver* pPre;
   auto data = CreateHighsModelMgr(*this, *this, pPre);
   SetMM( std::move( data ) );
   SetValuePresolver(pPre);
-
-  /// Copy env/lp to ModelAPI
-  copy_common_info_to_other();
 }
 
 HighsBackend::~HighsBackend() {
+  DestroyFixedLP();
   CloseSolver();
 }
+
+void HighsBackend::DestroyFixedLP() {
+  if (fixed_) {
+    loader().Highs_destroy(fixed_);
+    fixed_ = nullptr;
+  }
+}
+
+void HighsBackend::CopyOptionsToFixedLP(void* fixed) {
+  // Options not copied: the algorithm (always simplex, to obtain a basis),
+  // limits (mip:basis:timelimit/iterlimit apply instead) and file output.
+  static const char* const skip[] = {
+    "solver", "time_limit", "simplex_iteration_limit", "ipm_iteration_limit",
+    "pdlp_iteration_limit", "qp_iteration_limit",
+    "objective_bound", "objective_target",
+    "write_model_to_file", "write_presolved_model_to_file",
+    "write_solution_to_file", "write_model_file", "solution_file",
+    "write_basis_file", "write_presolved_model_file", "write_iis_model_file",
+    "read_solution_file", "read_basis_file",
+    "mip_improving_solution_save", "mip_improving_solution_file",
+    "mip_debug_solution_file"
+  };
+  char sval[kHighsMaximumStringLength];
+  // Names belong to the driver, not to a possibly different vendor CRT.
+  for (const auto& option : appliedOptions_) {
+    const char* name = option.first.c_str();
+    bool skipit = false;
+    for (auto sk : skip)
+      if (0 == std::strcmp(sk, name)) { skipit = true; break; }
+    if (skipit)
+      continue;
+    switch (option.second) {
+    case kHighsOptionTypeBool: {
+      int v = 0;
+      HIGHS_CCALL(loader().Highs_getBoolOptionValue(lp(), name, &v));
+      HIGHS_CCALL(loader().Highs_setBoolOptionValue(fixed, name, v));
+      break;
+    }
+    case kHighsOptionTypeInt: {
+      int v = 0;
+      HIGHS_CCALL(loader().Highs_getIntOptionValue(lp(), name, &v));
+      HIGHS_CCALL(loader().Highs_setIntOptionValue(fixed, name, v));
+      break;
+    }
+    case kHighsOptionTypeDouble: {
+      double v = 0;
+      HIGHS_CCALL(loader().Highs_getDoubleOptionValue(lp(), name, &v));
+      HIGHS_CCALL(loader().Highs_setDoubleOptionValue(fixed, name, v));
+      break;
+    }
+    case kHighsOptionTypeString:
+      HIGHS_CCALL(loader().Highs_getStringOptionValue(lp(), name, sval));
+      HIGHS_CCALL(loader().Highs_setStringOptionValue(fixed, name, sval));
+      break;
+    default:
+      break;
+    }
+  }
+}
+
 
 const char* HighsBackend::GetBackendName()
   { return "HighsBackend"; }
@@ -62,20 +123,74 @@ std::string HighsBackend::GetSolverVersion() {
     HIGHS_VERSION_MINOR, HIGHS_VERSION_PATCH);
 }
 
+void HighsBackend::InputStartValues() {
+  // Set the accumulated objectives
+  // In case of native MO, accObjectives will contain all the problem's objectives - and their meta into
+  // and will have the flag hadMultiObjective set to true
+  accObjectives().setAllInHighs(lp());
+  accObjectives().clear();
+  // Changing objective data invalidates a HiGHS start: install it afterwards.
+  BaseBackend::InputStartValues();
+}
+  void HighsBackend::FinishOptionParsing() {
+    // If CUDA is specified, scrap the current library, load the cuda one
+    // and replay all the options
+
+      if (storedOptions_.onGPU())
+      {
+    #ifdef __APPLE__
+          throw std::runtime_error("GPU support is not available on MacOS");
+    #endif
+      loader().Highs_destroy(lp());
+      LoadHighsLibrary(true);
+      OpenSolver();
+      ReplaySolverOptions();
+    }
+
+    std::string method = storedOptions_.lpmethod_;
+    if (method == "pdlp-gpu") method = "pdlp";
+    else if (method == "hipdlp-gpu") method = "hipdlp";
+    try {
+      SetSolverOption("solver", method);
+    } catch (const std::exception& e) {
+      (void)e;
+      MP_RAISE(fmt::format(
+          "alg:method={} is not available in this HiGHS library build "
+          "(see the HiGHS message above)", storedOptions_.lpmethod_));
+    }
+    if (feasrelax() && 1 != feasrelax())
+      MP_RAISE(fmt::format(
+          "alg:feasrelax={}: HiGHS supports only mode 1 "
+          "(minimize the weighted sum of violations)", (int)feasrelax()));
+    /// Copy env/lp to ModelAPI
+    copy_common_info_to_other();
+    int v = -1;
+    GetSolverOption("output_flag", v);
+    set_verbose_mode(v > 0);
+  }
+
+
 
 bool HighsBackend::IsQCP() const {
   return false; 
 }
 
 ArrayRef<double> HighsBackend::PrimalSolution() {
+  if (HasFixedLP()) return FixedLP().primal;
+  // A feasibility relaxation's point is infeasible for the original
+  // model, so HiGHS marks it infeasible: return it anyway.
+  if (IsMIP() && !feasrelaxDone_ &&
+      getIntAttr("primal_solution_status") != kHighsSolutionStatusFeasible)
+    return {};
   int num_vars = NumVars();
   std::vector<double> x(num_vars);
-  int primal_solution_status;
-  Highs_getIntInfoValue(lp(),
-                        "primal_solution_status", &primal_solution_status);
-  if (kHighsSolutionStatusFeasible == primal_solution_status)
-    Highs_getSolution(lp(), x.data(), NULL, NULL, NULL);
-  else
+  // int primal_solution_status;
+  // loader().Highs_getIntInfoValue(lp(),
+  //                       "primal_solution_status", &primal_solution_status);
+  // if ((kHighsSolutionStatusFeasible == primal_solution_status) || (storedOptions_.onGPU()))
+  auto e = loader().Highs_getSolution(lp(), x.data(), NULL, NULL, NULL);
+  // else
+  if (e != kHighsStatusOk && e != kHighsStatusWarning)
     x.clear();
   return x;
 }
@@ -85,36 +200,67 @@ pre::ValueMapDbl HighsBackend::DualSolution() {
 }
 
 ArrayRef<double> HighsBackend::DualSolution_LP() {
+  if (IsMIP()) return HasFixedLP() ? ArrayRef<double>(FixedLP().dual) : ArrayRef<double>{};
   int num_cons = NumLinCons();
   std::vector<double> pi(num_cons);
-  int error = Highs_getSolution(lp(), NULL, NULL, NULL, pi.data());
+  int error = loader().Highs_getSolution(lp(), NULL, NULL, NULL, pi.data());
   if (error)
     pi.clear();
   return pi;
 }
 
-double HighsBackend::ObjectiveValue() const {
-  return Highs_getObjectiveValue(lp());
+  ArrayRef<double> HighsBackend::GetObjectiveValues() {
+    if (HasFixedLP()) return std::vector<double>{FixedLP().objective};
+    if (accObjectives().hadNativeMultiObj()) {
+      AddToSolverMessage("Warning: HiGHS does not support returning the objective values for multiple\n"
+        "objectives; AMPL will compute the actual values.");
+      return std::vector<double>();
+    }
+    return std::vector<double> { ObjectiveValue() };
 }
 
-double HighsBackend::NodeCount() const {
+  void HighsBackend::ObjPriorities(ArrayRef<int> pri) {
+    if (pri.size() > 0)
+      SetSolverOption("blend_multi_objectives",
+        0);
+    accObjectives().setPriorities(pri);
+
+}
+  void HighsBackend::ObjWeights(ArrayRef<double> w) {
+    accObjectives().setWeights(w);
+}
+  void HighsBackend::ObjAbsTol(ArrayRef<double> a) {
+    accObjectives().setAbsTols(a);
+  }
+  void HighsBackend::ObjRelTol(ArrayRef<double> r) {
+    accObjectives().setRelTols(r);
+  }
+
+double HighsBackend::ObjectiveValue() const {
+  return loader().Highs_getObjectiveValue(lp());
+}
+
+int HighsBackend::NodeCount() const {
   return getInt64Attr("mip_node_count");
 }
 
-double HighsBackend::SimplexIterations() const {
+int HighsBackend::SimplexIterations() const {
   return getIntAttr("simplex_iteration_count");
 }
 
 int HighsBackend::BarrierIterations() const {
   return getIntAttr("ipm_iteration_count");
 }
+int HighsBackend::PdlpIterations() const {
+  return getIntAttr("pdlp_iteration_count");
+}
 
 void HighsBackend::DoWriteProblem(const std::string &file) {
-  HIGHS_CCALL(Highs_writeModel(lp(), file.c_str()));
+  HIGHS_CCALL(loader().Highs_writeModel(lp(), file.c_str()));
 }
 
 void HighsBackend::DoWriteSolution(const std::string &file) {
-  HIGHS_CCALL(Highs_writeSolutionPretty(lp(), file.c_str()));
+  HIGHS_CCALL(loader().Highs_writeSolutionPretty(lp(), file.c_str()));
 }
 
 
@@ -122,24 +268,206 @@ void HighsBackend::SetInterrupter(mp::Interrupter *inter) {
   inter->SetHandler(InterruptHighs, lp());
 }
 
+
+void HighsBackend::SetupPlateauCallbacks() {
+  if (!loader().Highs_setCallback || !loader().Highs_startCallback)
+    throw std::runtime_error(
+        "This HiGHS build does not provide the callback API "
+        "(Highs_setCallback); mip:plateautime is not available.");
+  HIGHS_CCALL( loader().Highs_setCallback(
+      lp(), &HighsBackend::DoPlateauCallback, this) );
+  HIGHS_CCALL( loader().Highs_startCallback(
+      lp(), kHighsCallbackMipImprovingSolution) );
+    HIGHS_CCALL( loader().Highs_startCallback(
+        lp(), kHighsCallbackMipInterrupt) );
+    HIGHS_CCALL(loader().Highs_startCallback(
+        lp(), kHighsCallbackMipSolution));
+    }
+
+void HighsBackend::DoPlateauCallback(
+    int callback_type, const char* /*message*/,
+    const HighsCallbackDataOut* data_out, HighsCallbackDataIn* data_in,
+    void* user_callback_data) {
+  auto* backend = static_cast<HighsBackend*>(user_callback_data);
+
+  // Check that we're in a correct callback. Probably non necessary.
+  if ((callback_type == kHighsCallbackMipImprovingSolution) ||
+      (callback_type == kHighsCallbackMipInterrupt) ||
+      (callback_type == kHighsCallbackMipSolution))
+  {
+      double relgap = data_out->mip_gap;
+      double absgap = std::fabs(data_out->mip_primal_bound - data_out->mip_dual_bound);
+      if (callback_type == kHighsCallbackMipImprovingSolution) {
+          // If new solution is reported, send it to the plateau monitor
+          if (backend->ReportIncumbentForPlateau(data_out->objective_function_value))
+          {
+              data_in->user_interrupt = 1;
+              return;
+          }
+      }
+	  // Now check if we should stop due to plateau due to mip gap changes
+      // Eventual solution improvement is already handled
+        if (backend->ReportGapForPlateau(absgap, relgap))
+          data_in->user_interrupt = 1;
+  } 
+}
+
+
+void HighsBackend::DoHighsFeasRelax() {
+  if (!loader().Highs_feasibilityRelaxation)
+    MP_RAISE("this HiGHS library lacks Highs_feasibilityRelaxation");
+  int n = NumVars(), m = NumLinCons();
+  /// Penalties: suffix-based vectors (in solver coordinates), or the
+  /// global values. Auxiliary variables get the global value.
+  auto mv = GetValuePresolver().PresolveSolution({ {}, feasrelax().rhspen() });
+  std::vector<double> rhspen = mv.GetConValues()(CG_Linear);
+  std::vector<double> lbpen = feasrelax().lbpen();
+  std::vector<double> ubpen = feasrelax().ubpen();
+  if (lbpen.size() && lbpen.size() < (size_t)n) lbpen.resize(n, this->lbpen());
+  if (ubpen.size() && ubpen.size() < (size_t)n) ubpen.resize(n, this->ubpen());
+  if (rhspen.size() && rhspen.size() < (size_t)m) rhspen.resize(m, this->rhspen());
+  auto res = loader().Highs_feasibilityRelaxation(lp(),
+      this->lbpen(), this->ubpen(), this->rhspen(),
+      lbpen.empty() ? nullptr : lbpen.data(),
+      ubpen.empty() ? nullptr : ubpen.data(),
+      rhspen.empty() ? nullptr : rhspen.data());
+  if (kHighsStatusError == res)
+    MP_RAISE("HiGHS feasibility relaxation failed");
+  feasrelaxDone_ = true;
+  /// Original objective value at the relaxed solution
+  int pst = kHighsSolutionStatusNone;
+  loader().Highs_getIntInfoValue(lp(), "primal_solution_status", &pst);
+  if (kHighsSolutionStatusNone != pst) {
+    std::vector<double> x(n), cost(n), lb(n), ub(n);
+    int ncols = 0, nnz = 0;
+    double offset = 0.0;
+    if (kHighsStatusError != loader().Highs_getSolution(lp(), x.data(), NULL, NULL, NULL)
+        && kHighsStatusError != loader().Highs_getColsByRange(lp(), 0, n-1, &ncols,
+              cost.data(), lb.data(), ub.data(), &nnz, NULL, NULL, NULL)) {
+      if (loader().Highs_getObjectiveOffset)
+        loader().Highs_getObjectiveOffset(lp(), &offset);
+      double obj = offset;
+      for (int j = 0; j < n; ++j)
+        obj += cost[j] * x[j];
+      feasrelax().flag_orig_obj_available();
+      feasrelax().orig_obj_value() = obj;
+    }
+  }
+}
+
 void HighsBackend::Solve() {
-  HIGHS_CCALL( Highs_run(lp()) );
+  if (feasrelax()) {
+    DoHighsFeasRelax();
+    WindupHIGHSSolve();
+    return;
+  }
+  int status = loader().Highs_run(lp());
+  if (status != kHighsStatusOk && status != kHighsStatusWarning)
+    throw std::runtime_error(fmt::format("  Error {} while solving with HiGHS", status));
+    // Mask warnings for pdlp
+  if((status == kHighsStatusWarning) && (storedOptions_.lpmethod_!="pdlp-gpu"))
+      Print("  Warning code {} while solving with HiGHS\n", status);
   WindupHIGHSSolve();
+}
+
+HighsBackend::FixedLPResult HighsBackend::SolveFixedLP(ArrayRef<double> x) {
+  if (!loader().Highs_passLp || !loader().Highs_getNumNz ||
+      !(loader().Highs_getFixedLp || loader().Highs_getLp))
+    MP_RAISE("HiGHS library lacks fixed-model LP API");
+  DestroyFixedLP();
+  int feasible = 0;
+  HIGHS_CCALL(loader().Highs_getIntInfoValue(lp(), "primal_solution_status", &feasible));
+  if (feasible != kHighsSolutionStatusFeasible)
+    MP_RAISE("no integer-feasible incumbent");
+  if (accObjectives().hadNativeMultiObj())
+    MP_RAISE("native multiple objectives are unsupported by fixed-model emulation");
+  int n = NumVars(), m = NumLinCons(), nz = loader().Highs_getNumNz(lp());
+  int sense, nc, nr, nnz;
+  double offset, tol;
+  GetSolverOption("mip_feasibility_tolerance", tol);
+  std::vector<double> cost(n), lb(n), ub(n), lhs(m), rhs(m), val(nz);
+  std::vector<int> start(n+1), index(nz), integrality(n);
+  /// Original bounds, to validate the incumbent's integer values
+  std::vector<double> ocost(n), olb(n), oub(n);
+  int ncols = 0, nnz0 = 0;
+  HIGHS_CCALL(loader().Highs_getColsByRange(lp(), 0, n-1, &ncols,
+      ocost.data(), olb.data(), oub.data(), &nnz0, NULL, NULL, NULL));
+  if (loader().Highs_getFixedLp) {
+    // HiGHS fixes the discrete columns at the incumbent (a warning
+    // reports fractional values; they are validated below)
+    if (kHighsStatusError == loader().Highs_getFixedLp(
+          lp(), kHighsMatrixFormatColwise,
+          &nc, &nr, &nnz, &sense, &offset, cost.data(), lb.data(), ub.data(),
+          lhs.data(), rhs.data(), start.data(), index.data(), val.data()))
+      MP_RAISE("Highs_getFixedLp failed");
+    for (int j = 0; j < n; ++j)
+      HIGHS_CCALL(loader().Highs_getColIntegrality(lp(), j, &integrality[j]));
+  } else {
+    HIGHS_CCALL(loader().Highs_getLp(lp(), kHighsMatrixFormatColwise,
+        &nc, &nr, &nnz, &sense, &offset, cost.data(), lb.data(), ub.data(),
+        lhs.data(), rhs.data(), start.data(), index.data(), val.data(),
+        integrality.data()));
+  }
+  for (int j = 0; j < n; ++j) {
+    if (integrality[j] == kHighsVarTypeInteger)
+      lb[j] = ub[j] = FixedIntegerValue(x[j], olb[j], oub[j], tol);
+    else if (integrality[j] != kHighsVarTypeContinuous)
+      MP_RAISE("unsupported semi-continuous/semi-integer variable");
+  }
+  fixed_ = loader().Highs_create();
+  if (!fixed_) MP_RAISE("cannot create fixed LP");
+  CopyOptionsToFixedLP(fixed_);
+  HIGHS_CCALL(loader().Highs_setStringOptionValue(fixed_, "solver", "simplex"));
+  if (fixed_model_time_limit() >= 0)
+    HIGHS_CCALL(loader().Highs_setDoubleOptionValue(fixed_, "time_limit", fixed_model_time_limit()));
+  if (fixed_model_iter_limit() >= 0)
+    HIGHS_CCALL(loader().Highs_setIntOptionValue(fixed_, "simplex_iteration_limit", fixed_model_iter_limit()));
+  HIGHS_CCALL(loader().Highs_passLp(fixed_, n, m, nz,
+      kHighsMatrixFormatColwise, sense, offset, cost.data(), lb.data(), ub.data(),
+      lhs.data(), rhs.data(), start.data(), index.data(), val.data()));
+  HIGHS_CCALL(loader().Highs_run(fixed_));
+  int status = loader().Highs_getModelStatus(fixed_);
+  if (status != kHighsModelStatusOptimal)
+    MP_RAISE(fmt::format("fixed LP not optimal (HiGHS status {})", status));
+  FixedLPResult result;
+  result.objective = loader().Highs_getObjectiveValue(fixed_);
+  result.primal.resize(n);
+  result.dual.resize(m);
+  result.varstt.resize(n);
+  result.constt.resize(m);
+  HIGHS_CCALL(loader().Highs_getSolution(fixed_, result.primal.data(), nullptr, nullptr, result.dual.data()));
+  HIGHS_CCALL(loader().Highs_getBasis(fixed_, result.varstt.data(), result.constt.data()));
+  auto convert = [](int status) {
+    switch (status) {
+    case kHighsBasisStatusBasic: return (int)BasicStatus::bas;
+    case kHighsBasisStatusLower: return (int)BasicStatus::low;
+    case kHighsBasisStatusUpper: return (int)BasicStatus::upp;
+    case kHighsBasisStatusNonbasic:
+    case kHighsBasisStatusZero: return (int)BasicStatus::sup;
+    default: MP_RAISE(fmt::format("Unknown HiGHS fixed-LP basis status {}", (int)status));
+    }
+  };
+  for (auto& status : result.varstt) status = convert(status);
+  for (auto& status : result.constt) status = convert(status);
+  HIGHS_CCALL(loader().Highs_getIntInfoValue(fixed_, "simplex_iteration_count", &result.iterations));
+  return result;
 }
 
 void HighsBackend::WindupHIGHSSolve() { }
 
 void HighsBackend::ReportResults() {
-  ReportHIGHSResults();
+   ReportHIGHSResults();
+  ConsiderEmulatedFixedModel();
   BaseBackend::ReportResults();
 }
 
 void HighsBackend::ReportHIGHSResults() {
-  SetStatus( ConvertHIGHSStatus() );
+  SetStatus( GetSolveResult() );
   AddHIGHSMessages();
 }
 
 SolutionBasis HighsBackend::GetBasis() {
+  if (IsMIP()) return FixedLPBasis(CG_Linear);
   std::vector<int> varstt = VarStatii();
   std::vector<int> constt = ConStatii();
   if (varstt.size() && constt.size()) {
@@ -166,6 +494,13 @@ void HighsBackend::SetBasis(SolutionBasis basis) {
 
 /// We also use this for MIP.
 /// Attempting partial MIP start.
+void HighsBackend::AddMIPStart(ArrayRef<double> primal, ArrayRef<int> sparsity) {
+  Solution start;
+  start.primal = primal;
+  start.spars_primal = sparsity;
+  AddPrimalDualStart(std::move(start));
+}
+
 void HighsBackend::AddPrimalDualStart(Solution sol0_unpres) {
   auto mv = GetValuePresolver().PresolveSolution(
     { sol0_unpres.primal, sol0_unpres.dual });
@@ -174,15 +509,20 @@ void HighsBackend::AddPrimalDualStart(Solution sol0_unpres) {
   auto x0 = mv.GetVarValues()();
   auto s0 = ms.GetVarValues()();
   auto pi0 = mv.GetConValues()(CG_Linear);
-  /// If all variables provided or all missing are continuous,
-  /// set warmstart, otherwise fix, solve, unfix, set warmstart
   if (s0.size() < (size_t)NumVars())
     s0.resize(NumVars());
+  if (x0.size() < (size_t)NumVars())
+    x0.resize(NumVars());
+  /// Partial start: if all missing values belong to continuous variables,
+  /// pass the start as is; otherwise either let HiGHS complete it
+  /// (mip:start=1, mip:maxstartnodes) or complete it here (mip:start=2).
   if (0==*std::min_element(s0.begin(), s0.end())) {
     bool fAllMissingAreRealVars = true;
     for (auto j=s0.size(); j--; ) {
+      if (s0[j])
+        continue;
       int integr;
-      auto res = Highs_getColIntegrality(lp(), j, &integr);
+      auto res = loader().Highs_getColIntegrality(lp(), j, &integr);
       if (kHighsStatusOk != res)
         break;       // no information, it's an LP
       if (kHighsVarTypeContinuous != integr) {
@@ -191,26 +531,77 @@ void HighsBackend::AddPrimalDualStart(Solution sol0_unpres) {
       }
     }
     if (!fAllMissingAreRealVars) {
-      std::vector<double> costs(NumVars());
-      std::vector<double> lb(NumVars());
-      std::vector<double> ub(NumVars());
-      int numnz, ncols;
-      Highs_getColsByRange(lp(), 0, NumVars()-1, &ncols,
-        costs.data(), lb.data(), ub.data(), &numnz, NULL, NULL, NULL);
-      Highs_changeColsBoundsByMask(lp(), s0.data(), x0.data(), x0.data());
-      Highs_run(lp());
-      x0 = PrimalSolution();         // get new solution
-      Highs_changeColsBoundsByMask(lp(), s0.data(), lb.data(), ub.data());
+      if (2 == storedOptions_.mipstart_ || !loader().Highs_setSparseSolution) {
+        if (!CompleteStartByFixing(x0, s0))
+          return;
+      } else {
+        std::vector<int> idx;
+        std::vector<double> val;
+        for (size_t j = 0; j < s0.size(); ++j)
+          if (s0[j]) {
+            idx.push_back((int)j);
+            val.push_back(x0[j]);
+          }
+        auto res = loader().Highs_setSparseSolution(
+              lp(), (int)idx.size(), idx.data(), val.data());
+        if (kHighsStatusError == res)
+          AddWarning("MIPSTART",
+                     "HiGHS rejected the partial MIP start "
+                     "(a value may be outside the variable bounds)");
+        return;
+      }
     }
   }
-  HIGHS_CCALL(Highs_setSolution(lp(), x0.data(), NULL, NULL, pi0.data()));
+  auto res = loader().Highs_setSolution(lp(), x0.data(), NULL, NULL,
+                                        pi0.empty() ? NULL : pi0.data());
+  if (kHighsStatusError == res)
+    AddWarning("WARMSTART",
+               "HiGHS rejected the starting point "
+               "(a value may be outside the variable bounds)");
+}
+
+bool HighsBackend::CompleteStartByFixing(std::vector<double>& x0,
+                                         const std::vector<int>& s0) {
+  std::vector<double> costs(NumVars());
+  std::vector<double> lb(NumVars());
+  std::vector<double> ub(NumVars());
+  int numnz, ncols;
+  HIGHS_CCALL(loader().Highs_getColsByRange(lp(), 0, NumVars()-1, &ncols,
+    costs.data(), lb.data(), ub.data(), &numnz, NULL, NULL, NULL));
+  HIGHS_CCALL(loader().Highs_changeColsBoundsByMask(
+                lp(), s0.data(), x0.data(), x0.data()));
+  bool ok = false;
+  try {
+    auto run = loader().Highs_run(lp());
+    int primal_status = kHighsSolutionStatusNone;
+    loader().Highs_getIntInfoValue(lp(), "primal_solution_status", &primal_status);
+    if (kHighsStatusError != run && kHighsSolutionStatusFeasible == primal_status) {
+      std::vector<double> x(NumVars());
+      if (kHighsStatusError !=
+          loader().Highs_getSolution(lp(), x.data(), NULL, NULL, NULL)) {
+        x0 = std::move(x);
+        ok = true;
+      }
+    }
+  } catch (...) {
+    HIGHS_CCALL(loader().Highs_changeColsBoundsByMask(
+                  lp(), s0.data(), lb.data(), ub.data()));
+    throw;
+  }
+  HIGHS_CCALL(loader().Highs_changeColsBoundsByMask(
+                lp(), s0.data(), lb.data(), ub.data()));
+  if (!ok)
+    AddWarning("MIPSTART",
+               "Could not complete the partial MIP start by fixing "
+               "the provided integer values; start ignored");
+  return ok;
 }
 
 
 ArrayRef<int> HighsBackend::VarStatii() {
   std::vector<int> vars(NumVars());
   conStatiii_.resize(NumLinCons());
-  HIGHS_CCALL(Highs_getBasis(lp(), vars.data(), conStatiii_.data()));
+  HIGHS_CCALL(loader().Highs_getBasis(lp(), vars.data(), conStatiii_.data()));
   for (auto& s : vars) {
     switch (s) {
     case kHighsBasisStatusBasic:
@@ -293,7 +684,7 @@ void HighsBackend::VarConStatii(ArrayRef<int> vst, ArrayRef<int> cst) {
                         indicesOfMissing.size());
     std::vector<double> dd(indicesOfMissing.size());
     int numnz;
-    Highs_getColsBySet(lp(), indicesOfMissing.size(), indicesOfMissing.data(),
+    loader().Highs_getColsBySet(lp(), indicesOfMissing.size(), indicesOfMissing.data(),
       di.data(), dd.data(), lb.data(), ub.data(), &numnz, NULL, NULL, NULL);
     for (size_t i = 0; i < indicesOfMissing.size(); i++) {
         if (lb[i] >= -1e-6)
@@ -322,14 +713,192 @@ void HighsBackend::VarConStatii(ArrayRef<int> vst, ArrayRef<int> cst) {
       MP_RAISE(fmt::format("Unknown AMPL con status value: {}", s));
     }
   }
-  HIGHS_CCALL(Highs_setBasis(lp(), stt.data(), cstt.data()));
+  HIGHS_CCALL(loader().Highs_setBasis(lp(), stt.data(), cstt.data()));
 }
 
+void HighsBackend::ComputeIIS() {
+  if (!loader().Highs_getIis)
+    MP_RAISE("this HiGHS library lacks Highs_getIis");
+  iisVars_.clear();
+  iisCons_.clear();
+  int strategy = storedOptions_.iisStrategy_;
+  if (strategy < 0)
+    strategy = 6;                 // elastic LP + deletion filter, row priority
+  SetSolverOption("iis_strategy", strategy);
+  int n = NumVars(), m = NumLinCons();
+  int ncol = 0, nrow = 0;
+  std::vector<int> colidx(n), rowidx(m), colbnd(n), rowbnd(m);
+  // The per-column/row conflict statuses are not requested:
+  // HiGHS 1.15.1 dereferences an empty vector for them when the IIS
+  // could not be proven (status Unknown), which crashes.
+  auto res = loader().Highs_getIis(lp(), &ncol, &nrow,
+      colidx.data(), rowidx.data(), colbnd.data(), rowbnd.data(),
+      nullptr, nullptr);
+  if (kHighsStatusError == res)
+    MP_RAISE("Highs_getIis failed");
+  iisVars_.assign(n, (int)IISStatus::non);
+  iisCons_.assign(m, (int)IISStatus::non);
+  for (int k = 0; k < ncol && k < n; ++k) {
+    int j = colidx[k];
+    if (j < 0 || j >= n) continue;
+    switch (colbnd[k]) {
+    case kHighsIisBoundLower: iisVars_[j] = (int)IISStatus::low; break;
+    case kHighsIisBoundUpper: iisVars_[j] = (int)IISStatus::upp; break;
+    case kHighsIisBoundBoxed: iisVars_[j] = (int)IISStatus::fix; break;
+    default:   /* free: the column is in the IIS LP, its bounds are not */
+      break;
+    }
+  }
+  for (int k = 0; k < nrow && k < m; ++k) {
+    int i = rowidx[k];
+    if (i < 0 || i >= m) continue;
+    iisCons_[i] = (int)IISStatus::mem;
+  }
+  if (0 == ncol && 0 == nrow)
+    AddToSolverMessage("HiGHS found no IIS (see iis:strategy).\n");
+}
+
+IIS HighsBackend::GetIIS() {
+  if (iisVars_.empty() && iisCons_.empty())
+    return {};
+  auto mv = GetValuePresolver().PostsolveIIS(
+        { iisVars_, {{{ CG_Linear, iisCons_ }}} });
+  return { mv.GetVarValues()(), mv.GetConValues()() };
+}
+
+SensRangesPresolved HighsBackend::GetSensRangesPresolved() {
+  if (!loader().Highs_getRanging || !loader().Highs_getRowsByRange) {
+    AddWarning("SENS", "this HiGHS library lacks Highs_getRanging");
+    return {};
+  }
+  void* h = HasFixedLP() ? fixed_ : (IsMIP() ? nullptr : lp());
+  if (!h)
+    return {};
+  int n = NumVars(), m = NumLinCons();
+  std::vector<double> cup(n), cdn(n), bup(n), bdn(n), rup(m), rdn(m);
+  auto res = loader().Highs_getRanging(h,
+      cup.data(), nullptr, nullptr, nullptr,
+      cdn.data(), nullptr, nullptr, nullptr,
+      bup.data(), nullptr, nullptr, nullptr,
+      bdn.data(), nullptr, nullptr, nullptr,
+      rup.data(), nullptr, nullptr, nullptr,
+      rdn.data(), nullptr, nullptr, nullptr);
+  if (kHighsStatusError == res) {
+    AddWarning("SENS", "HiGHS could not compute sensitivity ranges "
+                       "(an optimal basic solution is required)");
+    return {};
+  }
+  const double inf = Infinity();
+  std::vector<double> cost(n), lb(n), ub(n), rlb(m), rub(m), x(n), act(m);
+  std::vector<int> cstt(n), rstt(m);
+  int ncols = 0, nnz = 0, nrows = 0;
+  HIGHS_CCALL(loader().Highs_getColsByRange(h, 0, n-1, &ncols,
+      cost.data(), lb.data(), ub.data(), &nnz, NULL, NULL, NULL));
+  if (m > 0)
+    HIGHS_CCALL(loader().Highs_getRowsByRange(h, 0, m-1, &nrows,
+        rlb.data(), rub.data(), &nnz, NULL, NULL, NULL));
+  HIGHS_CCALL(loader().Highs_getSolution(h, x.data(), NULL, act.data(), NULL));
+  HIGHS_CCALL(loader().Highs_getBasis(h, cstt.data(), rstt.data()));
+  /// Ranges of a bound: the active bound's range is reported by HiGHS;
+  /// an inactive finite bound can move up to the current value;
+  /// an infinite bound has an infinite range (as in the other drivers).
+  auto ranges = [inf](int stt, double lb, double ub, double val,
+                      double dn, double up,
+                      double& lblo, double& lbhi, double& ublo, double& ubhi) {
+    switch (stt) {
+    case kHighsBasisStatusLower:          // active lower bound
+      lblo = dn;   lbhi = up;
+      ublo = val;  ubhi = inf;
+      break;
+    case kHighsBasisStatusUpper:          // active upper bound
+      lblo = -inf; lbhi = val;
+      ublo = dn;   ubhi = up;
+      break;
+    default:                              // basic / free: inactive bounds
+      lblo = -inf; lbhi = val;
+      ublo = val;  ubhi = inf;
+      break;
+    }
+    if (lb <= -inf) { lblo = -inf; lbhi = inf; }
+    if (ub >= inf)  { ublo = -inf; ubhi = inf; }
+  };
+  std::vector<double> lblo(n), lbhi(n), ublo(n), ubhi(n);
+  for (int j = 0; j < n; ++j)
+    ranges(cstt[j], lb[j], ub[j], x[j], bdn[j], bup[j],
+           lblo[j], lbhi[j], ublo[j], ubhi[j]);
+  std::vector<double> clblo(m), clbhi(m), cublo(m), cubhi(m), rhslo(m), rhshi(m);
+  for (int i = 0; i < m; ++i) {
+    ranges(rstt[i], rlb[i], rub[i], act[i], rdn[i], rup[i],
+           clblo[i], clbhi[i], cublo[i], cubhi[i]);
+    /// The rhs is the finite side (the upper for equalities and ranges)
+    bool lbfin = rlb[i] > -inf, ubfin = rub[i] < inf;
+    if (lbfin && !ubfin) { rhslo[i] = clblo[i]; rhshi[i] = clbhi[i]; }
+    else                 { rhslo[i] = cublo[i]; rhshi[i] = cubhi[i]; }
+  }
+  SensRangesPresolved sensr;
+  sensr.varlbhi = { {lbhi} };
+  sensr.varlblo = { {lblo} };
+  sensr.varubhi = { {ubhi} };
+  sensr.varublo = { {ublo} };
+  sensr.varobjhi = { {cup} };
+  sensr.varobj = { {cost} };
+  sensr.varobjlo = { {cdn} };
+  sensr.conlbhi = { {}, {{{CG_Linear, clbhi}}} };
+  sensr.conlblo = { {}, {{{CG_Linear, clblo}}} };
+  sensr.conubhi = { {}, {{{CG_Linear, cubhi}}} };
+  sensr.conublo = { {}, {{{CG_Linear, cublo}}} };
+  sensr.conrhshi = { {}, {{{CG_Linear, rhshi}}} };
+  sensr.conrhslo = { {}, {{{CG_Linear, rhslo}}} };
+  return sensr;
+}
+
+ArrayRef<double> HighsBackend::Ray() {
+  HighsInt has_ray;
+  std::vector<double> uray_pres(NumVars());
+  auto res = loader().Highs_getPrimalRay(lp(), &has_ray, uray_pres.data());
+  if (res)
+    Print("Error while getting primal ray");
+  if (res || (!has_ray))
+  {
+    uray_pres.clear();
+    return uray_pres;
+  }
+  auto mv = GetValuePresolver().PostsolveSolution({ uray_pres });
+  auto uray = mv.GetVarValues()();
+  return uray;
+}
+
+ArrayRef<double> HighsBackend::DRay() {
+  HighsInt has_ray;
+  std::vector<double> dray_pres(NumLinCons());
+  auto res = loader().Highs_getDualRay(lp(), &has_ray, dray_pres.data());
+  if (res)
+    Print("Error while getting dual ray");
+  if (res || (!has_ray))
+  {
+    dray_pres.clear();
+    return dray_pres;
+  }
+  auto vm = GetValuePresolver().PostsolveSolution({
+                                               {},
+                                               {{{CG_Linear, std::move(dray_pres)}}}
+    });
+  return vm.GetConValues().MoveOut();        // need the vector itself
+}
+
+
+
 void HighsBackend::AddHIGHSMessages() {
+  auto pdlp = PdlpIterations();
+  if (pdlp > 0)
+  {
+    AddToSolverMessage(fmt::format("{} PDLP iterations\n", pdlp));
+    return;
+  }
   auto ni = SimplexIterations();
   if (true)
     AddToSolverMessage(
-          fmt::format("{} simplex iterations\n", std::max(0.0, ni)));
+          fmt::format("{} simplex iterations\n", std::max(0, ni)));
   auto nbi = BarrierIterations();
   if (nbi > -1)
     AddToSolverMessage(
@@ -340,12 +909,35 @@ void HighsBackend::AddHIGHSMessages() {
           fmt::format("{} branching nodes\n", nnd));
 }
 
-std::pair<int, std::string> HighsBackend::ConvertHIGHSStatus() {
+
+std::map<std::string, std::variant<int, double, std::string>>
+HighsBackend::SolutionStats() {
+    std::map<std::string, std::variant<int, double, std::string>> stats;
+    stats["simplex_iterations"] = SimplexIterations();
+    stats["barrier_iterations"] = BarrierIterations();
+    stats["node_count"] = NodeCount();
+    stats["pdlp_iterations"] = PdlpIterations();
+    return stats;
+}
+
+std::pair<int, std::string> HighsBackend::GetSolveResult() {
   namespace sol = mp::sol;
-  int optstatus = Highs_getModelStatus(lp());
-  auto obj = Highs_getObjectiveValue(lp());
-  auto inf = Highs_getInfinity(lp());
+  if (feasrelaxDone_) {
+    // HiGHS restores the model status from before the relaxation;
+    // judge by the solution it left.
+    int pst = kHighsSolutionStatusNone;
+    loader().Highs_getIntInfoValue(lp(), "primal_solution_status", &pst);
+    if (kHighsSolutionStatusNone != pst)   // the point violates the original model
+      return { sol::SOLVED, "feasibility relaxation solved" };
+    return { sol::FAILURE, "feasibility relaxation found no solution" };
+  }
+  int optstatus = loader().Highs_getModelStatus(lp());
+  auto obj = loader().Highs_getObjectiveValue(lp());
+  auto inf = loader().Highs_getInfinity(lp());
   bool hasSol = (-inf < obj && obj < inf);
+  int primal_solution_status;
+  loader().Highs_getIntInfoValue(lp(),
+                        "primal_solution_status", &primal_solution_status);
   switch (optstatus) {
   case kHighsModelStatusOptimal:
     return { sol::SOLVED, "optimal solution" };
@@ -356,9 +948,16 @@ std::pair<int, std::string> HighsBackend::ConvertHIGHSStatus() {
       return { sol::UNBOUNDED_FEAS, "unbounded problem, feasible solution" };
     return { sol::UNBOUNDED_NO_FEAS, "unbounded problem, no solution" };
   case kHighsModelStatusUnboundedOrInfeasible:
-    return { sol::LIMIT_INF_UNB, "unbounded or infeasible" };
+    return { sol::LIMIT_INF_UNB, "unbounded or infeasible. "
+                                "Disable presolve (pre:solve=off) "
+                                "or run the IIS finder (iis:find=1) "
+                                "for a definitive answer." };
+  case kHighsModelStatusModelEmpty:
+    return { sol::SOLVED, "empty model" };
   case kHighsModelStatusModelError:
   case kHighsModelStatusLoadError:
+    if (kHighsSolutionStatusInfeasible == primal_solution_status)   // HiGHS 7
+      return { sol::INFEASIBLE, "infeasible problem" };
     return { sol::FAILURE, "solver error" };
   case kHighsModelStatusPresolveError:
   case kHighsModelStatusSolveError:
@@ -375,8 +974,8 @@ std::pair<int, std::string> HighsBackend::ConvertHIGHSStatus() {
       return { sol::LIMIT_FEAS_ITER, "iteration limit, feasible solution" };
     return { sol::LIMIT_NO_FEAS_ITER, "iteration limit, no solution" };
   case kHighsModelStatusSolutionLimit:
-    assert (hasSol);
-    return { sol::LIMIT_FEAS_NUMSOLS, "solution limit" };
+    if (hasSol) return { sol::LIMIT_FEAS_NUMSOLS, "solution limit, feasible solution" };
+    return { sol::LIMIT_NO_FEAS, "solution limit, no solution" };
   case kHighsModelStatusInterrupt:
     if (hasSol)
       return { sol::LIMIT_FEAS_INTERRUPT, "interrupt, feasible solution" };
@@ -398,19 +997,36 @@ std::pair<int, std::string> HighsBackend::ConvertHIGHSStatus() {
 }
 
 
-void HighsBackend::FinishOptionParsing() {
-  int v=-1;
-  GetSolverOption("output_flag", v);
-  set_verbose_mode(v>0);
-}
-
 
 ////////////////////////////// OPTIONS /////////////////////////////////
 
 static const mp::OptionValueInfo lp_values_method[] = {
   { "choose", "Automatic (default)", -1},
   { "simplex", "Simplex", 1},
-  { "ipm", "Interior point method", 2},
+  { "ipm", "Interior Point Method (automatic)", 2},
+  { "hipo", "HiPO interior point method (not available in every HiGHS library build; "
+            "rejected with a message if unavailable)", 2},
+  { "ipx", "IPX interior point method", 2},
+  { "pdlp", "cuPDLP-c solver", 3},
+  { "pdlp-gpu", "cuPDLP-c solver on NVIDIA GPU. Requires CUDA, not available on MacOS", 4},
+  { "hipdlp", "HiPDLP solver", 5},
+  { "hipdlp-gpu", "HiPDLP-c solver on NVIDIA GPU. Requires CUDA, not available on MacOS", 6},
+  { "qpasm", "QP active set method", 7}
+};
+
+
+static const mp::OptionValueInfo mip_lp_solver_values[] = {
+  { "choose", "Automatic (default)", -1},
+  { "simplex", "Simplex", 1},
+  { "ipm", "Interior Point Method (automatic)", 2},
+  { "hipo", "HiPO interior point method", 3},
+  { "ipx", "IPX interior point method", 4 }
+};
+
+static const mp::OptionValueInfo mip_ipm_solver_values[] = {
+  { "choose", "Automatic (default)", -1},
+  { "ipx", "IPX interior point method", 2},
+  { "hipo", "HiPO interior point method", 3}
 };
 
 static const mp::OptionValueInfo off_on_choose_values[] = {
@@ -419,31 +1035,94 @@ static const mp::OptionValueInfo off_on_choose_values[] = {
   { "on", "On", 2},
 };
 
+
+static const mp::OptionValueInfo pdlperestartmethod_values[] = {
+  { "0", "None", 0},
+  { "1", "GPU (default)", 1},
+  { "2", "CPU", 2},
+};
+
+static const mp::OptionValueInfo pdlp_scaling_mode_values[] = {
+  { "1", "Ruiz scaling", 0},
+  { "2", "L2", 1},
+  { "4", "PC (preconditioner-oriented)", 2},
+};
+
+static const mp::OptionValueInfo pdlp_step_size_strategy_values[] = {
+    {"0", "Fixed", 0},
+    {"1", "Adaptive (default)", 1},
+    {"2", "Malitsky-Pock", 2},
+    {"3", "PID", 3}
+};
+
+static const mp::OptionValueInfo pdlp_restart_strategy_values[] = {
+  { "0", "Off", 0},
+  { "1", "Fixed", 1},
+  { "2", "Adaptive (default)", 2},
+  {"3", "Halpern", 3}
+};
+
+static const mp::OptionValueInfo mipstart_values[] = {
+  { "1", "Pass the provided values to HiGHS, which completes a partial "
+         "start itself by a limited MIP search (see mip:maxstartnodes; default)", 1},
+  { "2", "Complete a partial start in the driver: fix the provided values "
+         "of integer variables, solve, unfix, and pass the complete solution "
+         "(legacy behavior)", 2}
+};
+
+static const mp::OptionValueInfo iis_strategy_values[] = {
+    {"-1", "Automatic: 6 (default)", -1 },
+    {"0", "Light test only (infeasible bounds)", 0 },
+    { "1", "Try dual ray", 1 },
+    { "2", "Try elastic LP", 2 },
+    { "4", "Find an irreducible (true) IIS by a deletion filter", 4 },
+    { "8", "Prioritise columns over rows in the deletion filter", 8 },
+    { "16", "Find the IIS of the LP relaxation for a MIP", 16 }
+};
+
 static const mp::OptionValueInfo run_crossover_values[] = {
   { "choose", "Run if the results of IPM without crossover is imprecise", -1},
   { "off", "Off", 1},
-  { "on", "On", 2},
+  { "on", "On (default)", 2},
+};
+
+static const mp::OptionValueInfo hipo_system_values[] = {
+    { "choose", "Choose automatically (default)", 0},
+    { "augmented", "Augmented system", 1},
+    { "normaleq", "Normal equations", 2}
+};
+static const mp::OptionValueInfo hipo_parallel_type_values[] = {
+    // tree, node or both
+	{ "tree", "Tree parallelism", 1},
+	{ "node", "Node parallelism", 2},
+	{ "both", "Both tree and node parallelism", 3}
+};
+static const mp::OptionValueInfo hipo_ordering_values[] = {
+	{ "choose", "Choose automatically (default)", 0},
+	{ "metis", "Multilevel graph partitioning", 1},
+	{ "amd", "Approximate minimum degree", 2},
+	{ "rcm", "Reverse Cuthill-McKee", 3}
 };
 static const mp::OptionValueInfo simplex_strategy_values_[] = {
-  { "0", "Choose automatically (default)", 0},
-  { "1", "Dual (serial)", 1},
-  { "2", "Dual (PAMI)", 2},
-  { "3", "Dual (SIP)", 3},
+  { "0", "Choose automatically", 0},
+  { "1", "Dual, serial (default)", 1},
+  { "2", "Dual, 'SIP' (Single Iteration Parallelism)", 2},
+  { "3", "Dual, 'PAMI' (Parallelization Across Multiple Iterations)", 3},
   { "4", "Primal", 4}
 };
 static const mp::OptionValueInfo simplex_scale_strategy_values_[] = {
   { "0", "Off", 0},
-  { "1", "Choose automatically (default)", 1},
-  { "2", "Equilibration", 2},
+  { "1", "Choose automatically", 1},
+  { "2", "Equilibration (default)", 2},
   { "3", "Forced equilibration", 3},
-  { "4", "Max value 0", 4},
-  { "5", "Max value 1", 5}
+  { "4", "Max value", 4}
 };
 static const mp::OptionValueInfo simplex_crash_strategy_values_[] = {
   { "0", "Off (default)", 0},
   { "1", "LTSSF", 1},
   { "2", "Bixby", 2}
 };
+/// HiGHS accepts further experimental crash strategies (3..9), undocumented.
 static const mp::OptionValueInfo simplex_edge_weight_strategy_values_[] = {
   { "-1", "Choose automatically (default)", -1},
   { "0", "Dantzig", 0},
@@ -454,187 +1133,439 @@ static const mp::OptionValueInfo simplex_edge_weight_strategy_values_[] = {
 void HighsBackend::InitCustomOptions() {
 
   set_option_header(
-      "HIGHS Optimizer Options for AMPL\n"
-      "--------------------------------------------\n"
-      "\n"
-      "To set these options, assign a string specifying their values to the "
-      "AMPL option ``highs_options``. For example::\n"
-      "\n"
-      "  ampl: option highs_options 'relgaptol=1e-6';\n");
- 
-  AddSolverOption("tech:outlev outlev",
-    "0*/1: Whether to write HighS log lines (chatter) to stdout and to file.",
+    "HIGHS Optimizer Options for AMPL\n"
+    "--------------------------------------------\n"
+    "\n"
+    "To set these options, assign a string specifying their values to the "
+    "AMPL option ``highs_options``. For example::\n"
+    "\n"
+    "  ampl: option highs_options 'mip:gap=1e-6';\n");
+
+  AddHighsOption("tech:outlev outlev",
+    "0*/1: Whether to write HiGHS log lines (chatter) to stdout and to file.",
     "output_flag", 0, 1);
 
-  AddSolverOption("tech:logfile logfile",
+  AddHighsOption("tech:logfile logfile",
     "Log file name.", "log_file");
 
-  const char* c = "choose";
-  AddSolverOption("alg:method method lpmethod",
-    "Which algorithm to use :\n"
-    "\n.. value-table::\n", "solver", lp_values_method, c);
+  std::string c;
+  AddStoredOption("alg:method method lp:method lpmethod lp:algorithm solver",
+    "Which algorithm to use for non-MIP problems:\n"
+    "\n.. value-table::\n", storedOptions_.lpmethod_, lp_values_method);
 
-  AddSolverOption("alg:simplex simplex simplex_strategy",
+  AddHighsOption("alg:simplex simplex simplex_strategy",
     "Strategy for simplex solver :\n"
     "\n.. value-table::\n", "simplex_strategy", simplex_strategy_values_, 0);
 
-  AddSolverOption("alg:simplexscale simplexscale simplex_scale_strategy",
+  AddHighsOption("alg:simplexscale simplexscale simplex_scale_strategy",
     "Simplex scaling strategy :\n"
-    "\n.. value-table::\n", "simplex_scale_strategy", 
+    "\n.. value-table::\n", "simplex_scale_strategy",
     simplex_scale_strategy_values_, 1);
 
-  AddSolverOption("alg:simplexcrash simplexcrash simplex_crash_strategy",
-    "Simplex crah strategy :\n"
+  AddHighsOption("alg:simplexcrash simplexcrash simplex_crash_strategy",
+    "Simplex crash strategy :\n"
     "\n.. value-table::\n", "simplex_crash_strategy",
     simplex_crash_strategy_values_, 0);
 
-  AddSolverOption("alg:simplexdualedge simplexdualedge simplex_dual_edge_weight_strategy",
+  AddHighsOption("alg:simplexdualedge simplexdualedge simplex_dual_edge_weight_strategy",
     "Simplex dual edge weights strategy :\n"
     "\n.. value-table::\n", "simplex_dual_edge_weight_strategy",
     simplex_edge_weight_strategy_values_, 1);
 
-  AddSolverOption("alg:simplexprimaledge simplexprimaledge simplex_primal_edge_weight_strategy",
+  AddHighsOption("alg:simplexprimaledge simplexprimaledge simplex_primal_edge_weight_strategy",
     "Simplex primal edge weights strategy :\n"
     "\n.. value-table::\n", "simplex_primal_edge_weight_strategy",
     simplex_edge_weight_strategy_values_, 1);
 
-  AddSolverOption("pre:solve presolve",
+  AddHighsOption("alg:simplexupdatelim simplexupdatelim simplex_update_limit",
+    "Limit on the number of simplex UPDATE operations before "
+    "refactorization (default 5000).",
+    "simplex_update_limit", 0, INT_MAX);
+
+  AddHighsOption("alg:simplexminconcurrency simplexminconcurrency simplex_min_concurrency",
+    "Minimum level of concurrency in parallel simplex (1..8, default 1).",
+    "simplex_min_concurrency", 1, 8);
+
+  AddHighsOption("alg:simplexmaxconcurrency simplexmaxconcurrency simplex_max_concurrency",
+    "Maximum level of concurrency in parallel simplex (1..8, default 8).",
+    "simplex_max_concurrency", 1, 8);
+
+  AddHighsOption("pre:solve presolve",
     "Whether to use presolve:\n"
     "\n.. value-table::\n",
     "presolve", off_on_choose_values, c);
 
-  AddSolverOption("alg:parallel parallel",
+
+
+  AddHighsOption("pre:userobjectivescale user_objective_scale userobjectivescale",
+      "Exponent of power-of-two objective scaling for model (default 0; "
+      "negative exponents allowed).",
+      "user_objective_scale", std::numeric_limits<HighsInt>::min(),
+      std::numeric_limits<HighsInt>::max());
+
+
+  AddHighsOption("pre:userboundscale user_bound_scale userboundscale",
+    "Exponent of power-of-two bound scaling for model (default 0; "
+    "negative exponents allowed).",
+    "user_bound_scale", std::numeric_limits<HighsInt>::min(),
+    std::numeric_limits<HighsInt>::max());
+
+  AddHighsOption("alg:parallel parallel",
     "Parallel option :\n"
     "\n.. value-table::\n", "parallel", off_on_choose_values, c);
 
-  AddSolverOption("lim:time timelim timelimit time_limit",
+  AddHighsOption("lim:time timelim timelimit time_limit",
     "Limit on solve time (in seconds; default: no limit).",
     "time_limit", 0.0, DBL_MAX);
 
-  AddSolverOption("lim:simplexiterationlimit simplexiterationlimit simplex_iteration_limit",
-    "Limit on simplex iterations (default: no limit).",
+  AddHighsOption("lim:iter iterlim lim:simplexiterationlimit simplexiterationlimit simplex_iteration_limit",
+    "Limit on simplex iterations when solving LPs, not counting "
+    "MIP subproblems (default: no limit).",
     "simplex_iteration_limit", 0, INT_MAX);
 
-  AddSolverOption("lim:ipmiterationlimit ipmiterationlimit ipm_iteration_limit",
+  AddHighsOption("bar:iterlim bariterlim lim:ipmiterationlimit ipmiterationlimit ipm_iteration_limit",
     "Limit on IPM iterations (default: no limit).",
     "ipm_iteration_limit", 0, INT_MAX);
 
-  AddSolverOption("alg:infinitecost infinitecost infinite_cost",
-    "Limit on cost coefficient : values larger than this will be treated as infinite (default: 1e20).",
+  AddHighsOption("lim:objectivebound objective_bound objectivebound",
+    "Objective bound for termination of the dual simplex solver (default: no limit).",
+    "objective_bound", -DBL_MAX, DBL_MAX);
+
+
+  AddHighsOption("lim:objectivetarget objective_target objectivetarget",
+    "Objective target for termination of the MIP solver (default: no limit).",
+    "objective_target", -DBL_MAX, DBL_MAX);
+
+  /// Not in Highs 1.14:
+  // AddHighsOption("lim:pdlpnativetermination pdlp_native_termination pdlpnativetermination",
+  //   "Use native termination for PDLP solver:\n"
+  //   "\n.. value-table::\n", "pdlp_native_termination", values_01_noyes_0default_, 0);
+
+  AddHighsOption("pdlp:scaling pdlpscaling pre:pdlpscaling_mode pdlp_scaling_mode",
+      "Scaling mode for PDLP solver (default 5 = 1 + 4), sum of:\n"
+      "\n.. value-table::\n", "pdlp_scaling_mode", pdlp_scaling_mode_values, 5);
+
+  AddHighsOption("lim:pdlpiter pdlpiterlim lim:pdlp_iteration_limit pdlpiterationlimit pdlp_iteration_limit",
+    "Iteration limit for PDLP solver (default: no limit).",
+    "pdlp_iteration_limit", 0, INT_MAX);
+
+  AddHighsOption("alg:infinitecost infinitecost infinite_cost",
+    "Limit on |cost coefficient|: values greater than or equal to this "
+    "will be treated as infinite (default: 1e20).",
     "infinite_cost", 1e15, Infinity());
 
-  AddSolverOption("alg:infinitebound infinitebound infinite_bound",
-    "Limit on |constraint bound|: values larger than this will be treated as infinite (default: 1e20).",
-    "infinite_cost", 1e15, Infinity());
+  AddHighsOption("alg:infinitebound infinitebound infinite_bound",
+    "Limit on |constraint bound|: values greater than or equal to this "
+    "will be treated as infinite (default: 1e20).",
+    "infinite_bound", 1e15, Infinity());
 
-  AddSolverOption("alg:infinitecoeff infinitecoeff large_matrix_value",
-    "Upper limit on |matrix entries|: values larger than this will be treated as infinite (default: 1e15).",
+  AddHighsOption("alg:infinitecoeff infinitecoeff large_matrix_value",
+    "Upper limit on |matrix entries|: values greater than or equal to this "
+    "will be treated as infinite (default: 1e15).",
     "large_matrix_value", 1.0, Infinity());
 
-  AddSolverOption("alg:zerocoeff zerocoeff small_matrix_value",
-    "Lower limit on |matrix entries|: values smaller than this will be treated as zero (default: 1e-9).",
+  AddHighsOption("alg:zerocoeff zerocoeff small_matrix_value",
+    "Lower limit on |matrix entries|: values less than or equal to this "
+    "will be treated as zero (default: 1e-9).",
     "small_matrix_value", 1e-12, Infinity());
 
-  AddSolverOption("alg:feastol feastol primal_feasibility_tolerance",
-    "Primal feasibility tolerance (default 1e-7).",
-    "primal_feasibility_tolerance", 1e-10, Infinity());
+  AddHighsOption("alg:feastol feastol primal_feasibility_tolerance",
+      "Primal feasibility tolerance (default 1e-7).",
+      "primal_feasibility_tolerance", 1e-10, Infinity());
 
-  AddSolverOption("alg:dualfeastol dualfeastol dual_feasibility_tolerance",
+  AddHighsOption("alg:kkttol kkttol alg:kkt_tolerance kkt_tolerance",
+    "KKT tolerance (default 1e-7). If changed from its default, "
+    "this tolerance is used for all feasibility and optimality (KKT) "
+    "measures, overriding the individual tolerances.",
+    "kkt_tolerance", 1e-10, Infinity());
+
+  AddHighsOption("alg:dualfeastol dualfeastol dual_feasibility_tolerance",
     "Dual feasibility tolerance (default 1e-7).",
     "dual_feasibility_tolerance", 1e-10, Infinity());
 
-  AddSolverOption("alg:ipmopttol ipmopttol ipm_optimality_tolerance",
-    "IMP optimality tolerance (default 1e-8).",
+  AddHighsOption("alg:primalrestol primalrestol primal_residual_tolerance",
+    "Primal residual tolerance (default 1e-7).",
+    "primal_residual_tolerance", 1e-10, Infinity());
+
+  AddHighsOption("alg:opttol opttol optimality_tolerance",
+    "Optimality tolerance (default 1e-7).",
+    "optimality_tolerance", 1e-10, Infinity());
+
+  AddHighsOption("alg:dualrestol dualrestol dual_residual_tolerance",
+    "Dual residual tolerance (default 1e-7).",
+    "dual_residual_tolerance", 1e-10, Infinity());
+
+  AddHighsOption("alg:ipmopttol ipmopttol ipm_optimality_tolerance",
+    "IPM optimality tolerance (default 1e-8).",
     "ipm_optimality_tolerance", 1e-12, Infinity());
 
-  AddSolverOption("bar:crossover run_crossover",
-    "Run crossover after IPM to get a basic solution",
-    "run_crossover", run_crossover_values, c);
+  AddHighsOption("pdlp:restartmethod pdlprestartmethod pdlp:cupdlpc_restart_method pdlpcupdlpcrestartmethod pdlp_cupdlpc_restart_method",
+    "Restart mode for PDLP solver:\n"
+      "\n.. value-table::\n",
+    "pdlp_cupdlpc_restart_method", pdlperestartmethod_values, 1);
 
-  AddSolverOption("tech:threads threads",
-    "How many threads to use when using the barrier algorithm "
-    "or solving MIP problems; default 0 ==> automatic choice.",
-		"threads", 0, INT32_MAX);
+  AddHighsOption("pdlp:restart pdlprestart pdlp:restart_strategy pdlprestartstrategy pdlp_restart_strategy",
+      "Restart strategy for PDLP solver:\n"
+      "\n.. value-table::\n",
+      "pdlp_restart_strategy", pdlp_restart_strategy_values, 1);
 
-  AddSolverOption("mip:detsimmetry detsimmetry mip_detect_symmetry",
-    "Whether symmetry should be detected (default 1)",
-    "mip_detect_symmetry",0, 1);
+  AddHighsOption("pdlp:stepsize pdlpstepsize pdlp:step_size_strategy pdlpstepsizestrategy pdlp_step_size_strategy",
+      "Stepsize strategy for PDLP solver:\n"
+      "\n.. value-table::\n",
+      "pdlp_step_size_strategy", pdlp_step_size_strategy_values, 1);
 
-  AddSolverOption("lim:stallnodes stallnodelim stallnodelimit mip_max_stall_nodes",
+  AddHighsOption("pdlp:opttol pdlpopttol pdlp:optimality_tolerance pdlp_optimality_tolerance pdlp_opt_tol",
+    "PDLP optimality tolerance (default 1e-7).",
+    "pdlp_optimality_tolerance", 1e-12, Infinity());
+
+
+  AddHighsOption("pdlp:ruiziter pdlpruiziter pdlp:ruiz_iterations pdlp_ruiz_iterations",
+      "Number of Ruiz scaling iterations for PDLP solver (default 10).",
+      "pdlp_ruiz_iterations", 0, INT_MAX);
+
+  AddHighsOption("lim:qpiter qpiterlim lim:qp_iteration_limit qp_iteration_limit qpiterationlimit",
+      "Iteration limit for QP active set method (default: no limit).",
+      "qp_iteration_limit", 0, INT_MAX);
+
+  AddHighsOption("qp:nullspacelim qpnullspacelim qp:nullspace_limit qp_nullspace_limit qpnullspacelimit",
+      "Nullspace limit for the active set QP solver (default: 4000).",
+      "qp_nullspace_limit", 0, INT_MAX);
+
+  AddHighsOption("qp:regularization qpregularization qp:regularization_value qp_regularization_value qpregularizationvalue",
+      "Regularization value added to the Hessian in the active set QP solver (default: 1e-7).",
+      "qp_regularization_value", 0.0, DBL_MAX);
+
+  AddHighsOption("bar:crossover crossover run_crossover",
+    "Run crossover after IPM to get a basic solution:\n"
+      "\n.. value-table::\n", "run_crossover", run_crossover_values, c);
+
+  AddHighsOption("bar:hiposystem hiposystem bar:hipo_system hipo_system",
+      "Control which Newton/KKT system is used by HiPO:\n"
+      "\n.. value-table::\n",  "hipo_system", hipo_system_values , c);
+
+
+  AddHighsOption("bar:hipoparallel hipoparallel bar:hipo_parallel_type hipo_parallel_type",
+	  "Control the type of parallelism used by HiPO:\n"
+      "\n.. value-table::\n", "hipo_parallel_type", hipo_parallel_type_values, c);
+
+  AddHighsOption("bar:hipoordering hipoordering bar:hipo_ordering hipo_ordering",
+	  "Control the ordering used by HiPO before factorization:\n"
+      "\n.. value-table::\n", "hipo_ordering", hipo_ordering_values, c);
+
+  AddHighsOption("bar:hipoblocksize hipoblocksize hipo_block_size",
+    "Block size for dense linear algebra within HiPO (default 128).",
+    "hipo_block_size", 0, INT_MAX);
+
+  AddHighsOption("qp:hotstart qphotstart qp_allow_hot_start",
+    "0*/1: Allow the active set QP solver to hot start.",
+    "qp_allow_hot_start", 0, 1);
+
+  AddHighsOption("tech:threads threads",
+    "Maximum number of threads used by HiGHS (parallel simplex, "
+    "IPM and MIP); default 0 ==> automatic choice.",
+    "threads", 0, INT32_MAX);
+  AddHighsOption("mip:symmetry symmetry mip:detsimmetry detsimmetry mip_detect_symmetry",
+    "0/1*: Whether MIP symmetry should be detected.",
+    "mip_detect_symmetry", 0, 1);
+
+  AddHighsOption("mip:restart miprestart mip_allow_restart",
+    "0/1*: Whether MIP restart is permitted.",
+    "mip_allow_restart", 0, 1);
+
+  AddStoredOption("mip:start mipstart",
+    "How a partial MIP start (initial values for some integer variables, "
+    "with alg:start>0) is completed:\n"
+    "\n.. value-table::\n", storedOptions_.mipstart_, mipstart_values);
+
+  AddHighsOption("mip:maxstartnodes maxstartnodes mip_max_start_nodes",
+    "Maximum number of MIP nodes when completing a partial MIP start "
+    "(default 500). See mip:start.",
+    "mip_max_start_nodes", 0, INT_MAX);
+
+  AddHighsOption("mip:poolagelimit poolagelimit mip_pool_age_limit",
+    "Maximal age of rows in the MIP cutpool before they are deleted "
+    "(default 30, max 1000).",
+    "mip_pool_age_limit", 0, 1000);
+
+  AddHighsOption("mip:nodecuts nodecuts mip_allow_cut_separation_at_nodes",
+    "0/1*: Whether cut separation at nodes other than the root is permitted.",
+    "mip_allow_cut_separation_at_nodes", 0, 1);
+
+  AddHighsOption("mip:rootpresolveonly rootpresolveonly mip_root_presolve_only",
+    "0*/1: Whether MIP presolve is only applied at the root node.",
+    "mip_root_presolve_only", 0, 1);
+
+  AddHighsOption("mip:heur:feasjump heurfeasjump mip_heuristic_run_feasibility_jump",
+    "0/1*: Use the feasibility jump heuristic.",
+    "mip_heuristic_run_feasibility_jump", 0, 1);
+
+  AddHighsOption("mip:heur:rins heurrins mip_heuristic_run_rins",
+    "0/1*: Use the RINS heuristic.",
+    "mip_heuristic_run_rins", 0, 1);
+
+  AddHighsOption("mip:heur:rens heurrens mip_heuristic_run_rens",
+    "0/1*: Use the RENS heuristic.",
+    "mip_heuristic_run_rens", 0, 1);
+
+  AddHighsOption("mip:heur:rootredcost heurrootredcost mip_heuristic_run_root_reduced_cost",
+    "0/1*: Use the root reduced cost heuristic.",
+    "mip_heuristic_run_root_reduced_cost", 0, 1);
+
+  AddHighsOption("mip:heur:ziround heurziround mip_heuristic_run_zi_round",
+    "0*/1: Use the ZI Round heuristic.",
+    "mip_heuristic_run_zi_round", 0, 1);
+
+  AddHighsOption("mip:heur:shifting heurshifting mip_heuristic_run_shifting",
+    "0*/1: Use the Shifting heuristic.",
+    "mip_heuristic_run_shifting", 0, 1);
+
+  AddHighsOption("mip:lifting lifting mip_lifting_for_probing",
+    "Level of lifting for probing that is used (default -1).",
+    "mip_lifting_for_probing", -1, INT_MAX);
+
+  AddHighsOption("lim:stallnodes stallnodelim stallnodelimit mip_max_stall_nodes",
     "Maximum MIP number of nodes where estimate is above cutoff bound (default: no limit).",
     "mip_max_stall_nodes", 0, INT_MAX);
 
-  AddSolverOption("lim:leavenodes leaveslim mip_max_leaves",
+  AddHighsOption("lim:leavenodes leaveslim mip_max_leaves",
     "Maximum MIP number of leaf nodes (default: no limit).",
     "mip_max_leaves", 0, INT_MAX);
 
-  AddSolverOption("lim:nodes nodelim nodelimit mip_max_nodes",
+  AddHighsOption("lim:nodes nodelim nodelimit mip_max_nodes",
     "Maximum MIP nodes to explore (default: no limit).",
     "mip_max_nodes", 0, INT_MAX);
 
-  AddSolverOption("lim:improvingsols improvingsolslimit mip_max_improving_sols",
-    "Maximum number of improving solutions found (default: no limit).",
+  AddHighsOption("lim:sol sollim lim:improvingsols improvingsolslimit mip_max_improving_sols",
+    "Stop the MIP solver after this many improving solutions "
+    "have been found (default: no limit).",
     "mip_max_improving_sols", 1, INT_MAX);
 
-  AddSolverOption("mip:lpagelimit lpagelimit mip_lp_age_limit",
+  AddHighsOption("mip:lpagelimit lpagelimit mip_lp_age_limit",
     "Maximal age of dynamic LP rows before they are removed from the LP relaxation "
-    "(default 10)",
-    "mip_lp_age_limit", 0, INT_MAX);
+    "(default 10, max 32767).",
+    "mip_lp_age_limit", 0, 32767);
 
-  AddSolverOption("mip:poolsoftlimit poolsoftlimit mip_pool_soft_limit",
-    "Soft limit on the number of rows in the cutpool for dynamic age adjustment"
-    "(default 10000)",
+  /*
+  * mip_lp_solver
+MIP LP solver: "choose", "simplex", "ipm", "ipx" or "hipo"
+Type: string
+Default: "choose"
+mip_ipm_solver
+MIP IPM solver: "choose", "ipx" or "hipo"
+Type: string
+Default: "choose"
+ipm_optimality_tolera
+  */
+
+  AddHighsOption("mip:lpsolver miplpsolver mip_lp_solver",
+      "Choose the lp solver to be used during mip solves:\n"
+      "\n.. value-table::\n", "mip_lp_solver", mip_lp_solver_values, c);
+
+  AddHighsOption("mip:ipmsolver mipipmsolver mip_ipm_solver",
+      "Choose the ipm solver to be used during mip solves:\n"
+      "\n.. value-table::\n", "mip_ipm_solver", mip_ipm_solver_values, c);
+
+
+
+  AddHighsOption("mip:poolsoftlimit poolsoftlimit mip_pool_soft_limit",
+    "Soft limit on the number of rows in the cutpool for dynamic age adjustment "
+    "(default 10000).",
     "mip_pool_soft_limit", 1, INT_MAX);
 
-  AddSolverOption("mip:pscostreliability pscostreliability mip_pscost_minreliable",
-    "Minimal number of observations before pseudo costs are considered reliable"
-    "(default 8)",
+  AddHighsOption("mip:pscostreliability pscostreliability mip_pscost_minreliable",
+    "Minimal number of observations before pseudo costs are considered reliable "
+    "(default 8).",
     "mip_pscost_minreliable", 0, INT_MAX);
 
-  AddSolverOption("mip:mincliquetable mincliquetable mip_min_cliquetable_entries_for_parallelism",
-    "Minimal number of entries in the cliquetable before neighborhood queries of the conflict graph use parallel processing"
-    "(default 100000)",
+  AddHighsOption("mip:mincliquetable mincliquetable mip_min_cliquetable_entries_for_parallelism",
+    "Minimal number of entries in the cliquetable before neighborhood queries "
+    "of the conflict graph use parallel processing (default 100000).",
     "mip_min_cliquetable_entries_for_parallelism", 0, INT_MAX);
 
-  AddSolverOption("tech:miploglev miploglev mip_report_level",
+  AddHighsOption("tech:miploglev miploglev mip_report_level",
     "0/1*/2: MIP solver report level",
     "mip_report_level", 0, 2);
 
-  AddSolverOption("mip:intfeastol intfeastol inttol mip_feasibility_tolerance",
+  AddHighsOption("tech:miplogfreq miplogfreq mip_min_logging_interval",
+    "Minimum interval between MIP log lines, in seconds (default 5).",
+    "mip_min_logging_interval", 0.0, DBL_MAX);
+
+  AddHighsOption("tech:logtoconsole logtoconsole log_to_console",
+    "0/1*: Whether HiGHS log lines go to the console "
+    "(with tech:outlev=1; set 0 to log only to tech:logfile).",
+    "log_to_console", 0, 1);
+
+  AddHighsOption("tech:timelesslog timelesslog timeless_log",
+    "0*/1: Suppress time-based data in the HiGHS log.",
+    "timeless_log", 0, 1);
+
+  AddHighsOption("tech:seed seed random_seed",
+    "Random number seed (default 0), affecting perturbations that "
+    "may influence the solution path.",
+    "random_seed", 0, INT_MAX);
+
+  AddHighsOption("mip:intfeastol intfeastol inttol mip_feasibility_tolerance",
     "Feasibility tolerance for integer variables (default 1e-06).",
     "mip_feasibility_tolerance", 1e-10, Infinity());
 
-  AddSolverOption("mip:heureff heureff mip_heuristic_effort",
+  AddHighsOption("mip:heureff heureff mip_heuristic_effort",
     "Fraction of time to spend in MIP heuristics (default 0.05).",
     "mip_heuristic_effort", 0.0, 1.0);
 
-  AddSolverOption("mip:relgaptol relgaptol mip_rel_gap",
-    "tolerance on relative gap, | ub - lb|/|ub | , to determine whether optimality has been reached for a MIP instance "
+  AddHighsOption("mip:gap mipgap mip:relgaptol relgaptol mip_rel_gap",
+    "Tolerance on relative gap, | ub - lb|/|ub | , to determine whether optimality has been reached for a MIP instance "
     "(default 1e-04).",
     "mip_rel_gap", 0.0, Infinity());
 
-  AddSolverOption("mip:absgaptol absgaptol mip_abs_gap",
-    "tolerance on absolute gap of MIP, |ub-lb|, to determine whether optimality has been reached for a MIP instance "
+  AddHighsOption("mip:gapabs mipgapabs mip:absgaptol absgaptol mip_abs_gap",
+    "Tolerance on absolute gap of MIP, |ub-lb|, to determine whether optimality has been reached for a MIP instance "
     "(default 1e-06).",
     "mip_abs_gap", 0.0, Infinity());
+
+  AddHighsOption("bar:centring centring pre:centring run_centring",
+    "Perform centring steps or not:\n"
+    "\n.. value-table::\n", "run_centring", values_01_noyes_0default_, 0);
+
+  AddHighsOption("bar:maxcentringsteps maxcentringsteps pre:maxcentringsteps max_centring_steps",
+    "Maximum number of steps to use when computing the analytic centre "
+    "(default 5).",
+    "max_centring_steps", 0, INT_MAX);
+
+  AddHighsOption("bar:centringratiotol centringratiotol pre:centringratiotolerance centring_ratio_tolerance centringratiotolerance",
+    "Centring stops when the ratio max(x_j*s_j) / min(x_j*s_j) is below "
+    "this tolerance (default 100).",
+    "centring_ratio_tolerance", 0.0, DBL_MAX);
+
+  AddStoredOption("iis:strategy iis_strategy iisstrategy",
+      "Strategy for IIS calculation (with iis:find=1), "
+      "-1 or a sum of:\n"
+      "\n.. value-table::\n"
+      "\nHiGHS presets: 6 = true IIS with row priority, "
+      "14 = true IIS with column priority. HiGHS's IIS finder is "
+      "LP-based: for a MIP, the reported rows and bounds form an "
+      "infeasible subsystem found by solving elastic MIPs, which "
+      "cannot be proven irreducible; with 16, integrality is dropped "
+      "and the IIS of the LP relaxation is sought.",
+      storedOptions_.iisStrategy_, iis_strategy_values);
+
+  AddHighsOption("lim:iistime iistimelim lim:iis_time_limit iis_time_limit iistimelimit",
+	  "Time limit for computing IIS (default: no limit).",
+	  "iis_time_limit", 0.0, DBL_MAX);
 }
 
 double HighsBackend::MIPGap() {
-  // TODO Check if the following is always true
-  if (BarrierIterations() == 0)
+  if (!IsMIP())
     return 0;
   return getDblAttr("mip_gap");
 }
 double HighsBackend::BestDualBound() {
-  // TODO Check if the following is always true
-  if (BarrierIterations() == 0)
+  if (!IsMIP())
     return 0;
   return getDblAttr("mip_dual_bound");
 }
 
 double HighsBackend::MIPGapAbs() {
-  // TODO Check if the following is always true
-  if (BarrierIterations() == 0)
+  if (!IsMIP())
     return 0;
   return std::fabs(
     ObjectiveValue() - BestDualBound());
@@ -644,17 +1575,20 @@ double HighsBackend::MIPGapAbs() {
 
 // AMPLs
 
-AMPLS_MP_Solver* AMPLSOpenHighs(
-  const char* slv_opt, CCallbacks cb = {}) {
-  return AMPLS__internal__Open(std::unique_ptr<mp::BasicBackend>{new mp::HighsBackend()},
-    cb);
+AMPLS_MP_Solver* Open_highs(CCallbacks cb = {}) {
+  AMPLS_MP_Solver* slv =
+    AMPLS__internal__Open(
+      std::unique_ptr<mp::BasicBackend>{new mp::HighsBackend()},
+      cb);
+  return slv;
 }
 
-void AMPLSCloseHighs(AMPLS_MP_Solver* slv) {
+void AMPLSClose_highs(AMPLS_MP_Solver* slv) {
   AMPLS__internal__Close(slv);
 }
 
-void* GetHighsmodel(AMPLS_MP_Solver* slv) {
+void* AMPLSGetModel_highs(AMPLS_MP_Solver* slv) {
   return
     dynamic_cast<mp::HighsBackend*>(AMPLSGetBackend(slv))->lp();
 }
+

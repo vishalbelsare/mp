@@ -24,11 +24,14 @@
 
 #include "mp/problem.h"
 #include "mp/problem-builder.h"
+#include "expr-writer.h"
 
 namespace mp {
 
 void LinearExpr::SortTerms() {
-  std::map<int, double> var_coef_map;
+  assert(0);
+  /*
+  std::map<int, double> var_coef_map;      // slow @todo
   for (int i=0; i<num_terms(); ++i)
     if (0.0!=std::fabs(coef(i)))
       var_coef_map[var_index(i)] += coef(i);
@@ -36,7 +39,7 @@ void LinearExpr::SortTerms() {
   for (const auto& vc: var_coef_map) {
     if (0.0!=std::fabs(vc.second))
       AddTerm(vc.first, vc.second);
-  }
+  } */
 }
 
 template <typename Alloc>
@@ -53,8 +56,8 @@ int BasicProblem<Alloc>::GetSuffixSize(suf::Kind kind) {
     size = algebraic_cons_.capacity() +
         logical_cons_.capacity();
     break;
-  case suf::OBJ:
-    size = linear_objs_.capacity();
+  case suf::OBJ:     // we now know about objno.
+    size = linear_objs_.capacity();  // This is to return for all objs #184
     break;
   case suf::PROBLEM:
     size = 1;
@@ -109,13 +112,66 @@ void BasicProblem<Alloc>::SetInfo(const NLProblemInfo &info) {
   int num_common_exprs = info.num_common_exprs();
   linear_exprs_.reserve(num_common_exprs);
   nonlinear_exprs_.reserve(num_common_exprs);
+  common_expr_positions_.reserve(num_common_exprs);
 }
 
-/// Instantiate
+template <typename Params>
+const std::string& BasicProblem<Params>::item_name(
+    int i, std::vector<std::string>& names,
+    int n, const char* stub,  int n2, const char* stub2) {
+  assert(0<=i && i<n);
+  if ((int)names.size()<n) {
+    int sz0 = (int)names.size();
+    names.resize(n);
+    int k=sz0;
+    auto gen_names = [&names](
+        int k, int n, const char* stub, int k_sub=0) {
+      for ( ; k<n; k++) {
+        assert(stub);
+        int l = std::strlen(stub);
+        assert(l);
+        bool fbr = '['==stub[l-1];
+        names[k] = stub;
+        names[k] += std::to_string(k-k_sub+1);
+        names[k] += (fbr ? ']' : '_');
+      }
+    };
+    if (n2>=0 && n2<n) {
+      if (k<n2) {
+        gen_names(k, n2, stub);
+        gen_names(n2, n, stub2, n2);
+      } else
+        gen_names(k, n, stub2, n2);
+    } else
+      gen_names(k, n, stub);
+  }
+  assert(names[i].size());
+  return names[i];
+}
+
+// Instantiations
+
 template class BasicProblem< >;
 
 template void ReadNLFile(fmt::CStringRef filename, Problem &p, int flags);
 
 template
 void ReadNLString(NLStringRef str, Problem &p, fmt::CStringRef name, int flags);
+
+template
+void WriteExpr<typename Problem::ExprTypes>(
+fmt::Writer &w,
+const LinearExpr &linear, NumericExpr nonlinear,
+Problem::VarNamer);
+
+template
+void WriteExpr<typename Problem::ExprTypes>
+(fmt::Writer &w, LogicalExpr expr, Problem::VarNamer);
+
+/// Write algebraic constraint.
+template
+void WriteAlgCon<typename Problem::ExprTypes>(
+fmt::Writer &w, const typename Problem::MutAlgebraicCon &con,
+Problem::VarNamer);
+
 }  // namespace mp

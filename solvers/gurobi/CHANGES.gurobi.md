@@ -1,5 +1,323 @@
-Summary of recent updates to gurobi for AMPL
+Summary of recent updates to Gurobi for AMPL
 ============================================
+
+
+## 20261101
+- Prepare for Gurobi 14 (options available when built against 14):
+  *alg:method=7* (NL barrier), *alg:concurrentmethod=4*,
+  *cut:oa*, *mip:noreltreeheur*, *mip:pdhgheursolutions*,
+  *mip:pdhgheurtime*, *mip:pdhgheurwork*, *nlbar:initmu*,
+  *nlbar:startpush*; *alg:pdhggpu* follows the 14 range.
+  New option *obj:multi:inheritparams* (all versions) controls
+  parameter inheritance of multi-objective passes, whose Gurobi
+  default changes in 14. Solution pool values are read via
+  *PoolNX*/*PoolNObjVal*.
+- Add separate fixed-model limits *mip:basis:timelimit* and
+  *mip:basis:iterlimit*.
+- Align option documentation with Gurobi 13.0.3 parameters:
+  - Value lists updated: *pre:aggregate* (2 = aggressive),
+    *iis:method* (3 = LP-relaxation IIS for MIP, revised texts),
+    *bar:crossoverbasis* (-1 = automatic, the default),
+    *alg:pdhggpu* (0/1), *alg:method* (automatic choice text).
+  - Individual *cut:...* controls document the -1..2 range;
+    only *cut:cuts* goes up to 3.
+  - Documented ranges and defaults corrected for *mip:gap*,
+    *mip:gapabs*, *mip:heurfrac*, *mip:inttol*, *lim:sol*, *lim:mem*,
+    *lim:softmem*, *mip:improvework*, *tech:threads*,
+    *tech:concurrentmip*, *pre:sos1bigm*, *pre:sos2bigm*,
+    *tech:tunetimelim*, *tech:tunetrials*, *tech:tuneresults* and
+    *tech:tunedynamicjobs*. Gurobi itself validates parameter values.
+  - Option *tech:tuneusefilename* removed: the parameter is not
+    available in the Gurobi C library (grbtune only).
+  - *pre:funcpiece...* options note the deprecation of function
+    constraints since Gurobi 13.0.
+  - New options: *cut:dualimplied*, *cut:liftproject*,
+    *cut:projimplied*, *cut:psd*, *cut:strongcg*,
+    *mip:fixvarsinindicators*, *pre:crush*, *tech:solfiles*,
+    *tech:tunecleanup*, *tech:tunecriterion*, *tech:tunemetric*,
+    *tech:tunetargetmipgap*, *tech:tunetargettime*.
+
+
+## 20260908
+- Updated to Gurobi 13.0.3 that includes bug fixes.
+- Changes in MP:
+  - Option *obj:multi:stats=1* outputs multi-objective
+    pass statistics in the *.objpass[_...]* suffixes.
+  - Options *mip:plateau:...* control MIP
+    tailing-off.
+    Can be used in multi-objective solves,
+    see option *obj:multi:options*. 
+  - Fix a bug in complementarity reformulation
+    with *cvt:compl=2,3*.
+  - Option *cvt:nlobj* controls whether nonlinear
+    objective terms are passed to the objective,
+    vs moved to a constraint or piecewise-linearly
+    approximated. Setting *cvt:nlobj=0*
+    *cvt:quadobj=0* enables native
+    multiobjective method (*obj:multi=1*)
+    if only supported for linear objectives.
+
+
+## 20260624
+- Changes in MP, in particular:
+  - Option *cvt:pow2_as_qp* prefers quadratization
+    of the ^2 operator for affine arguments (default).
+  - Faster parsing of quadratic expressions with
+    defined variables.
+  - The main driver code is separated into a shared
+    library and used commonly with AMPLS API.
+
+
+## 20260515
+- Updated to Gurobi 13.0.2, which includes bugfixes;
+  the GPU-PDHG algorithm has matured from the beta state
+  and is now fully supported.
+- Changes in MP.
+
+
+## 20260414
+- Changes in MP, see MP changelog. In particular:
+  - Additional case where the signpow function
+    is recognized: abs(C*x)*x
+    (C constant, x variable).
+  - Option *cvt:pre:boundsbest* defaults to making
+    auxiliary subexpression result variables free,
+    unless the result is constant.  This allows
+    stronger nonlinear presolve.
+
+
+## 20260130
+- Updated to Gurobi 13.0.1, which includes bugfixes.
+
+
+## 20260109
+- Changes in MP
+  - Remove excessive '_' symbols in output 
+    model constraint and variable names.
+
+
+## 20251213
+- Recognize logistic function 1/(1+e^(-x)),
+  option cvt:pre:logistic.
+- Recognize signpow() functions in the model
+  (from expressions such as abs(x)^0.5*x).
+  Gurobi 13 accepts signpow() natively.
+  See option *cvt:pre:signpow*.
+- Change in MP: option *obj:multi:options*: fix integer-valued
+  objective-specific options.
+
+
+## 20251121
+- Updated to Gurobi 13.0.0:
+  - Nonlinear barrier method for finding local optima 
+    in non-convex continuous models, see *alg:optimalitytarget*.
+  - Primal-Dual Hybrid Gradient (PDHG) method for large-scale 
+    linear programs (see *alg:method* and options in the *pdhg:* 
+    namespace.
+  - New control: *mip:norelheursolutions* (*norelsol*).
+- Multiobjective options (see *obj:multi:options*)
+  in Gurobi's native
+  multiobjective mode (*obj:multi=1*).
+
+
+## 20251021
+- Changes in MP: option *cvt:expr:nlassign*.
+
+
+## 20251015
+- Changes in MP
+- Fixed *multiobj=1/2* for a single objective.
+  Running multiobjective for a single-objective
+  model makes sense with a negative `.objweight`
+  suffix.
+- Option *lp:warmstart* controls whether and how
+  to warm start LP optimization.
+
+
+## 20250814
+- Changes in MP
+  - Improved preprocessing of logical
+    and combinatorial expressions
+    (options *cvt:pre:unnest*, *cvt:pre:sort*).
+  - Option *cvt:pre:boundlogarg* (default 0) to bound
+    arguments of logarithm nonnegative. Previously
+    always done, sometimes deteriorating performance
+    of nonlinear solvers.
+
+
+## 20250801
+- Changes in MP
+  - Tolerances set by options *cvt:pre:feastol*,
+    *cvt:pre:feastolrel* both need to be violated
+    to produce a warning on contradicting
+    variable/constraint bounds. Previously
+    the preprocessor failed on any violation,
+    without letting the solver try.
+  - Options *cvt:compl*, *cvt:compl:eps* control
+    complementarity reformulations.
+
+
+## 20250723
+- Updated to Gurobi 12.0.3, which includes bugfixes 
+
+
+## 20250617
+- Option *mip:opttol* renamed as *lp:opttol* (*opttol*).
+- Changes in MP
+  - Multi-objective emulator: added support for
+    objective-specific options via objective suffixes
+    beginning with *option_*
+  - Option *cvt:unnest*: bits 2 and 4 switch on
+    inlining of linear and quadratic subexpressions
+    produced during reformulations (by default on).
+  - Options *cvt:pre:ctx2ineq*, *cvt:pre:ctx2count*
+    to control context propagation into conditional
+    comparisons #267.
+
+
+## 20250515
+- Updated to Gurobi 12.0.2, which includes bugfixes
+- Improved detection of unsupported multiobjective models
+
+
+## 20250429
+- Added the Tan expression (previously always submitted
+	to Gurobi as a general constraint).
+- Fixed a bug in parsing of quadratic expressions,
+  which could wrongly parse products of unequal
+  linear expressions, such as (x-3)*(x-z-5).
+
+
+## 20250424
+- Changes in MP
+  - Option *cvt:qp2pass* (default even faster parsing
+    of quadratics)
+
+
+## 20250329
+- Changes in MP:
+  - Option *cvt:multoutcard* to limit the size of
+    out-multiplied QP expressions. Can improve parsing
+    speed on large models, but slow down solving,
+    so overall benefit depends on the instance.
+  - Improved parsing of quadratic expressions.
+
+
+## 20250311
+- Additional diagnostic messages are printed in case the solver
+  fails to initialize
+
+
+## 20250308
+- Option *alg:kappa_exact*
+
+
+## 20250204
+- Updated to Gurobi 12.0.1
+
+
+## 20241119
+- MP changes: added support for x^y expressions, where x and y
+  are variables
+
+
+## 20241114
+- Updated to Gurobi 12.0 which provides performance improvements 
+  across a variety of model families
+- Gurobi now supports nonlinear constraints of the form y=f(x),
+  where f is a multivariate function given by a closed-form expression.
+- Solve mixed-integer nonlinear programming (MINLP) problems 
+  to global optimality more efficiently via the new non-linear 
+  expression interface.
+
+
+## 20240808
+- Added option *alg:nlpheur* to control an heuristic for
+  non-convex quadratic models.
+
+
+## 20240728
+- Updated to Gurobi libraries 11.0.3, which include many  
+  bug fixes.
+
+ 
+## 20240724
+- Option *acc:_all*
+  - Useful to disable all reformulations (*acc:_all=2*),
+    or force linearization (*acc:_all=0*).
+- Option *cvt:prod*     
+  - Controls reformulation of binary products into logical 
+    constraints.
+- Faster input of quadratic expressions.
+
+
+## 20240617
+- *Multi-objective emulator*
+  - *obj:multi=2* forces emulation, even if MO natively supported.
+	- Fixed a bug in the objective degradation suffixes
+    *.objasbtol*, *.objreltol*.
+
+
+## 20240604
+- Presolve division by constant, resulting in fewer constraints.
+- Fix no-solution case in multi-objective emulator.
+
+
+## 20240529
+- *Multi-objective emulator*
+  - All flat MP solvers support multi-objective mode (*obj:multi=1*),
+		either natively, or via emulation.
+  - Suffixes *.objpriority*, *.objweight*, *.objabstol*, *.objreltol*.
+  - [BREAKING] Default intuitive handling of *.objweight*,
+    see option *obj:multi:weight*, even when natively supported.
+
+
+## 20240518
+- Updated to Gurobi libraries 11.0.2, which include many 
+  bug fixes.
+
+
+## 20240429
+- [BREAKING] Merged `report_times` and `timing`; they 
+  are now aliases, set the value to 1 to have basic info,
+  to 2 to have more detailed info.
+
+  
+## 20240327
+- Added support for Web License Server parameters, via options
+  `wls_licenseid`, `wls_accessid`, `wls_secret`, `wls_token`, 
+  `wls_tokenduration` and `wls_tokenrefresh`.
+
+
+## 20240320
+- *SOS constraints*.
+  - Fixed handling of SOS2 constraints created by AMPL
+    as reformulations of PL expressions (`option
+    pl_linearize 1`, default; set to 0 to use the solver's
+    native PL functions or MP linearization.)
+  - Disallow repeated weights for SOS constraints
+    (suffixes `.sosno`/`.ref`.)
+- *Native handling of POW(x, INT)*.
+  - Power expressions with positive integer exponent
+    are passed natively vs previously quadratic or linear 
+    reformulation. For best performance, global solving capability
+    might be needed (`global=1`).
+- *Option `report_times`* 
+- *Unused `acc:` options*.
+  - The constraint acceptance options `acc:...`
+    for non-handled constraints are ignored
+    (previously triggered error.)
+
+
+## 20240311
+- Added option `tech:reportwork` to display or return in the 
+  problem suffix `work` the work units spent while solving 
+  the problem.
+
+
+## 20240310
+- Updated to Gurobi libraries 11.0.1, which include many 
+  bug fixes.
 
 
 ## 20240115
@@ -19,9 +337,9 @@ Summary of recent updates to gurobi for AMPL
 
 
 ## 20231208
-- Option 'global' and suffix '.global` synonyms for
-  'funcnonlinear'
-- Changed values for 'global' / 'funcnonlinear' options
+- Option `global` and suffix `.global` synonyms for
+  `funcnonlinear`
+- Changed values for `global` / `funcnonlinear` options
   and suffixes: default 0 (Gurobi automatic),
   -1 (static PL approximation), 1 (global solving).
 

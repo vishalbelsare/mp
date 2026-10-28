@@ -24,9 +24,10 @@
 #define MODEL_MANAGER_STD_H_
 
 #include <cmath>
+#include <chrono>
 
 #include "mp/env.h"
-#include "mp/clock.h"
+#include "mp/utils-clock.h"
 #include "mp/model-mgr-base.h"
 #include "mp/solver-io.h"
 
@@ -79,21 +80,44 @@ protected:
   void ReadNLModel(const std::string& nl_filename,
                    const std::string& filename_no_ext,
                    Checker_AMPLS_ModeltTraits cb_checkmodel,
-                   std::function<void()> after_header)
+                   std::function<void(char*)> after_header)
   override {
-    steady_clock::time_point start = steady_clock::now();
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 
     ReadNLFile(nl_filename,
                [this, &filename_no_ext, after_header](){
       MakeProperSolutionHandler(filename_no_ext);
       if (after_header)
-        after_header();                   // parse options
+        after_header(nullptr);                   // parse options
     });
     ReadNames(filename_no_ext);
 
     double read_time = GetTimeAndReset(start);
-    if (GetEnv().timing())
-      GetEnv().Print("NL model read time = {:.6f}s\n", read_time);
+    if (GetEnv().timing() > 1)
+    {
+        GetEnv().SetReadTime(read_time);
+        GetEnv().Print("NL model read time = {:.6f}s\n", read_time);
+    }
+    if (cb_checkmodel) {
+      AMPLS_ModelTraits mtraits;
+      mtraits.n_alg_con = 0;
+      mtraits.n_conic_con = 0;
+      mtraits.n_log_con = 0;
+      mtraits.n_quad_con = 0;
+      mtraits.n_vars = 0;
+      mtraits.additional_options = 0;
+      mtraits.warn_cb = 0;
+      cb_checkmodel(&mtraits);
+      // As we don't use model sizes in this call,
+      // we can run this before reading NL.
+      // And we do do it because we want to set any additional options
+      // before user-provided ones.
+      if (mtraits.additional_options && after_header) {
+        after_header(*mtraits.additional_options);
+        if (mtraits.warn_cb)
+          GetEnv().set_warn_cb(mtraits.warn_cb);
+      }
+    }
 
     ConvertModelAndUpdateBackend();
 
@@ -104,8 +128,11 @@ protected:
     }
 
     double cvt_time = GetTimeAndReset(start);
-    if (GetEnv().timing())
-      GetEnv().Print("NL model conversion time = {:.6f}s\n", cvt_time);
+    if (GetEnv().timing() > 1)
+    {
+      GetEnv().SetConversionTime(cvt_time);
+      GetEnv().Print("NL model conversion time = {:.6f}s\n\n", cvt_time);
+    }
   }
 
   /// Read the NL file
@@ -122,22 +149,39 @@ protected:
   /// The .row file has cons + objs.
   void ReadNames(const std::string& namebase) {
     if (WantNames()) {
-      NameProvider npv("_svar");
-      NameProvider npc("_scon");
+      NameProvider npv("_svar", "_sdvar");
+      NameProvider npc("_scon", "_slogcon");
       if (WantNames()<=2) {
         npv.ReadNames(namebase + ".col",
-                      GetModel().num_vars());
+                      GetModel().num_vars()
+                      + GetModel().num_common_exprs());
         npc.ReadNames(namebase + ".row",
                       GetModel().num_cons()
                       + GetModel().num_objs());
       }
       if (WantNames()>=2
           || npv.number_read()+npc.number_read()) {
+				bool var_names_empty = false;
         GetModel().SetVarNames(
-              npv.get_names(GetModel().num_vars()));
-        GetModel().SetConNames(
-              npc.get_names(GetModel().num_cons()) );
-        SetObjNames(npc);
+              npv.get_names(
+                GetModel().num_vars() + GetModel().num_common_exprs(),
+								GetModel().num_vars(), &var_names_empty));
+				if (var_names_empty)
+					GetEnv().AddWarning(
+								"VarNameEmpty",
+								"Some variable names are empty in the input, "
+								"using generic names");
+				bool con_names_empty = false;
+				GetModel().SetConNames(
+              npc.get_names(GetModel().num_cons(),
+														GetModel().num_algebraic_cons(),
+														&con_names_empty) );
+				if (con_names_empty)
+					GetEnv().AddWarning(
+								"ConNameEmpty",
+								"Some constraint names are empty in the input, "
+								"using generic names");
+				SetObjNames(npc);
       }
     }
   }
@@ -160,12 +204,20 @@ protected:
       }
       std::vector<std::string> names_o;
       for (auto io=num_c+o1; io<num_c+o2; ++io) {
-        if (npco.number_read()>(size_t)io)
+				auto name_generated {"_sobj["
+														 + std::to_string(io-num_c+1)
+														 + ']'};
+				if (npco.number_read()>(size_t)io) {
           names_o.push_back(npco.name(io));
-        else
-          names_o.push_back("_sobj["
-                            + std::to_string(io-num_c+1)
-                            + ']');
+					if (!names_o.back().size()) {
+						GetEnv().AddWarning(
+									"ObjNameEmpty",
+									"Some objective names are empty in the input, "
+									"using generic names");
+						names_o.back() = name_generated;
+					}
+				} else
+					names_o.push_back(name_generated);
       }
       GetModel().SetObjNames( std::move( names_o ) );
     }
@@ -185,8 +237,27 @@ protected:
   /// Says we finished problem modification,
   /// so we run model conversion and communicate the result into the ModelAPI.
   void ConvertModelAndUpdateBackend() {
+    linear_algebraic_ = !GetModel().num_logical_cons();
+    auto is_linear = [](NumericExpr expression) {
+      return !expression || expression.kind() == expr::NUMBER;
+    };
+    for (auto obj : GetModel().objs())
+      linear_algebraic_ &= is_linear(obj.nonlinear_expr());
+    for (auto con : GetModel().algebraic_cons())
+      linear_algebraic_ &= is_linear(con.nonlinear_expr());
+    for (const char* name : {"sosno", "sos"}) {
+      auto values = GetModel().ReadIntSuffix({name, suf::Kind::VAR});
+      for (auto value : values)
+        linear_algebraic_ &= !value;
+    }
     GetCvt().ConvertModel();
   }
+
+public:
+  bool IsLinearAlgebraic() const override { return linear_algebraic_; }
+
+private:
+  bool linear_algebraic_ = false;
 
 
 protected:
@@ -239,11 +310,23 @@ protected:
     return GetModel().InitialDualValuesSparsity();
   }
 
+  SuffixSet& GetSuffixes(suf::Kind kind) override {
+   return GetModel().suffixes(kind);
+  }
+
+  /// Get suffix names
+  std::set<std::string> GetSuffixNames() override {
+    return GetModel().suffixnames();
+  }
+
   ArrayRef<int> ReadSuffix(const SuffixDef<int>& suf) override {
     return GetModel().ReadIntSuffix(suf);
   }
-  ArrayRef<double> ReadSuffix(const SuffixDef<double>& suf) override {
-    return GetModel().ReadDblSuffix(suf);
+  /// @param fint: if not NULL,
+  ///   is set to 1 iff the suffix was integer.
+  ArrayRef<double> ReadSuffix(
+      const SuffixDef<double>& suf, int *fint=nullptr) override {
+    return GetModel().ReadDblSuffix(suf, fint);
   }
 
   void ReportSuffix(const SuffixDef<int>& suf,
@@ -257,6 +340,11 @@ protected:
   size_t GetSuffixSize(int kind) override {
     return GetModel().GetSuffixSize((suf::Kind)kind);
   }
+  /// Get obj option setter
+  BasicObjOptionSetter* GetObjOptionSetter() override {
+    return GetCvt().GetObjOptionSetter();
+  }
+
   void SetSolutionFileName(const std::string& fileName) override {
     if (HaveSolH())
       GetSolH().OverrideSolutionFileName(fileName);
@@ -274,6 +362,26 @@ protected:
       const double *x, const double *y, double obj) override {
     GetSolH().HandleFeasibleSolution(solve_code, msg, x, y, obj);
   }
+
+  /// Need and successfully prepared the next solve iteration?
+  bool PrepareSolveIteration(
+      std::function<sol::Status(void)> get_stt, std::function<Solution(void)> get_sol)
+      override
+  { return GetCvt().PrepareSolveIteration(get_stt, get_sol); }
+
+  /// Is/was MultiObj Emulator used?
+  bool IsMOEmulationOn() const override
+  { return GetCvt().IsMOEmulationOn(); }
+
+  /// Vector of pass indexes for each original objective
+  /// @note 0 is the first index
+  ArrayRef<int> GetMultiobjPasses() const override
+  { return GetCvt().GetMultiobjPasses(); }
+
+  /// Objective weights
+  ArrayRef<double> GetObjWeightsAdapted() override
+  { return GetCvt().GetObjWeightsAdapted(); }
+
 
   const std::vector<bool>& IsVarInt() const override {
     return GetModel().IsVarInt();

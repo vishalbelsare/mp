@@ -32,7 +32,16 @@ namespace mp {
 #ifndef MP_ASSERT
   /// Debug assert
   #define MP_ASSERT(condition, message) \
-    assert((condition) && message)
+    assert((condition) && (message))
+#endif
+
+/// Assert with throw, only for Debug
+#ifdef NDEBUG
+  #define MP_ASSERT__RAISE(condition, message) \
+    do { } while(0)
+#else
+  #define MP_ASSERT__RAISE(condition, message) \
+    do { if (!(condition)) MP_RAISE(message); } while(0)
 #endif
 
 /// Assert even for Release
@@ -75,7 +84,9 @@ class Error : public fmt::internal::RuntimeError {
   /// Costruct from message formatting arguments?
   FMT_VARIADIC_(char, , Error, init, fmt::CStringRef)
 
-  /// Construct from message and optional exit code
+  /// Construct from message and optional exit code.
+  /// A single int argument selects this overload, not formatted construction.
+  /// Use Error(fmt::format(format, value)) when the int is a message argument.
   Error(fmt::CStringRef msg, int c=-1) : exit_code_(c)
   { SetMessage(msg.c_str()); }
 

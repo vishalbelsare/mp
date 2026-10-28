@@ -102,11 +102,11 @@ double CbcmpBackend::ObjectiveValue() const {
   return Cbc_getObjValue(lp());
 }
 
-double CbcmpBackend::NodeCount() const {
+int CbcmpBackend::NodeCount() const {
     return Cbc_getNodeCount(lp());
 }
 
-double CbcmpBackend::SimplexIterations() const {
+int CbcmpBackend::SimplexIterations() const {
   // TODO which one is it?
   return Cbc_getIterationCount(lp());
 }
@@ -116,11 +116,7 @@ int CbcmpBackend::BarrierIterations() const {
   return Cbc_getIterationCount(lp());
 }
 
-inline bool ends_with(std::string const& value, std::string const& ending)
-{
-  if (ending.size() > value.size()) return false;
-  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
-}
+
 void CbcmpBackend::DoWriteProblem(const std::string & name) {
   if (ends_with(name, ".lp"))
     Cbc_writeLp(lp(), name.c_str());
@@ -136,7 +132,8 @@ void CbcmpBackend::SetInterrupter(mp::Interrupter *inter) {
 }
 
 void CbcmpBackend::Solve() {
-  CBCMP_CCALL(Cbc_solve(lp()));
+  // Do not check result. as it returns non-zero for any limit reached
+  Cbc_solve(lp());
   WindupCBCMPSolve();
 }
 
@@ -148,7 +145,7 @@ void CbcmpBackend::ReportResults() {
 }
 
 void CbcmpBackend::ReportCBCMPResults() {
-  SetStatus( ConvertCBCMPStatus() );
+  SetStatus( GetSolveResult() );
   AddCBCMPMessages();
   if (need_multiple_solutions())
     ReportCBCMPPool();
@@ -179,6 +176,14 @@ void CbcmpBackend::ReportCBCMPPool() {
   }
   */
 }
+std::map<std::string, std::variant<int, double, std::string>>
+CbcmpBackend::SolutionStats() {
+    std::map<std::string, std::variant<int, double, std::string>> stats;
+    stats["simplex_iterations"] = SimplexIterations();
+    stats["barrier_iterations"] = BarrierIterations();
+    stats["node_count"] = NodeCount();
+    return stats;
+}
 
 
 void CbcmpBackend::AddCBCMPMessages() {
@@ -192,7 +197,7 @@ void CbcmpBackend::AddCBCMPMessages() {
           fmt::format("{} branching nodes\n", nnd));
 }
 
-std::pair<int, std::string> CbcmpBackend::ConvertCBCMPStatus() {
+std::pair<int, std::string> CbcmpBackend::GetSolveResult() {
   namespace sol = mp::sol;
   auto obj = Cbc_getObjValue(lp());
   bool hasSol = (-1e20<obj && obj<1e20);
@@ -618,13 +623,13 @@ void CbcmpBackend::InitCustomOptions() {
   // GetCBCParamsList();
 
   set_option_header(
-      "CBCMP Optimizer Options for AMPL\n"
+      "CBC Optimizer Options for AMPL\n"
       "--------------------------------------------\n"
       "\n"
       "To set these options, assign a string specifying their values to the "
-      "AMPL option ``cbcmp_options``. For example::\n"
+      "AMPL option ``cbc_options``. For example::\n"
       "\n"
-      "  ampl: option cbcmp_options 'mipgap=1e-6';\n");
+      "  ampl: option cbc_options 'presolve=more';\n");
 
 
   AddStoredOption("tech:outlev outlev",
